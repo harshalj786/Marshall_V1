@@ -152,11 +152,6 @@ rag = NRagPipeline(file_path="data.csv", mode_docs="csv")
 - ChromaDB
 - LangChain ecosystem
 
----
-
-## License
-
-MIT License
 
 ---
 
