@@ -204,10 +204,6 @@ Configure retrieval parameters at query time:
 - LangChain ecosystem
 - Internet connection for HuggingFace model downloads
 
-<<<<<<< HEAD
-=======
----
-
 ## File Structure Details
 
 ### Pipeline Classes
