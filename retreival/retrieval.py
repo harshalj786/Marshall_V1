@@ -7,13 +7,18 @@ from langchain_community.llms import Ollama
 from langchain_core.prompts import PromptTemplate
 from langchain_core.output_parsers import PydanticOutputParser
 from pydantic import BaseModel,Field
+import re
 class Retrival(Runnable):
     def __init__(self,docs:list[Document],mode:Literal["mmr","simple","mqr","wiki"],collection_name:Optional[str] = "Default",path : Optional[str] = None):
         #mqr stands for multi query retrival
         self.docs = docs
         self.mode = mode
         self.path = path
-        self.collection_name = collection_name
+        clean_name = re.sub(r'[^a-zA-Z0-9._-]', '_', collection_name)
+        clean_name = clean_name.strip('_.-')
+        if len(clean_name) < 3:          
+          clean_name = "VDB_collection"
+        self.collection_name = clean_name
         self.llm = Ollama(model="mistral",temperature = 0)#this llm is only for removing ambiguity not for reasoning
         class schema(BaseModel):
             multi_query : list[str] = Field(description="Write 5 more queries similar to the user's query to remove the ambiguity of the original query.")
