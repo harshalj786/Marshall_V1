@@ -1,6 +1,6 @@
 # Marshall - Advanced RAG Pipeline Framework
 
-**Marshall** is a modular Retrieval-Augmented Generation (RAG) pipeline built with LangChain. It enables you to load documents, chunk them intelligently, store embeddings in a vector database, and query them using an LLM with advanced memory capabilities.
+**Marshall** is a modular Retrieval-Augmented Generation (RAG) framework built on **LangChain + LangGraph**. It loads documents from many formats, chunks them, stores embeddings in a vector database, and answers questions through either classic RAG pipelines, LangGraph state-machine graphs, or a **ReAct-style agent** with four tools (calculator, doc-search, Wikipedia, web search).
 
 > *"I am Marshall, the AI son of Harshal."*
 
@@ -16,10 +16,15 @@
   - `mmr` - Maximal Marginal Relevance (diversity-aware)
   - `mqr` - Multi-Query Retrieval (disambiguation)
   - `wiki` - Wikipedia retrieval
-- **Three Pipeline Modes**:
-  - `NRagPipeline` - Single query-response
-  - `ChatRagPipeline` - Interactive chat with session history
-  - `ChatRagPipelineWithMemory` - Interactive chat with persistent user memory
+- **LangChain + LangGraph Orchestration**: legacy Runnable-based pipelines alongside newer LangGraph state-machine graphs
+- **Pipeline / Graph Modes**:
+  - `NRagPipeline` - Single query-response (LangChain)
+  - `ChatRagPipeline` - Interactive chat with session history (LangChain)
+  - `ChatRagPipelineWithMemory` - Interactive chat with persistent user memory (LangChain)
+  - `ChatRagGraph` - LangGraph version of `ChatRagPipeline` with `MemorySaver` checkpointing
+  - `ChatRagWithMemoryGraph` - LangGraph version with a 5-turn memory-gate
+  - `AgentGraph` - **ReAct-style agent** with tool-calling (calculator, doc-search, Wikipedia, web)
+- **Tool-Calling Layer** (`tools/`): `calculator`, `wikipedia_lookup`, `web_search`, `search_current_doc`
 
 ---
 
@@ -27,7 +32,8 @@
 
 ```
 Marshall_V1$/
-├── pipeline.py           # Main RAG pipeline classes (NRagPipeline, ChatRagPipeline, ChatRagPipelineWithMemory)
+├── pipeline.py           # Legacy LangChain pipelines (NRagPipeline, ChatRagPipeline, ChatRagPipelineWithMemory)
+├── pipeline_lg.py        # LangGraph graphs (ChatRagGraph, ChatRagWithMemoryGraph, AgentGraph)
 ├── ingestion/
 │   ├── doc_loader.py     # Document loading (PDF, scanned PDF, web, YouTube, CSV, TXT, folder)
 │   ├── chunking.py       # Text chunking strategies (recursive, semantic)
@@ -38,6 +44,9 @@ Marshall_V1$/
 │   └── __init__.py
 ├── memory/
 │   ├── long_term_memory.py  # User memory management for persistent chat history
+│   └── __init__.py
+├── tools/
+│   ├── tools.py          # Agent tools (calculator, wikipedia_lookup, web_search, search_current_doc)
 │   └── __init__.py
 ├── db/                   # Vector database persistence (gitignored)
 ├── labbb.ipynb          # Jupyter notebook for testing/experimentation
@@ -62,9 +71,12 @@ venv\Scripts\activate  # Windows
 
 # Install dependencies
 pip install langchain langchain-community langchain-huggingface langchain-experimental
+pip install langgraph langgraph-checkpoint langgraph-prebuilt langchain-ollama
 pip install chromadb sentence-transformers
 pip install pypdf pdfplumber youtube-transcript-api
 pip install ollama
+# Agent tool-calling extras:
+pip install duckduckgo-search ddgs wikipedia
 ```
 
 ---
@@ -138,6 +150,61 @@ memory_chat = ChatRagPipelineWithMemory(
 memory_chat.invoke({})
 ```
 
+### LangGraph Chat Mode
+
+```python
+from pipeline_lg import ChatRagGraph
+
+graph = ChatRagGraph(
+    file_path="path/to/document.pdf",
+    mode_docs="pdf",
+    mode_retreiver="simple",
+)
+
+# thread_id scopes conversation state via MemorySaver
+cfg = {"configurable": {"thread_id": "session-1"}}
+answer = graph.invoke({"query": "What is this document about?"}, config=cfg)
+print(answer)
+```
+
+### Agent Mode with Tool-Calling
+
+`AgentGraph` gives Marshall four tools and lets it decide when to use them.
+
+```python
+from pipeline_lg import AgentGraph
+
+agent = AgentGraph(
+    file_path="path/to/document.pdf",
+    mode_docs="pdf",
+    mode_retreiver="simple",
+    model="llama3.1",     # llama3.1 or qwen2.5 — mistral does not reliably emit tool_calls
+)
+
+cfg = {"configurable": {"thread_id": "agent-1"}}
+
+# Arithmetic → routed to the `calculator` tool
+print(agent.invoke("what is 47 times 82?", config=cfg))
+
+# About the loaded document → routed to `search_current_doc`
+print(agent.invoke("what does the document say about OPVC pipes?", config=cfg))
+
+# Encyclopedic → routed to `wikipedia_lookup`
+print(agent.invoke("who invented the transistor?", config=cfg))
+
+# Current events → routed to `web_search`
+print(agent.invoke("what are the top news stories today?", config=cfg))
+```
+
+**Available tools** (`tools/tools.py`):
+
+| Tool | Purpose |
+|------|---------|
+| `calculator` | Safe AST-based arithmetic (`+ - * / ** %`) — no `eval`, no builtins |
+| `search_current_doc` | Semantic search over the document loaded into `AgentGraph` |
+| `wikipedia_lookup` | Top-k Wikipedia articles with retry-on-empty |
+| `web_search` | DuckDuckGo web search for time-sensitive queries |
+
 ### Loading Different Document Types
 
 ```python
@@ -199,17 +266,24 @@ Configure retrieval parameters at query time:
 ## Requirements
 
 - Python 3.9+
-- Ollama (with `mistral` model installed)
+- Ollama running locally
+  - `mistral` for the RAG pipelines (LangChain + LangGraph chat graphs)
+  - `llama3.1` (or `qwen2.5`) for `AgentGraph` — mistral cannot reliably emit tool-calls
 - ChromaDB
-- LangChain ecosystem
-- Internet connection for HuggingFace model downloads
+- LangChain + LangGraph ecosystem
+- Internet connection for HuggingFace model downloads and Wikipedia/web tools
 
 ## File Structure Details
 
-### Pipeline Classes
+### Pipeline Classes (LangChain — `pipeline.py`)
 - **NRagPipeline**: Single query-response pipeline for one-off questions
 - **ChatRagPipeline**: Interactive chat with session-based memory
 - **ChatRagPipelineWithMemory**: Interactive chat with persistent user memory across sessions
+
+### Graph Classes (LangGraph — `pipeline_lg.py`)
+- **ChatRagGraph**: `START → retrieve → generate → END` with `MemorySaver` for thread-scoped history
+- **ChatRagWithMemoryGraph**: adds a conditional memory-gate that compresses the user's history every 5 turns
+- **AgentGraph**: ReAct loop `START → agent → tools_condition → {tools → agent, END}` using `ChatOllama.bind_tools` + `langgraph.prebuilt.ToolNode`
 
 ### Document Loading Support
 - **PDF**: Regular PDFs using PyPDFLoader
@@ -228,12 +302,12 @@ The `UserMemory` class creates vector embeddings of user queries to provide pers
 ## Development
 
 This project uses:
-- **LangChain** for pipeline orchestration
+- **LangChain** for the legacy Runnable-based pipelines
+- **LangGraph** for the newer state-machine graphs and the ReAct agent (`ToolNode`, `tools_condition`, `MemorySaver`)
 - **ChromaDB** for vector storage
 - **HuggingFace Transformers** for embeddings
 - **Ollama** for local LLM inference
-- **Mistral** as the default language model # can be changed anytime 
->>>>>>> 9b9091e (added memory module and updated pipeline)
+- **Mistral** as the default RAG model; **llama3.1** for the tool-calling agent
 
 ---
 
