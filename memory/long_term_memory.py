@@ -8,7 +8,7 @@ from langchain_core.messages import HumanMessage,AIMessage
 from langchain_core.prompts import PromptTemplate
 from langchain_core.output_parsers import StrOutputParser
 class UserMemory(Runnable):
-    def __init__(self,chat_history : list[str] = None,collection_name = "user's_history",persist_directory_path : Optional[str] = None):
+    def __init__(self,chat_history : list[str] = None,collection_name = "user_history",persist_directory_path : Optional[str] = None):
         self.chat_history = chat_history or []
         self.collection_name = collection_name
         self.persist_directory_path = persist_directory_path
@@ -32,7 +32,7 @@ class UserMemory(Runnable):
         parser = StrOutputParser()
         template = PromptTemplate(
             template=""" You are an ai assistant that would be given an user's chat_history just compress it and keep the personal things and relations about the user \n 
-            chat_history :- {human_messages}
+            chat_history :- {human_messages} , compress 
 """,input_variables=["human_messages"]
         )
         chain = template | llm | parser
