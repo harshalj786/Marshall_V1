@@ -49,7 +49,7 @@ sentence-transformers==5.3.0           # all-MiniLM-L6-v2, downloaded on first r
 pypdf==6.9.1                           # mode="pdf"
 youtube-transcript-api==1.2.4          # mode="youtube"
 beautifulsoup4==4.14.2                 # mode="web_url" (WebBaseLoader)
-# pdfplumber                           # mode="scanned_pdf" — SEE NOTE 2, currently NOT installed
+pdfplumber==0.11.10                    # mode="scanned_pdf"
 
 # --- Agent tools --------------------------------------------------------------
 wikipedia==1.4.0                       # tools/tools.py::wikipedia_lookup
@@ -74,11 +74,11 @@ pydantic==2.12.4                       # mqr output schema, tool arg schemas
 #    To reproduce the GPU environment (RTX 4080 per docs/tech_stack.md):
 #        pip install torch==2.6.0 --index-url https://download.pytorch.org/whl/cu124
 #
-# 2. pdfplumber is NOT currently installed, so mode_docs="scanned_pdf" raises
-#    ImportError at load() time — verified, not assumed. README.md:280 advertises
-#    the mode. Left commented rather than pinned to a guessed version, because
-#    this file records what is known to work and that path is not currently
-#    exercised. Install and pin it when scanned PDFs are actually needed.
+# 2. pdfplumber was missing when this file was first written, which made
+#    mode_docs="scanned_pdf" raise ImportError at load() despite README.md:280
+#    advertising it. Now installed and pinned, and the mode is verified working.
+#    It pulls in pdfminer.six, pypdfium2, Pillow and cryptography transitively;
+#    those are left unpinned like the rest of the non-langchain surface.
 #
 # 3. duckduckgo-search is NOT listed even though it is installed (8.1.1) and
 #    README.md:83 tells you to install it. The current langchain-community does
