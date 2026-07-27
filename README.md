@@ -1,6 +1,6 @@
 # Marshall - Advanced RAG Pipeline Framework
 
-**Marshall** is a modular Retrieval-Augmented Generation (RAG) framework built on **LangChain + LangGraph**. It loads documents from many formats, chunks them, stores embeddings in a vector database, and answers questions through either classic RAG pipelines, LangGraph state-machine graphs, or a **ReAct-style agent** with four tools (calculator, doc-search, Wikipedia, web search).
+**Marshall** is a modular Retrieval-Augmented Generation (RAG) framework built on **LangChain + LangGraph**. It loads documents from many formats, chunks them, stores embeddings in a vector database, and answers questions through either classic RAG pipelines, LangGraph state-machine graphs, or a **ReAct-style agent** with five tools (calculator, doc-search, Wikipedia, web search, and long-term user-memory recall).
 
 > *"I am Marshall, the AI son of Harshal."*
 
@@ -23,8 +23,11 @@
   - `ChatRagPipelineWithMemory` - Interactive chat with persistent user memory (LangChain)
   - `ChatRagGraph` - LangGraph version of `ChatRagPipeline` with `MemorySaver` checkpointing
   - `ChatRagWithMemoryGraph` - LangGraph version with a 5-turn memory-gate
-  - `AgentGraph` - **ReAct-style agent** with tool-calling (calculator, doc-search, Wikipedia, web)
-- **Tool-Calling Layer** (`tools/`): `calculator`, `wikipedia_lookup`, `web_search`, `search_current_doc`
+  - `AgentGraph` - **ReAct-style agent** with tool-calling *and* a long-term memory gate
+- **Tool-Calling Layer** (`tools/`): `calculator`, `wikipedia_lookup`, `web_search`, `search_current_doc`, `recall_user_memory`
+- **Dual-Layer Memory on the Agent**: short-term LangGraph state alongside a persistent
+  ChromaDB user profile — injected automatically every *N* turns, and searchable on demand
+  by the agent itself. Recall works across conversations and across process restarts.
 
 ---
 
@@ -43,10 +46,11 @@ Marshall_V1$/
 │   ├── retrieval.py      # Retrieval strategies (simple, MMR, MQR, wiki)
 │   └── __init__.py
 ├── memory/
-│   ├── long_term_memory.py  # User memory management for persistent chat history
+│   ├── long_term_memory.py  # UserMemory — persistent user profile (compress + semantic recall)
 │   └── __init__.py
 ├── tools/
-│   ├── tools.py          # Agent tools (calculator, wikipedia_lookup, web_search, search_current_doc)
+│   ├── tools.py          # Agent tools (calculator, wikipedia_lookup, web_search,
+│   │                     #   search_current_doc, recall_user_memory)
 │   └── __init__.py
 ├── db/                   # Vector database persistence (gitignored)
 ├── labbb.ipynb          # Jupyter notebook for testing/experimentation
@@ -169,7 +173,7 @@ print(answer)
 
 ### Agent Mode with Tool-Calling
 
-`AgentGraph` gives Marshall four tools and lets it decide when to use them.
+`AgentGraph` gives Marshall five tools and lets it decide when to use them.
 
 ```python
 from pipeline_lg import AgentGraph
@@ -204,6 +208,65 @@ print(agent.invoke("what are the top news stories today?", config=cfg))
 | `search_current_doc` | Semantic search over the document loaded into `AgentGraph` |
 | `wikipedia_lookup` | Top-k Wikipedia articles with retry-on-empty |
 | `web_search` | DuckDuckGo web search for time-sensitive queries |
+| `recall_user_memory` | Semantic search over what the *user* said in earlier conversations |
+
+### Agent Memory Gate
+
+`AgentGraph` remembers the user in two directions at once:
+
+- **Passive** — every `memory_every_n_turns` turns, the user's own messages are compressed
+  into a personal profile by `UserMemory` and folded into the agent's system prompt.
+- **Active** — the agent can call `recall_user_memory` itself when asked something about
+  the user that the visible conversation cannot answer.
+
+```python
+agent = AgentGraph(
+    file_path="path/to/document.pdf",
+    mode_docs="pdf",
+    mode_retreiver="simple",
+    user_history_directory_path="path/to/memory/storage",  # required for durable recall
+    memory_every_n_turns=5,     # 0 disables the passive gate entirely
+    enable_recall_tool=True,    # False → 4-tool config, prompt adjusts to match
+    user_id=None,               # None → shares one profile with ChatRagWithMemoryGraph
+)
+
+# --- conversation one ---
+a = {"configurable": {"thread_id": "mon"}}
+for msg in ["my name is Harshal",
+            "I live in Pune",
+            "I work on a RAG agent called Marshall",
+            "my favourite topic is structural analysis",
+            "I like building pipelines"]:          # the 5th turn trips the gate
+    agent.invoke(msg, config=a)
+
+print(agent.get_turn_count("mon"))               # 5
+print(agent.get_user_history_summary("mon"))
+# Compressed Chat History:
+#   * Name: Harshal
+#   * Location: Pune, India
+#   * Profession: works on a RAG agent named Marshall
+#   * Interest: Structural Analysis, Building Pipelines
+# ...and from here on this profile is folded into the agent's system prompt
+
+# --- conversation two: a different thread, nothing in its context ---
+b = {"configurable": {"thread_id": "tue"}}
+print(agent.invoke("what is my name?", config=b))
+# → calls recall_user_memory, answers "Harshal" from the persisted store
+```
+
+Memory is scoped to the **user**, not the thread — a `thread_id` is one conversation, so a
+new thread still recalls what earlier ones were told. Pass `user_id` only if you need to
+keep several people's profiles apart.
+
+> **Note on an 8B model.** `llama3.1` occasionally calls `recall_user_memory` on a plain
+> statement ("I work on a RAG agent") where no lookup is needed. Answers stay correct — the
+> cost is a wasted retrieval. Measured against the 4-tool baseline the delta is about one
+> extra call in four conversational turns, and the baseline over-triggers too. Set
+> `enable_recall_tool=False` or try `model="qwen2.5"` if this matters for your use case.
+
+Unlike the chat graphs, `AgentGraph` does **not** trim history: agent turns emit 3-4
+messages each, and cutting between an `AIMessage`'s `tool_calls` and its `ToolMessage`
+orphans the pair, which Ollama rejects.
 
 ### Loading Different Document Types
 
@@ -267,7 +330,8 @@ Configure retrieval parameters at query time:
 
 - Python 3.9+
 - Ollama running locally
-  - `mistral` for the RAG pipelines (LangChain + LangGraph chat graphs)
+  - `mistral` for the RAG pipelines (LangChain + LangGraph chat graphs), and for
+    `UserMemory`'s profile compression — non-tool text generation, which it does well
   - `llama3.1` (or `qwen2.5`) for `AgentGraph` — mistral cannot reliably emit tool-calls
 - ChromaDB
 - LangChain + LangGraph ecosystem
@@ -283,7 +347,16 @@ Configure retrieval parameters at query time:
 ### Graph Classes (LangGraph — `pipeline_lg.py`)
 - **ChatRagGraph**: `START → retrieve → generate → END` with `MemorySaver` for thread-scoped history
 - **ChatRagWithMemoryGraph**: adds a conditional memory-gate that compresses the user's history every 5 turns
-- **AgentGraph**: ReAct loop `START → agent → tools_condition → {tools → agent, END}` using `ChatOllama.bind_tools` + `langgraph.prebuilt.ToolNode`
+- **AgentGraph**: ReAct loop plus a memory gate, using `ChatOllama.bind_tools` + `langgraph.prebuilt.ToolNode`:
+
+  ```text
+  START → count_turn → {summarize_user_history → agent, agent}
+  agent → tools_condition → {tools → agent, END}
+  ```
+
+  The turn counter deliberately sits *before* `agent` rather than inside it: the ReAct loop
+  re-enters `agent` after every tool call, so counting there would make the gate fire on
+  tool usage instead of conversation length.
 
 ### Document Loading Support
 - **PDF**: Regular PDFs using PyPDFLoader
@@ -295,7 +368,17 @@ Configure retrieval parameters at query time:
 - **Folders**: Batch processing with glob patterns
 
 ### Memory System
-The `UserMemory` class creates vector embeddings of user queries to provide personalized context in future conversations, stored in a separate ChromaDB collection.
+The `UserMemory` class embeds the user's own messages into a separate ChromaDB collection to
+provide personalized context in future conversations. It exposes two paths:
+
+- `.invoke({})` — compresses the user's messages into a short personal profile via `mistral`
+- `.retreival(query, k)` — semantic search over those messages, used by `recall_user_memory`
+
+Indexing is **idempotent**: documents are upserted under content-hash ids, so re-running the
+memory gate on a growing conversation will not duplicate earlier messages (which would
+otherwise shrink effective recall diversity to `k/m` after `m` gate hits). The collection is
+opened lazily rather than built from documents, so an empty history is safe and a persisted
+collection can be reopened in a later session.
 
 ---
 

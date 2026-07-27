@@ -3,16 +3,19 @@
 Static tools importable directly:
     calculator, wikipedia_lookup, web_search
 
-Factory (built at agent-init because it closes over a live Retrival instance):
+Factories (built at agent-init because they close over live agent state):
     make_search_current_doc(retrival) -> BaseTool
+    make_recall_user_memory(build_memory) -> BaseTool
 """
 import ast
 import operator
-from typing import Optional
+from typing import Annotated, Optional
 
 from langchain_core.tools import tool, BaseTool
+from langchain_core.runnables import RunnableConfig
 from langchain_community.retrievers import WikipediaRetriever
 from langchain_community.utilities import DuckDuckGoSearchAPIWrapper
+from langgraph.prebuilt import InjectedState
 
 
 _ALLOWED_BINOPS = {
@@ -124,3 +127,52 @@ def make_search_current_doc(retrival) -> BaseTool:
             return f"search_current_doc error: {e}"
 
     return search_current_doc
+
+
+def make_recall_user_memory(build_memory) -> BaseTool:
+    """Build a `recall_user_memory` tool over the user's own long-term memory.
+
+    `build_memory(messages, thread_id) -> UserMemory | None` is called on demand so the
+    tool always reads the live conversation and stays scoped to the calling thread.
+    `state` and `config` are injected by LangGraph and hidden from the LLM's tool schema,
+    so the model only ever sees `query` and `k`.
+    """
+
+    @tool
+    def recall_user_memory(query: str,
+                           k: int = 4,
+                           state: Annotated[dict, InjectedState] = None,
+                           config: RunnableConfig = None) -> str:
+        """Look up a fact the user ASKED you to remember from an earlier conversation.
+
+        Returns verbatim snippets of the user's own past messages — their name, family,
+        job, location, preferences, past projects.
+
+        Call this ONLY when the user ASKS a question about themselves that you cannot
+        already answer from the visible conversation, e.g. "what is my name?", "where do
+        I live?", "what did I tell you about my job?", "do you remember my project?".
+
+        Only a QUESTION can justify this tool. Do NOT call it when:
+        - the user is TELLING you something about themselves — "my name is X", "I live in
+          Y", "I work on Z" are statements, so there is nothing to look up;
+        - the answer is already visible earlier in this conversation;
+        - they greet you or make small talk ("hi", "hello there", "how are you?");
+        - the question is about the world, the loaded document, or current events — use
+          `wikipedia_lookup`, `search_current_doc`, or `web_search` instead.
+
+        After calling it, quote the actual detail you found back to the user as part of a
+        natural reply."""
+        try:
+            messages = (state or {}).get("messages", [])
+            thread_id = ((config or {}).get("configurable") or {}).get("thread_id", "default")
+            memory = build_memory(messages, thread_id)
+            if memory is None:
+                return "no user memory yet: the user has not told you anything about themselves."
+            context = memory.retreival(query, k)
+            if not context or not context.strip():
+                return f"no user memory matched: {query}"
+            return context
+        except Exception as e:
+            return f"recall_user_memory error: {e}"
+
+    return recall_user_memory

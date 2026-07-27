@@ -3,6 +3,7 @@ from tools.tools import (
     wikipedia_lookup,
     web_search,
     make_search_current_doc,
+    make_recall_user_memory,
 )
 
 __all__ = [
@@ -10,4 +11,5 @@ __all__ = [
     "wikipedia_lookup",
     "web_search",
     "make_search_current_doc",
+    "make_recall_user_memory",
 ]
