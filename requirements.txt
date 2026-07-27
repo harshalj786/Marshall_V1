@@ -1,0 +1,91 @@
+# Marshall V1 — pinned dependencies
+#
+# Captured from the working environment on 2026-07-27, verified with `pip check`
+# (no broken requirements) and by running the retrieval + memory + agent import
+# paths end to end. Tested on CPython 3.12.9 (Windows).
+#
+# Exact pins (==), not ranges. This project has already lost time to a LangGraph
+# resolution crisis whose fix survived only as a shell-history artifact; the point
+# of this file is that the next dependency change is a deliberate, reviewable diff
+# rather than an archaeology exercise.
+#
+#   pip install -r requirements.txt
+#
+# Scope: direct imports, plus every member of the langchain/langgraph family —
+# including the transitive ones. That family is pinned in full deliberately: the
+# crisis was caused by langgraph-checkpoint / langgraph-sdk / langchain-core
+# drifting against each other, and none of those three is imported directly, so a
+# direct-imports-only list would not have prevented it. Everything else (torch,
+# numpy, transformers, ...) is left to resolve normally — see the notes at the
+# bottom. For a byte-exact snapshot of this machine, use `pip freeze`; this file
+# is meant to stay readable.
+
+# --- Core orchestration -------------------------------------------------------
+# Co-pinned as one unit. Bump these together, never individually.
+langchain==1.2.12
+langchain-core==1.5.0
+langchain-community==0.4.1
+langchain-text-splitters==1.1.1
+langchain-experimental==0.4.1          # SemanticChunker (ingestion/chunking.py)
+langchain-huggingface==1.2.0           # embeddings (ingestion/vector_db.py)
+langchain-ollama==1.1.0                # ChatOllama — the only client with .bind_tools
+langgraph==1.1.2
+langgraph-checkpoint==3.0.1            # transitive; MemorySaver
+langgraph-prebuilt==1.0.8              # transitive; ToolNode, tools_condition, InjectedState
+langgraph-sdk==0.3.15                  # transitive
+ormsgpack==1.12.1                      # transitive; langgraph-checkpoint serialisation
+
+# --- LLM backend --------------------------------------------------------------
+# Models are NOT pinned by pip. Ollama must be running locally with:
+#   ollama pull mistral     # RAG pipelines, chat graphs, UserMemory compression
+#   ollama pull llama3.1    # AgentGraph — mistral does not reliably emit tool_calls
+ollama==0.6.2
+
+# --- Vector store + embeddings ------------------------------------------------
+chromadb==1.5.5
+sentence-transformers==5.3.0           # all-MiniLM-L6-v2, downloaded on first run
+
+# --- Document loading ---------------------------------------------------------
+pypdf==6.9.1                           # mode="pdf"
+youtube-transcript-api==1.2.4          # mode="youtube"
+beautifulsoup4==4.14.2                 # mode="web_url" (WebBaseLoader)
+# pdfplumber                           # mode="scanned_pdf" — SEE NOTE 2, currently NOT installed
+
+# --- Agent tools --------------------------------------------------------------
+wikipedia==1.4.0                       # tools/tools.py::wikipedia_lookup
+ddgs==9.14.4                           # tools/tools.py::web_search — SEE NOTE 3
+
+# --- Shared -------------------------------------------------------------------
+pydantic==2.12.4                       # mqr output schema, tool arg schemas
+
+
+# ==============================================================================
+# NOTES
+# ==============================================================================
+#
+# 1. torch is deliberately NOT pinned here.
+#    The working machine runs torch==2.6.0+cu124, a CUDA build. That `+cu124`
+#    local version identifier does not exist on PyPI, so pinning it would make
+#    `pip install -r requirements.txt` fail outright; and pinning plain
+#    `torch==2.6.0` would resolve to the CPU wheel and silently replace a working
+#    GPU install. torch arrives transitively via sentence-transformers, so leaving
+#    it unpinned is the only option that is safe in both directions.
+#
+#    To reproduce the GPU environment (RTX 4080 per docs/tech_stack.md):
+#        pip install torch==2.6.0 --index-url https://download.pytorch.org/whl/cu124
+#
+# 2. pdfplumber is NOT currently installed, so mode_docs="scanned_pdf" raises
+#    ImportError at load() time — verified, not assumed. README.md:280 advertises
+#    the mode. Left commented rather than pinned to a guessed version, because
+#    this file records what is known to work and that path is not currently
+#    exercised. Install and pin it when scanned PDFs are actually needed.
+#
+# 3. duckduckgo-search is NOT listed even though it is installed (8.1.1) and
+#    README.md:83 tells you to install it. The current langchain-community does
+#    `from ddgs import DDGS` — the renamed package — so duckduckgo-search is
+#    vestigial and unused. Pinning it would freeze dead surface area.
+#
+# 4. python-dotenv is not listed: .env exists with four keys but no module in the
+#    repository reads it (no dotenv / os.environ / os.getenv import anywhere).
+#    Add it when configuration is actually wired up — see R2 in
+#    docs/architecture_review.md.
