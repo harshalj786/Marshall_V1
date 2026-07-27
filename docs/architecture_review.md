@@ -8,8 +8,10 @@
 |---|---|
 | **C1** — corpus re-appended on every construction | `[FIXED]` — `ingestion/vector_db.py` |
 | **C2** — long-term memory silently non-durable | `[FIXED]` — `memory/long_term_memory.py` |
-| **C3** — no dependency manifest | open |
-| **H1–H6, M1–M10, L1–L13** | open |
+| **C3** — no dependency manifest | `[FIXED]` — `requirements.txt` |
+| **H1–H6, M1–M11, L1–L14** | open |
+
+All three criticals are now closed. **H1** (untrusted content in the system message) is the highest-severity open finding.
 
 **Note on `WHAT_I_BUILT.md`:** it is stale. It claims "`tools/tools.py` is empty — a stub I haven't filled in yet" (line 154, 161) and describes `UserMemory`'s collection as `"user's_history"` (line 101). Both are false as of the current tree — `tools/tools.py` holds five working tools, and the collection default is `"user_history"`. `README.md` is the accurate document.
 
@@ -616,9 +618,15 @@ Tool *results* are always `ToolMessage`s carrying a string. Errors are strings t
 *Risk:* `persist_directory=None` yields an in-memory Chroma. Memory worked flawlessly in a session and was gone on exit. A user testing the feature saw it work; a user relying on it lost everything.
 *Resolved by* a `UserWarning` at `UserMemory.__init__`. See §6-1. The ephemeral behaviour itself is unchanged and still the default — this makes it visible, it does not make it durable. Callers who want durable recall must still pass `user_history_directory_path`.
 
-**C3. No dependency manifest.**
-No `requirements.txt`, `pyproject.toml`, `setup.py`, `Pipfile`, or lock file anywhere. Install is unpinned `pip install` lines at `README.md:77-83`.
-*Risk:* the environment is unreproducible. This repository already had a LangGraph version crisis — `.claude/settings.local.json` records hand-pinning through `langgraph==0.3.34` and then `1.1.2`, plus `langgraph-checkpoint`, `langgraph-prebuilt`, `langgraph-sdk`, and `langchain-core` bounds. That knowledge lives only in a permissions allowlist. Directly contradicts `docs/security.md` §6 ("explicitly pin exact versions") and `docs/tech_stack.md` §5.
+**C3. No dependency manifest.** `[FIXED]`
+No `requirements.txt`, `pyproject.toml`, `setup.py`, `Pipfile`, or lock file anywhere. Install was unpinned `pip install` lines at `README.md:77-83`.
+*Risk:* the environment was unreproducible. This repository already had a LangGraph version crisis — `.claude/settings.local.json` records hand-pinning through `langgraph==0.3.34` and then `1.1.2`, plus `langgraph-checkpoint`, `langgraph-prebuilt`, `langgraph-sdk`, and `langchain-core` bounds. That knowledge lived only in a permissions allowlist. Directly contradicted `docs/security.md` §6 ("explicitly pin exact versions") and `docs/tech_stack.md` §5.
+
+> **Resolution.** `requirements.txt` pins 21 packages with `==`, verified against the running environment and by a clean `pip install --dry-run` (exit 0, no conflicts, nothing new to install) on CPython 3.12.9.
+>
+> The scope decision matters: the file pins **the entire langchain/langgraph family including its transitive members** — `langgraph-checkpoint`, `langgraph-sdk`, `ormsgpack` — none of which the code imports directly. A direct-imports-only manifest would not have prevented the original crisis, because that crisis *was* those packages drifting against each other and against `langchain-core`. Everything outside that family is left to resolve normally.
+>
+> **`torch` is deliberately not pinned.** The working machine runs `torch==2.6.0+cu124`; that local version identifier does not exist on PyPI, so pinning it would make `pip install -r` fail outright, while pinning plain `torch==2.6.0` would resolve to the CPU wheel and silently replace a working GPU install. It arrives transitively via `sentence-transformers`, so leaving it unpinned is the only option safe in both directions. The exact CUDA build and its `--index-url` are documented in the file.
 
 ### HIGH
 
@@ -668,6 +676,8 @@ No trim node in `_build_graph` (546-563), by design (`README.md:267-269`); `Memo
 
 **M10. No output-size cap or timeout on any tool.** `tools/tools.py` throughout. `wikipedia_lookup(k=3)` can inject tens of thousands of characters into the context in one `ToolMessage`.
 
+**M11. `mode_docs="scanned_pdf"` is broken in the working environment.** `ingestion/doc_loader.py:33-38`. `pdfplumber` is not installed, so `PDFPlumberLoader` imports fine (langchain defers the underlying import) and then raises `ImportError: pdfplumber package not found` at `.load()`. Verified by running it, not inferred from the import list. `README.md:280` and `WHAT_I_BUILT.md:63` both advertise the mode as working. *Discovered while pinning dependencies; left commented in `requirements.txt` rather than pinned to a guessed version, since the manifest records what is known to work.*
+
 ### LOW
 
 **L1.** Unused imports: `pipeline.py:3` (`BuildKnowledge`), `ingestion/doc_loader.py:4` (`SeleniumURLLoader`), `:9` (`BaseModel`, `Field`), `ingestion/chunking.py:1` (`Language`), `:6` (`Document`).
@@ -683,6 +693,7 @@ No trim node in `_build_graph` (546-563), by design (`README.md:267-269`); `Memo
 **L11.** `WHAT_I_BUILT.md` is stale (claims `tools/tools.py` is empty; wrong collection name).
 **L12.** `.claude/settings.local.json` allowlists `Bash(pip install *)`, `Bash(git push *)`, and `Bash(git commit *)` unbounded.
 **L13.** Stale artifact `db/user_history_test/` on disk.
+**L14.** `README.md:83` tells you to `pip install duckduckgo-search ddgs`. Only `ddgs` is used — the installed `langchain-community` does `from ddgs import DDGS`, so `duckduckgo-search` is vestigial. Omitted from `requirements.txt` rather than pinned as dead surface.
 
 ---
 
@@ -829,9 +840,11 @@ The three problems identified as blocking further work:
 
 1. ~~**C1** — index construction is welded to querying, so every start re-appends the corpus.~~ `[FIXED]` The re-append is gone and warm starts now skip embedding. The *structural* half — `Retrival` still cannot open a collection without re-supplying `docs` — remains open as R1 and still drives M1 and the voice startup cost.
 2. ~~**C2** — long-term memory silently defaults to non-durable.~~ `[FIXED]` It is now loud rather than silent. It is still ephemeral by default; callers must pass a path.
-3. **C3** — no dependency manifest, in a project that has already survived one LangGraph version crisis whose resolution is recorded only in a permissions allowlist. **Now the top open item**, and worth doing before the next dependency change rather than after.
+3. ~~**C3** — no dependency manifest, in a project that has already survived one LangGraph version crisis whose resolution is recorded only in a permissions allowlist.~~ `[FIXED]` 21 packages pinned and verified. The known-good baseline now exists in the repository rather than in shell history.
 
-The two lower-severity issues most worth folding into the next pass are **H1** (untrusted content in the system message — because `docs/roadmap.md` is about to add tools with real side effects, and the project's own security doc already forbids it) and **H4** (backporting `AgentGraph`'s error-handling discipline to `ChatRagWithMemoryGraph`, which is a ten-line change).
+**All three criticals are closed.** The highest-severity open finding is now **H1** — untrusted document content concatenated into the system message. That ordering matters for what comes next: `docs/roadmap.md` Phases 3-5 add Gmail, browser, and scraper tools, i.e. tools with real side effects, driven by a model whose system prompt can be written to by any PDF or web page it ingests. H1 is cheap to fix now and expensive to fix after those land.
+
+Worth folding into the same pass as H1: **H4**, backporting `AgentGraph`'s error-handling discipline to `ChatRagWithMemoryGraph`, which is a ten-line change to code that already has the correct pattern sitting a few hundred lines away.
 
 **One operational note carried over from C1:** the fix prevents new duplicates but does not remove ones already on disk. Any collection under `db/` built before this change should be deleted and rebuilt, or it will keep serving the copies it already accumulated.
 
