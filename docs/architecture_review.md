@@ -11,9 +11,12 @@
 | **C3** — no dependency manifest | `[FIXED]` — `requirements.txt` |
 | **H1** — untrusted content in the system message | `[FIXED]` — `pipeline_lg.py` |
 | **M11** — `scanned_pdf` mode broken | `[FIXED]` — `requirements.txt` |
-| **H2–H6, M1–M10, L1–L14** | open |
+| **H4** — divergent error handling between the memory gates | `[FIXED]` — `pipeline_lg.py` |
+| **H2, H3, H5, H6, M1–M10, L1–L14** | open |
 
-All three criticals and the highest-severity high are closed. **H2** (unbounded agent context plus an in-RAM checkpointer) is now the highest-severity open finding, and the one that most directly blocks voice. **H4** remains the cheapest win on the board at roughly ten lines.
+All three criticals plus H1 and H4 are closed. **H2** (unbounded agent context plus an in-RAM checkpointer) is now the highest-severity open finding, and the one that most directly blocks voice.
+
+The repository also now has its first tests, in `tests/` — see the H4 resolution.
 
 **Note on line references:** the H1 fix restructured the prompt constants at the top of `pipeline_lg.py`, so line numbers cited in §1–§7 for anything above `ChatRagGraph` have shifted. Symbol names are still accurate.
 
@@ -312,7 +315,7 @@ There is no `trim_history` node in `_build_graph` (546-563) — a deliberate cho
 | `retreival/retrieval.py:67-68` | `mqr`'s `PydanticOutputParser` raises `OutputParserException` whenever mistral emits prose around the JSON — unhandled, kills the turn. The prompt (34-42) works hard to prevent this but has no fallback. |
 | `retreival/retrieval.py:26-27` | Chroma / embedding / disk failures propagate out of `Retrival.__init__`, i.e. out of every pipeline and graph constructor, leaving a half-built object. |
 | `pipeline.py:66, 128, 215, 226` | No try/except around any Ollama call. A dropped connection terminates the REPL loop and discards `chat_history`. |
-| `pipeline_lg.py:226-232` | `ChatRagWithMemoryGraph._summarize_user_history_node` has **no** try/except, while the structurally identical `AgentGraph._summarize_user_history_node` (519-523) wraps `memory.invoke` and comments *"a memory failure must never destroy the user's turn"*. The right lesson was learned in one class and not backported to the other. |
+| `pipeline_lg.py:226-232` | `[FIXED — see H4]` `ChatRagWithMemoryGraph._summarize_user_history_node` had **no** try/except, while the structurally identical `AgentGraph._summarize_user_history_node` (519-523) wraps `memory.invoke` and comments *"a memory failure must never destroy the user's turn"*. The right lesson was learned in one class and not backported to the other. |
 | `tools/tools.py:70` | `import wikipedia` sits **outside** the `try` at 74. If the package is missing, `ImportError` escapes the tool's own error handling and propagates through `ToolNode`. |
 | `pipeline_lg.py:141, 292, 582` | All three `invoke` methods return `""` when no matching `AIMessage` is found. A silent empty string is indistinguishable from a legitimately empty answer. |
 | `memory/long_term_memory.py:58` | With an empty history, `"\n".join([])` is `""` — the model is asked to compress nothing and will invent a profile. |
@@ -654,9 +657,15 @@ No trim node in `_build_graph` (546-563), by design (`README.md:267-269`); `Memo
 `ingestion/doc_loader.py:19-79` and `retreival/retrieval.py:28-90` both fall off the end with no `else`.
 *Risk:* the error surfaces one or two layers away as a misleading `ValueError` from `Chunking` or a `TypeError` at `pipeline.py:41`. Debugging cost is high and the true cause is never named.
 
-**H4. Divergent error handling between the two memory gates.**
+**H4. Divergent error handling between the two memory gates.** `[FIXED]`
 `pipeline_lg.py:226-232` (unguarded) vs `512-523` (guarded, with the comment *"a memory failure must never destroy the user's turn"*).
-*Risk:* an Ollama hiccup on turn 5 of `ChatRagWithMemoryGraph` raises out of `invoke` and loses the user's turn. The correct pattern exists ten lines of scrolling away.
+*Risk:* an Ollama hiccup on turn 5 of `ChatRagWithMemoryGraph` raised out of `invoke` and lost the user's turn. The correct pattern existed ten lines of scrolling away.
+
+> **Resolution.** `ChatRagWithMemoryGraph._summarize_user_history_node` now carries the same guard, returning `{}` on failure so the turn completes and any previous summary survives — `user_history_summary` uses the default overwrite reducer, so an absent key means "no update" whereas returning the key with a blank value would erase a good profile.
+>
+> **The guard is deliberately wider than the one it mirrors.** `AgentGraph` wraps only `memory.invoke({})`, because it constructs its `UserMemory` in `_build_user_memory`, outside the try. The chat graph constructs it *inside* the node — and construction is what performs the Chroma write (see H6) — so guarding only `.invoke()` would have left a failed write still killing the turn. Both signatures are unchanged; in particular the chat graph's node did **not** gain `AgentGraph`'s `config` parameter, which it has no use for.
+>
+> **Verified against the pre-fix code.** `tests/test_memory_gate_resilience.py` covers compression failure, construction failure, the `{}`-not-blank distinction, the happy path, parity between the two graphs, and two end-to-end runs proving a gate-tripping turn still returns an answer and a good profile survives a later failure. Run against the unguarded version, 6 of the 9 fail; the 3 that pass are the two signature assertions and the happy path, which the fix should not affect. The end-to-end tests skip automatically when Ollama is unreachable.
 
 **H5. `Structure_pipeline` is broken and is a 133-line copy.**
 `pipeline.py:245-378`; variable mismatch between the template at 302/309 and the invocation at 361.
@@ -859,7 +868,9 @@ The three problems identified as blocking further work:
 
 **All three criticals are closed, and so is H1** — untrusted document content no longer reaches the system message in the LangGraph generation, verified by a live injection attempt rather than by inspection. That mattered for sequencing: `docs/roadmap.md` Phases 3-5 add Gmail, browser, and scraper tools with real side effects, driven by a model whose system prompt any ingested PDF or web page could previously write to. Fixing it before those land was much cheaper than after.
 
-The highest-severity open finding is now **H2** — unbounded message growth in `AgentGraph` combined with an in-RAM, per-object `MemorySaver`. It is also the one that most directly blocks voice: time-to-first-token grows monotonically through a conversation, which is the opposite of what real-time interaction needs, and nothing survives a restart. **H4** remains the cheapest item on the board — ten lines to backport `AgentGraph`'s error-handling discipline to `ChatRagWithMemoryGraph`, whose correct pattern already sits a few hundred lines away in the same file.
+**H4 is closed too** — `ChatRagWithMemoryGraph` now shares `AgentGraph`'s error-handling discipline, and the repository has its first tests as a result.
+
+The highest-severity open finding is now **H2** — unbounded message growth in `AgentGraph` combined with an in-RAM, per-object `MemorySaver`. It is also the one that most directly blocks voice: time-to-first-token grows monotonically through a conversation, which is the opposite of what real-time interaction needs, and nothing survives a restart. Note it is *not* a small fix, for the reason recorded at `README.md:267-269`: trimming an agent thread means cutting between an `AIMessage`'s `tool_calls` and its matching `ToolMessage`, which Ollama rejects. Any trim must reconcile those pairs — the same problem that blocks mid-generation cancellation in §10, so the two are worth solving together.
 
 **One caveat carried forward from the H1 fix:** `AgentGraph`'s tool routing has not been re-verified against `llama3.1`, which is not pulled locally. See R4.
 
