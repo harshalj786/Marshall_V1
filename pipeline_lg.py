@@ -249,12 +249,21 @@ class ChatRagWithMemoryGraph:
         return "generate"
 
     def _summarize_user_history_node(self, state: ChatState) -> dict:
-        memory = UserMemory(
-            chat_history=state["messages"],
-            persist_directory_path=self.user_history_directory_path,
-        )
-        summary = memory.invoke({})
-        return {"user_history_summary": summary}
+        try:
+            memory = UserMemory(
+                chat_history=state["messages"],
+                persist_directory_path=self.user_history_directory_path,
+            )
+            return {"user_history_summary": memory.invoke({})}
+        except Exception:
+            # a memory failure must never destroy the user's turn; keep the previous summary.
+            # Mirrors AgentGraph._summarize_user_history_node. The guard is wider than that
+            # one because this node also CONSTRUCTS the UserMemory, and construction is what
+            # writes to Chroma — AgentGraph does that in _build_user_memory, outside its try,
+            # so guarding only .invoke() here would still let a failed write kill the turn.
+            # Returning {} leaves user_history_summary untouched rather than blanking it:
+            # the key uses the default overwrite reducer, so absence means "no update".
+            return {}
 
     def _generate_node(self, state: ChatState) -> dict:
         summary = state.get("user_history_summary", "")
