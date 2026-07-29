@@ -12,11 +12,12 @@
 | **H1** — untrusted content in the system message | `[FIXED]` — `pipeline_lg.py` |
 | **M11** — `scanned_pdf` mode broken | `[FIXED]` — `requirements.txt` |
 | **H4** — divergent error handling between the memory gates | `[FIXED]` — `pipeline_lg.py` |
-| **H2, H3, H5, H6, M1–M10, L1–L14** | open |
+| **H2** — unbounded agent context | `[FIXED]` — `pipeline_lg.py`, `memory/reconciliation.py` |
+| **H3, H5, H6, M1–M10, L1–L14** | open |
 
-All three criticals plus H1 and H4 are closed. **H2** (unbounded agent context plus an in-RAM checkpointer) is now the highest-severity open finding, and the one that most directly blocks voice.
+All three criticals plus H1, H2 and H4 are closed. H2's second half is not: the agent's context no longer grows without bound, but `MemorySaver` is still in-RAM, so **the checkpointer** (`SqliteSaver`, `docs/roadmap.md` Phase 1) is what remains of it. **H6** (`UserMemory` writes from its constructor) is now the highest-severity fully-open finding.
 
-The repository also now has its first tests, in `tests/` — see the H4 resolution.
+The repository also now has its first tests, in `tests/` — see the H4 and H2 resolutions.
 
 **Note on line references:** the H1 fix restructured the prompt constants at the top of `pipeline_lg.py`, so line numbers cited in §1–§7 for anything above `ChatRagGraph` have shifted. Symbol names are still accurate.
 
@@ -649,9 +650,25 @@ No `requirements.txt`, `pyproject.toml`, `setup.py`, `Pipfile`, or lock file any
 >
 > **Still open in `pipeline.py`.** All four legacy classes retain the original pattern. Left untouched deliberately: that file holds uncommitted work in progress and `Structure_pipeline` is a known placeholder. Fix it there if the LangChain generation is kept — see R9 on deciding its fate first.
 
-**H2. Unbounded context growth in `AgentGraph` plus an unbounded in-RAM checkpointer.**
+**H2. Unbounded context growth in `AgentGraph` plus an unbounded in-RAM checkpointer.** `[FIXED — context growth; MemorySaver still in RAM]`
 No trim node in `_build_graph` (546-563), by design (`README.md:267-269`); `MemorySaver` at 461.
 *Risk:* prompt size, latency, and token cost grow linearly per turn until the context window is exceeded and the turn hard-fails. A long-running process additionally retains every checkpoint of every thread in RAM.
+
+> **Resolution (context growth).** A `summarize_and_trim` node now compresses the conversation on a cadence: every `summarize_every_n_turns` turns (default 7), once the list is longer than `summary_keep_recent` (default 14), everything before a safe cut point is folded into a running summary and the list is replaced with that summary plus the recent tail. Length now oscillates between the keep window and one inter-cycle interval above it instead of climbing. Two new state keys carry it — `running_summary` and `summary_turns_since` — and no existing node signature changed.
+>
+> **The cut point is the reusable half.** `memory/reconciliation.py:find_safe_cut_point(messages, target_index)` walks backward from a desired index to the nearest boundary that separates no `AIMessage.tool_calls` from its `ToolMessage`s — the constraint that made trimming look impossible in the first place (`README.md:267-269`). It validates the *split*, not one side of it, so the same primitive serves history trimming (which keeps the suffix) and voice barge-in (which keeps the prefix and must shed an interrupted, unanswered tail). It is a pure function over a plain message list: no graph, no state, no I/O, and tested that way.
+>
+> **Failure contract mirrors H4.** Every failure path — LLM error, blank completion, no safe boundary — returns `{}`. The message list survives untouched, `summary_turns_since` keeps climbing so the next turn retries, and the user's turn still answers. Persistence failures are swallowed one level lower: durability is lost, the trim is not.
+>
+> **Placement follows H1.** The summary is LLM-generated text derived from untrusted turns, so it travels in a `HumanMessage` inside `<conversation_summary>` tags, and the agent prompt's data rule now names that tag alongside `<user_profile>`. The system prompt itself is excluded from both the cut and the transcript, and is re-prepended after the trim — without that, the first trim would silently delete the agent's entire instruction block, since `invoke` only injects it into an empty history. The same caveat as R4 applies to the prompt edit: it lengthens one bullet, and this codebase's tool routing is empirically tuned to an 8B model that is not pulled locally.
+>
+> **Sessions.** `running_summary` is written to `{summary_persist_path}/conversation_summary.json` on every cycle, keyed by `thread_id` (a single global summary would replay one conversation into another) and written via a temp file and rename. `invoke` reloads it when a thread has no in-RAM history. Missing, unreadable, or corrupt file: the session starts fresh, never errors.
+>
+> **Verified.** `tests/test_reconciliation.py` (11 tests, pure) and `tests/test_summarization_cycle.py` (23 tests, real graph and real `ToolNode` with faked model handles) — cadence, list replacement, the tool-pair walk-back, the failure/retry contract, disk persistence and reload across a fresh graph. The two tool-boundary tests were re-run against a naive `min(target, len)` cut and both fail there, so they are load-bearing. The compressor prompt was also exercised against a live model end to end.
+>
+> *Still open:* the checkpointer. `MemorySaver` still holds every checkpoint of every thread in RAM and still loses everything at exit — the summary file is currently the only thing that survives a restart. `SqliteSaver` (`docs/roadmap.md` Phase 1) is the fix and is untouched here.
+>
+> *Known cost:* the first cycle of a conversation drops only one message (at 16 messages, keeping 14), so it pays a compression call for very little. Every later cycle drops a full interval. Raising `summary_keep_recent` or lowering `summarize_every_n_turns` shifts where that lands; the warm-up call itself is not worth a special case.
 
 **H3. Two critical-path functions return `None` on an unknown mode.**
 `ingestion/doc_loader.py:19-79` and `retreival/retrieval.py:28-90` both fall off the end with no `else`.
@@ -870,13 +887,15 @@ The three problems identified as blocking further work:
 
 **H4 is closed too** — `ChatRagWithMemoryGraph` now shares `AgentGraph`'s error-handling discipline, and the repository has its first tests as a result.
 
-The highest-severity open finding is now **H2** — unbounded message growth in `AgentGraph` combined with an in-RAM, per-object `MemorySaver`. It is also the one that most directly blocks voice: time-to-first-token grows monotonically through a conversation, which is the opposite of what real-time interaction needs, and nothing survives a restart. Note it is *not* a small fix, for the reason recorded at `README.md:267-269`: trimming an agent thread means cutting between an `AIMessage`'s `tool_calls` and its matching `ToolMessage`, which Ollama rejects. Any trim must reconcile those pairs — the same problem that blocks mid-generation cancellation in §10, so the two are worth solving together.
+**H2's first half is closed** — `AgentGraph` now compresses and trims its own history on a cadence, so time-to-first-token stops climbing with conversation length. The pair-reconciliation problem that made it look expensive was solved as a separate primitive rather than inside the node, precisely because §10 needs the same one for barge-in: `find_safe_cut_point` is a pure function over a message list and knows nothing about the graph. What remains of H2 is the checkpointer — `MemorySaver` is still in-RAM and per-object, so only the summary file survives a restart.
+
+The highest-severity fully-open finding is now **H6** — `UserMemory` writes to Chroma from its constructor, so every read path also writes.
 
 **One caveat carried forward from the H1 fix:** `AgentGraph`'s tool routing has not been re-verified against `llama3.1`, which is not pulled locally. See R4.
 
 **One operational note carried over from C1:** the fix prevents new duplicates but does not remove ones already on disk. Any collection under `db/` built before this change should be deleted and rebuilt, or it will keep serving the copies it already accumulated.
 
-For voice specifically: the graph topology is sound and needs no redesign. The work is entirely in the layer above (async, streaming, an event-driven input source, cancellation semantics) and the layer below (startup cost, blocking clients, per-session isolation). The single hardest problem is not async — it is that cancelling mid-ReAct-loop orphans a `tool_calls`/`ToolMessage` pair in a way Ollama rejects, which means barge-in requires a reconciliation protocol that does not exist yet.
+For voice specifically: the graph topology is sound and needs no redesign. The work is entirely in the layer above (async, streaming, an event-driven input source, cancellation semantics) and the layer below (startup cost, blocking clients, per-session isolation). The single hardest problem is not async — it is that cancelling mid-ReAct-loop orphans a `tool_calls`/`ToolMessage` pair in a way Ollama rejects. Half of that is now in place: `memory/reconciliation.py:find_safe_cut_point` decides where an interrupted history can be cut, and was written for both callers deliberately. What barge-in still owes is everything around it — cancelling the in-flight generation, deciding what to do with a tool that already started, and getting the cut applied to checkpointed state mid-turn.
 
 ---
 
