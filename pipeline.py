@@ -1,6 +1,6 @@
 from ingestion.doc_loader import LoadDocs
 from ingestion.chunking import Chunking
-from ingestion.vector_db import BuildKnowledge
+from ingestion.ingest import ensure_ingested
 from retreival.retrieval import Retrival
 from langchain_core.runnables import Runnable
 from typing import Optional,Literal
@@ -22,15 +22,16 @@ class NRagPipeline(Runnable):
         self.mode_chunks = mode_chunks
         self.directory_path = persist_directory_path
         self.mode_retreiver = mode_retreiver
-        if not glob_pattern:
-            obj_1 = LoadDocs(file_path=self.file_path,mode=self.mode_docs)
-            self.docs = obj_1.invoke({})
-        else:
-            obj_1 = LoadDocs(file_path=self.file_path,mode=self.mode_docs)
-            self.docs = obj_1.invoke({"glob_pattern": self.glob_pattern})
-        obj_2 = Chunking(chunk_size=500,chunk_overlap=50,mode=self.mode_chunks)# here arguments are hardcoded
-        self.chunked_docs = obj_2.invoke({"docs":self.docs})
-        self.obj_3 = Retrival(docs=self.chunked_docs,mode=self.mode_retreiver,collection_name=f"VDB for {self.file_path}",path=self.directory_path)
+        #ingestion is a separate step now: this loads, chunks and embeds only when the
+        #collection is missing, and otherwise opens what an earlier run wrote (R1)
+        self.collection_name = ensure_ingested(
+            file_path=self.file_path,
+            mode_docs=self.mode_docs,
+            glob_pattern=self.glob_pattern,
+            mode_chunks=self.mode_chunks,
+            persist_directory_path=self.directory_path,
+        )
+        self.obj_3 = Retrival(mode=self.mode_retreiver,collection_name=self.collection_name,path=self.directory_path)
     def invoke(self,input,config=None):
         #putting k here gives the power for how much context we want to send to the llm
         k : Optional[int] = input.get("k",4)
@@ -79,15 +80,14 @@ class ChatRagPipeline(Runnable):
         self.mode_chunks = mode_chunks
         self.directory_path = persist_directory_path
         self.mode_retreiver = mode_retreiver
-        if not glob_pattern:
-            obj_1 = LoadDocs(file_path=self.file_path,mode=self.mode_docs)
-            self.docs = obj_1.invoke({})
-        else:
-            obj_1 = LoadDocs(file_path=self.file_path,mode=self.mode_docs)
-            self.docs = obj_1.invoke({"glob_pattern": self.glob_pattern})
-        obj_2 = Chunking(chunk_size=500,chunk_overlap=50,mode=self.mode_chunks)# here arguments are hardcoded
-        self.chunked_docs = obj_2.invoke({"docs":self.docs})
-        self.obj_3 = Retrival(docs=self.chunked_docs,mode=self.mode_retreiver,collection_name=f"VDB for {self.file_path}",path =self.directory_path)
+        self.collection_name = ensure_ingested(
+            file_path=self.file_path,
+            mode_docs=self.mode_docs,
+            glob_pattern=self.glob_pattern,
+            mode_chunks=self.mode_chunks,
+            persist_directory_path=self.directory_path,
+        )
+        self.obj_3 = Retrival(mode=self.mode_retreiver,collection_name=self.collection_name,path =self.directory_path)
     def invoke(self,input_dict,config=None):
         chat_history = []
         k : Optional[int] = input_dict.get("k",4)
@@ -147,15 +147,14 @@ class ChatRagPipelineWithMemory(Runnable):
         self.mode_retreiver = mode_retreiver
         self.user_history_directory_path = user_history_directory_path
         self.chat_history = []
-        if not glob_pattern:
-            obj_1 = LoadDocs(file_path=self.file_path,mode=self.mode_docs)
-            self.docs = obj_1.invoke({})
-        else:
-            obj_1 = LoadDocs(file_path=self.file_path,mode=self.mode_docs)
-            self.docs = obj_1.invoke({"glob_pattern": self.glob_pattern})
-        obj_2 = Chunking(chunk_size=500,chunk_overlap=50,mode=self.mode_chunks)# here arguments are hardcoded
-        self.chunked_docs = obj_2.invoke({"docs":self.docs})
-        self.obj_3 = Retrival(docs=self.chunked_docs,mode=self.mode_retreiver,collection_name=f"VDB for {self.file_path}",path =self.directory_path)
+        self.collection_name = ensure_ingested(
+            file_path=self.file_path,
+            mode_docs=self.mode_docs,
+            glob_pattern=self.glob_pattern,
+            mode_chunks=self.mode_chunks,
+            persist_directory_path=self.directory_path,
+        )
+        self.obj_3 = Retrival(mode=self.mode_retreiver,collection_name=self.collection_name,path =self.directory_path)
     def invoke(self,input_dict,config=None):
         k : Optional[int] = input_dict.get("k",4)
         lambda_mult : Optional[float] = input_dict.get("lambda_mult",0.5)
@@ -215,7 +214,6 @@ Context:
                     response = chain.invoke({"query":user_query,"context":retreived_context,"chat_history_placeholder":self.chat_history})
                     self.chat_history.append(HumanMessage(content=user_query))
                     self.chat_history.append(AIMessage(content=response))
-                    # if len(self.chat_history)
                     print(response)
                 elif count>=5:
                  if count%5 ==0:
@@ -227,6 +225,8 @@ Context:
                  response = chain_2.invoke({"query":user_query,"context":retreived_context,"chat_history_placeholder":self.chat_history,"user_history":user_history})
                  self.chat_history.append(HumanMessage(content=user_query))
                  self.chat_history.append(AIMessage(content=response))
+                 if len(self.chat_history) >= 10:
+                        self.chat_history.clear()
                  print(f"{response}\n")
         return response
     def MsgHistory(self):
@@ -241,3 +241,137 @@ Context:
         user_history = obj.invoke({})
         print(user_history)
         return user_history
+class Structure_pipeline(Runnable):
+    def __init__(self,
+                 file_path,mode_docs : Optional[str] = "pdf" , 
+                 glob_pattern : Optional[str] = None,
+                 mode_chunks : Optional[Literal["recursive","semantic"]] = "recursive",
+                 persist_directory_path : Optional[str] = None,
+                 mode_retreiver : Optional[Literal["mmr","simple","mqr","wiki"]] = "simple",
+                 user_history_directory_path : Optional[str] = None):
+        self.file_path = file_path
+        self.mode_docs = mode_docs
+        self.glob_pattern = glob_pattern
+        self.mode_chunks = mode_chunks
+        self.directory_path = persist_directory_path
+        self.mode_retreiver = mode_retreiver
+        self.user_history_directory_path = user_history_directory_path
+        self.chat_history = []
+        if not glob_pattern:
+            obj_1 = LoadDocs(file_path=self.file_path,mode=self.mode_docs)
+            self.docs = obj_1.invoke({})
+        else:
+            obj_1 = LoadDocs(file_path=self.file_path,mode=self.mode_docs)
+            self.docs = obj_1.invoke({"glob_pattern": self.glob_pattern})
+        obj_2 = Chunking(chunk_size=500,chunk_overlap=50,mode=self.mode_chunks)# here arguments are hardcoded
+        self.chunked_docs = obj_2.invoke({"docs":self.docs})
+        self.obj_3 = Retrival(docs=self.chunked_docs,mode=self.mode_retreiver,collection_name=f"VDB for {self.file_path}",path =self.directory_path)
+    def invoke(self,input_dict,config=None):
+        k : Optional[int] = input_dict.get("k",4)
+        lambda_mult : Optional[float] = input_dict.get("lambda_mult",0.5)
+        language : Optional[str] = input_dict.get("language","en")
+        template = ChatPromptTemplate.from_messages([
+    ("system",""" You are an expert structural analysis tutor and assistant. \
+You are given a transcript from a YouTube video as your primary context. \
+Your sole purpose is to help users understand, analyze, and learn from \
+the structural analysis content presented in that video.
+
+## Your Capabilities
+- Answer questions strictly based on the video transcript provided
+- Explain structural analysis concepts mentioned in the video \
+(e.g., trusses, beams, frames, stress, strain, deflection, FEM, load analysis, etc.)
+- Clarify derivations, formulas, or methods discussed in the transcript
+- Summarize sections or the full video on request
+- Point out which part of the transcript supports your answer
+
+## Constraints
+- Only answer questions relevant to structural analysis and related engineering topics
+- Do not answer questions unrelated to the video content or structural analysis
+- If a question cannot be answered from the transcript, say so clearly — do not hallucinate
+- If the transcript is incomplete or unclear at a point, acknowledge it honestly
+
+## Response Style
+- Be concise and technically precise
+- Use proper structural engineering terminology
+- When referencing the transcript, mention the context \
+(e.g., "As explained in the video when discussing beam deflection...")
+- For mathematical content, present formulas clearly and explain each variable
+
+## Video Transcript
+<transcript>
+{transcript}
+</transcript>
+
+Use the transcript above as your primary source. You may supplement with general \
+structural analysis knowledge to clarify concepts from the video, but always \
+distinguish it from what the video explicitly covers.
+"""),MessagesPlaceholder(variable_name="Chat_history"),
+    ("human","{query}")
+])
+        template_with_user_history = ChatPromptTemplate.from_messages([
+    ("system", """You are an expert structural analysis tutor and assistant.
+Your name is Marshall. You are the AI son of Harshal.
+
+GUIDELINES:
+- Answer only questions related to structural analysis and the provided transcript context.
+- Extract only relevant structural analysis information from the context.
+- Do not include irrelevant details or answer off-topic questions.
+- If multiple sources exist, combine them logically.
+- If the answer is not found in the context, respond with:
+  "I could not find the answer in the provided transcript context."
+- Reference the transcript naturally without fake citations.
+- Use proper structural engineering terminology at all times.
+- For mathematical content (formulas, derivations), explain each variable clearly.
+- If the transcript is unclear or incomplete at a point, acknowledge it honestly.
+
+STRUCTURAL ANALYSIS SCOPE:
+- Topics include: trusses, beams, frames, arches, cables, stress, strain,
+  deflection, slope, shear force, bending moment, FEM, load analysis,
+  support reactions, influence lines, and related concepts.
+- Do not answer questions outside this scope.
+
+Transcript Context:
+{context}
+
+Also take a look at the user's personal history: {user_history} and answer accordingly.
+"""),
+    MessagesPlaceholder(variable_name="chat_history_placeholder"),
+    ("human", "{query}")
+])
+        llm = Ollama(model="mistral",temperature = 0)
+        parser = StrOutputParser()
+        chain = template | llm | parser
+        chain_2 = template_with_user_history | llm | parser
+        response = None
+        count = 0
+        while(True):
+          user_query = input("Ask a question or quit to exit or history for chat history")
+          retreived_dict = self.obj_3.invoke({"k":k,"lambda_mult":lambda_mult,"query":user_query})
+          retreived_context = "\n\n".join([doc.page_content for doc in retreived_dict["context"]])
+          if user_query.lower() == "quit":
+                break
+          elif user_query.lower() == "history":
+              for chat in self.chat_history:
+                  print(f"{chat}")
+              continue
+          else:
+                count = count + 1 
+                if count<5 :
+                    response = chain.invoke({"query":user_query,"context":retreived_context,"chat_history_placeholder":self.chat_history})
+                    self.chat_history.append(HumanMessage(content=user_query))
+                    self.chat_history.append(AIMessage(content=response))
+                    print(response)
+                elif count>=5:
+                 if count%5 ==0:
+                    obj_4 = UserMemory(
+                        chat_history=self.chat_history,
+                        persist_directory_path=self.user_history_directory_path
+                    )
+                    user_history = obj_4.invoke({})
+                 response = chain_2.invoke({"query":user_query,"context":retreived_context,"chat_history_placeholder":self.chat_history,"user_history":user_history})
+                 self.chat_history.append(HumanMessage(content=user_query))
+                 self.chat_history.append(AIMessage(content=response))
+                 if len(self.chat_history) >= 10:
+                        self.chat_history.clear()
+                 print(f"{response}\n")
+        return response
