@@ -264,9 +264,37 @@ keep several people's profiles apart.
 > extra call in four conversational turns, and the baseline over-triggers too. Set
 > `enable_recall_tool=False` or try `model="qwen2.5"` if this matters for your use case.
 
-Unlike the chat graphs, `AgentGraph` does **not** trim history: agent turns emit 3-4
-messages each, and cutting between an `AIMessage`'s `tool_calls` and its `ToolMessage`
-orphans the pair, which Ollama rejects.
+### Conversation Summarization
+
+`AgentGraph` compresses its own history instead of letting it grow. Every
+`summarize_every_n_turns` turns (default 7), once the message list is longer than
+`summary_keep_recent` (default 14), the `summarize_and_trim` node folds everything older
+into a running summary and replaces the list with that summary plus the recent tail:
+
+```python
+agent = AgentGraph(
+    file_path="doc.pdf",
+    summarize_every_n_turns=7,          # 0 disables the cycle
+    summary_keep_recent=14,             # messages kept verbatim
+    summary_persist_path="db/",         # defaults to persist_directory_path
+)
+
+print(agent.get_running_summary("mon"))    # the compressed record
+print(len(agent.get_history("mon")))       # bounded, not linear in turn count
+```
+
+The cut point is never chosen blindly: agent turns emit 3-4 messages each, and cutting
+between an `AIMessage`'s `tool_calls` and its `ToolMessage` orphans the pair, which Ollama
+rejects. `memory/reconciliation.py:find_safe_cut_point` walks backward to the nearest
+boundary that keeps every pair whole — a pure function over a plain message list, so voice
+barge-in can reuse it to discard an interrupted tail.
+
+The summary rides in a `HumanMessage` inside `<conversation_summary>` tags, never in the
+system message, for the same reason retrieved context does. It is written to
+`{summary_persist_path}/conversation_summary.json` keyed by `thread_id` and reloaded when
+a new process picks the conversation up; a missing or corrupt file simply starts fresh. If
+the summarizing call fails, nothing changes — the turn still answers and the next turn
+retries.
 
 ### Loading Different Document Types
 
