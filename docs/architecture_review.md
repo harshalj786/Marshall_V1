@@ -665,7 +665,7 @@ No trim node in `_build_graph` (546-563), by design (`README.md:267-269`); `Memo
 >
 > **Failure contract mirrors H4.** Every failure path — LLM error, blank completion, no safe boundary — returns `{}`. The message list survives untouched, `summary_turns_since` keeps climbing so the next turn retries, and the user's turn still answers. Persistence failures are swallowed one level lower: durability is lost, the trim is not.
 >
-> **Placement follows H1.** The summary is LLM-generated text derived from untrusted turns, so it travels in a `HumanMessage` inside `<conversation_summary>` tags, and the agent prompt's data rule now names that tag alongside `<user_profile>`. The system prompt itself is excluded from both the cut and the transcript, and is re-prepended after the trim — without that, the first trim would silently delete the agent's entire instruction block, since `invoke` only injects it into an empty history. The same caveat as R4 applies to the prompt edit: it lengthens one bullet, and this codebase's tool routing is empirically tuned to an 8B model that is not pulled locally.
+> **Placement follows H1.** The summary is LLM-generated text derived from untrusted turns, so it travels in a `HumanMessage` inside `<conversation_summary>` tags, and the agent prompt's data rule now names that tag alongside `<user_profile>`. The system prompt itself is excluded from both the cut and the transcript, and is re-prepended after the trim — without that, the first trim would silently delete the agent's entire instruction block, since `invoke` only injects it into an empty history. The same caveat as R4 applied to the prompt edit: it lengthens one bullet, and this codebase's tool routing is empirically tuned to an 8B model that was not pulled locally. That caveat is now discharged — this bullet was part of the prompt measured under R4, and routing was unchanged against the pre-H1 baseline.
 >
 > **Sessions.** `running_summary` is written to `{summary_persist_path}/conversation_summary.json` on every cycle, keyed by `thread_id` (a single global summary would replay one conversation into another) and written via a temp file and rename. `invoke` reloads it when a thread has no in-RAM history. Missing, unreadable, or corrupt file: the session starts fresh, never errors.
 >
@@ -777,12 +777,39 @@ All preserve current behavior. **Not implemented — recommendations only.** Ord
 *Change:* a base class owning ingestion (delegating to R1), the checkpointer, `get_history`, `run_chat`, and `_last_answer`. The three graph classes then contribute only their nodes and edges.
 *Trade-off:* inheritance across three classes whose graph shapes genuinely differ — `AgentGraph` has no `context` in state and no retrieve node. Keep the base strictly to plumbing; do **not** try to unify `ChatState` and `AgentState`, which are correctly different.
 
-### R4. Move retrieved context and the user profile out of the system message — *done for the graphs*
+### R4. Move retrieved context and the user profile out of the system message — *done for the graphs; routing caveat discharged*
 
 *Problem:* H1 — prompt injection from ingested documents, against the project's own `docs/security.md` §4.
 *Done:* implemented for all three LangGraph classes, as described under H1 in §8. Answer quality was re-checked on the real PDF across a two-turn exchange — answers stayed grounded and the follow-up still resolved against history.
 *Still open:* the same pattern in all four `pipeline.py` classes.
 *Trade-off, as realised:* the chat graphs use mistral and were re-verified live. **The agent's tool routing was not**, because only `mistral:latest` is pulled locally and `AgentGraph` needs `llama3.1`. Its prompt gained a data-rule bullet, and this codebase's agent behaviour is empirically tuned to an 8B model (`README.md:261-265`). The prompt/binding invariant and both `enable_recall_tool` branches were asserted structurally, but **routing behaviour should be re-checked against llama3.1 before relying on it** — a longer prompt is exactly the kind of change that shifts an 8B model's tool selection.
+
+> **Caveat discharged.** `llama3.1:latest` (4.9 GB, Ollama 0.24.0) was pulled and the routing was measured. **The accumulated prompt changes have not degraded tool selection.**
+>
+> **What actually changed in the agent prompt.** Only H1 and H2 touched `AGENT_SYSTEM_PROMPT_TEMPLATE`, and between them they added exactly one bullet — the data rule, which H2 then extended to name `<conversation_summary>`. H4 did not touch the agent prompt at all; it changed `ChatRagWithMemoryGraph._summarize_user_history_node`. The surface under suspicion was six lines.
+>
+> **Method.** Each query on its own `thread_id` so no history is shared, two trials each, the real `test_pdf's/Pipes_2025.pdf` loaded, five tools bound, memory seeded first so `recall_user_memory` had something to find. Then the whole run repeated as a control arm with the exact pre-H1 prompt reconstructed from `c100c2e` and set on the instance. Verification only — no repository code was modified, then or now.
+>
+> | Route | Query | Expected | Current prompt | Pre-H1 control |
+> |---|---|---|---|---|
+> | math | *what is 47 times 82?* | `calculator` | **2/2** | 2/2 |
+> | document | *what does the document say about OPVC pipes?* | `search_current_doc` | **2/2** | 2/2 |
+> | user | *what is my name?* | `recall_user_memory` | **2/2** | 2/2 |
+> | encyclopedic | *who invented the transistor?* | `wikipedia_lookup` | **2/2** | 2/2 |
+> | web | *what are the top news stories today?* | `web_search` | **2/2** | 2/2 |
+> | no tool | *what do you think makes a good explanation?* | answer directly | **0/2** | 0/2 |
+>
+> Identical on every route in both arms, including the miss. The full ReAct loop was exercised, not just selection: tool results reach the reply (`calculator` → "3,854", `recall_user_memory` → "Your name is Harshal", `search_current_doc` → real PDF content).
+>
+> **The one miss is a category boundary, not a regression.** "Answer directly" is reserved by the prompt for *greeting, chit-chat, opinion*; stable factual questions are routed to `wikipedia_lookup` by design. Probing the boundary: `hi`, `hello there`, `how are you?` and `do you prefer tea or coffee?` all correctly took no tool, while *what is the capital of France?* went to `wikipedia_lookup` — which is the prompt working as written. Only *what do you think makes a good explanation?* is a genuine miss, and it reads factually enough ("what makes a good explanation") to pull an 8B model to Wikipedia. It fails identically on the pre-H1 prompt.
+>
+> **Two things the run exposed that are not about the prompt.**
+> 1. *Statement over-triggering is worse than `README.md:261-265` documents.* It claims roughly one spurious call per four conversational turns; measured, **4 of 5 plain statements** ("I live in Pune", "I like building pipelines") triggered `recall_user_memory` or `wikipedia_lookup`. The control arm did the same (3 of 5). Only the first two statements are a controlled comparison — the seeds share one thread, so the arms' histories diverge as soon as they disagree — and those two were identical. Real, worse than documented, not caused by the prompt changes.
+> 2. *`wikipedia_lookup` is the latency problem, not routing.* 53–82 s inside the agent, with two answers reporting the Wikipedia API unavailable; standalone the same call returns in 22.6 s. That is finding K (no timeout, no backoff, no rate-limit handling) surfacing under repeated agent use. In §10 terms it is a 53–82 s dead-air stall on a turn that routed correctly.
+>
+> **A trap for whoever tests a tool next.** `llama3.1` emits proper structured `tool_calls` with four or five tools bound, but falls back to writing the call out as prose JSON when only **one** tool is bound — and it mangles the name, emitting the description's first word rather than the function's. The system prompt makes no difference either way. `AgentGraph` always binds four or five, so it never hits this, but a minimal one-tool reproduction will show a failure that the real system does not have. This is the same prose-instead-of-`tool_call` symptom the code comments warn about, reached by a different route.
+>
+> **Still not covered by any test.** Every `AgentGraph` test monkeypatches `agent.llm` — `test_summarization_cycle.py` does so at 15 sites, deliberately, because faking the model is what makes the graph behaviour assertable. The result is that **no test in the repository exercises tool routing**, and the numbers above came from a throwaway harness. Routing is verified as of this commit and will silently rot; pinning even one route as a `needs_llama31`-marked test would be the cheap fix.
 
 ### R5. Give `UserMemory` a durability guard and a read-only mode — *partially done*
 
@@ -907,7 +934,7 @@ The three problems identified as blocking further work:
 
 The highest-severity fully-open finding is now **H6** — `UserMemory` writes to Chroma from its constructor, so every read path also writes.
 
-**One caveat carried forward from the H1 fix:** `AgentGraph`'s tool routing has not been re-verified against `llama3.1`, which is not pulled locally. See R4.
+~~**One caveat carried forward from the H1 fix:** `AgentGraph`'s tool routing has not been re-verified against `llama3.1`, which is not pulled locally. See R4.~~ `[DISCHARGED]` `llama3.1` was pulled and routing measured against both the current and the pre-H1 prompt: identical on every route, so the H1/H2 prompt edits did not shift tool selection. Full results under R4.
 
 **One operational note carried over from C1, now sharper under R1:** the fix prevents new duplicates but does not remove ones already on disk. Any collection under `db/` built before this change should be deleted and rebuilt, or it will keep serving the copies it already accumulated. R1 makes this stickier rather than better: `ensure_ingested` sees a populated collection and skips ingestion entirely, so a stale or duplicate-laden collection is now never even re-examined. The same applies to a chunk-size change — deleting the collection directory is the only way to force a rebuild.
 
