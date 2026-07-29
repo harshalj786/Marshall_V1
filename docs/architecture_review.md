@@ -13,11 +13,14 @@
 | **M11** — `scanned_pdf` mode broken | `[FIXED]` — `requirements.txt` |
 | **H4** — divergent error handling between the memory gates | `[FIXED]` — `pipeline_lg.py` |
 | **H2** — unbounded agent context | `[FIXED]` — `pipeline_lg.py`, `memory/reconciliation.py` |
+| **R1** — retrieval welded to index construction | `[FIXED]` — `ingestion/ingest.py`, `ingestion/vector_db.py`, `retreival/retrieval.py` |
 | **H3, H5, H6, M1–M10, L1–L14** | open |
 
 All three criticals plus H1, H2 and H4 are closed. H2's second half is not: the agent's context no longer grows without bound, but `MemorySaver` is still in-RAM, so **the checkpointer** (`SqliteSaver`, `docs/roadmap.md` Phase 1) is what remains of it. **H6** (`UserMemory` writes from its constructor) is now the highest-severity fully-open finding.
 
-The repository also now has its first tests, in `tests/` — see the H4 and H2 resolutions.
+R1 is listed in the table because its structural half is now closed too: ingestion is an explicit step (`ingestion/ingest.py`) and `Retrival` can open a collection it did not build. That was the first item in the §10 voice sequencing, and it is what M1 and the startup-cost finding both rested on.
+
+The repository also now has its first tests, in `tests/` — see the H4, H2 and R1 resolutions.
 
 **Note on line references:** the H1 fix restructured the prompt constants at the top of `pipeline_lg.py`, so line numbers cited in §1–§7 for anything above `ChatRagGraph` have shifted. Symbol names are still accurate.
 
@@ -65,6 +68,8 @@ Four philosophies are visible, and they are not fully consistent with each other
 4. For graphs only: build the LLM handle, the prompts, a `MemorySaver`, and compile the `StateGraph`.
 
 There is no cache and no "collection already exists, skip" check. Constructing the object *is* the ingestion.
+
+> **No longer true as of R1.** Six of the seven constructors now call `ensure_ingested(...)`, which *is* the "collection already exists, skip" check, and then open the collection by name. Step 3 above happens only on a cold index; on a warm one the source document is never read. `Structure_pipeline` is the seventh and still does the above verbatim.
 
 **Response flow** then depends on which class you built. Three distinct shapes:
 
@@ -171,11 +176,11 @@ tools/__init__.py          → tools.tools (re-export)
 ### Shared globals
 
 - **`memory/long_term_memory.py:12` — `_EMBEDDING_MODEL`.** A module-level singleton behind `_get_embedding_model()` (14-22), added because construction costs ~3 s and the memory gate plus recall tool rebuild `UserMemory` frequently. Correct optimization; the check-then-set is not synchronized (§4).
-- **`ingestion/vector_db.py:10-12` has no such singleton.** `BuildKnowledge.__init__` constructs a fresh `HuggingFaceEmbeddings` every time — i.e. once per `Retrival`, i.e. once per pipeline/graph object. Inconsistent with `UserMemory`.
+- ~~**`ingestion/vector_db.py:10-12` has no such singleton.** `BuildKnowledge.__init__` constructs a fresh `HuggingFaceEmbeddings` every time — i.e. once per `Retrival`, i.e. once per pipeline/graph object. Inconsistent with `UserMemory`.~~ `[FIXED — see R1]` It has one now, behind `_get_embedding_model()`, for the same reason and with the same check-then-set race (D).
 
 ### Tight coupling
 
-- **`Retrival` owns `BuildKnowledge` in its constructor** (`retreival/retrieval.py:26-27`). You cannot construct a `Retrival` over an *existing* collection without re-supplying and re-ingesting `docs`. Retrieval and index-construction are welded together. This is the root cause of the duplicate-write problem in §8.
+- ~~**`Retrival` owns `BuildKnowledge` in its constructor** (`retreival/retrieval.py:26-27`). You cannot construct a `Retrival` over an *existing* collection without re-supplying and re-ingesting `docs`. Retrieval and index-construction are welded together. This is the root cause of the duplicate-write problem in §8.~~ `[FIXED — see R1]` `docs` is now optional; omitting it opens an existing collection and raises `CollectionNotFoundError` if there is none. `Retrival` still *delegates* to `BuildKnowledge`, deliberately — that is the single funnel guaranteeing both sides embed with the same model and address the same sanitized name.
 - **All six top-level classes hard-code their entire ingestion chain in `__init__`.** There is no way to inject a pre-built `Retrival` into `AgentGraph` or any pipeline.
 - **The LLM is constructed at the point of use**, not injected: `pipeline.py:64,112,196,342`, `retreival/retrieval.py:22`, `memory/long_term_memory.py:50`, `pipeline_lg.py:89,193,460`. Seven independent construction sites for what is conceptually one configured backend.
 
@@ -183,12 +188,12 @@ tools/__init__.py          → tools.tools (re-export)
 
 | Duplicate | Locations | Notes |
 |---|---|---|
-| The load→chunk→`Retrival` constructor block | `pipeline.py:25-33, 82-90, 150-158, 261-269`; `pipeline_lg.py:79-88, 182-191, 419-428` | **7 copies**, character-for-character identical apart from variable names. |
+| The load→chunk→`Retrival` constructor block | `pipeline.py:25-33, 82-90, 150-158, 261-269`; `pipeline_lg.py:79-88, 182-191, 419-428` | **7 copies**, character-for-character identical apart from variable names. `[MOSTLY FIXED — see R1]` Six of the seven now call `ensure_ingested(...)` and open by name; the seventh is `Structure_pipeline`, left on the old path on purpose. |
 | The REPL loop (`while True` / `input` / `quit` / `history`) | `pipeline.py:116-131, 202-231, 348-377`; `pipeline_lg.py:143-159, 294-309, 584-596` | **6 copies.** |
 | `get_history(thread_id)` | `pipeline_lg.py:161-163, 311-313, 598-600` | 3 identical copies. |
 | "last AIMessage" extraction | `pipeline_lg.py:137-141, 288-292, 577-582` | 3 copies, the third with an extra `tool_calls` filter. |
 | The Marshall system prompt | `pipeline.py:96-111, 163-178` (inline) and `pipeline_lg.py:36-48` (constant) | The graph version correctly hoisted it to a module constant; `pipeline.py` did not. |
-| Collection-name sanitization regex | `retreival/retrieval.py:17-21` and `pipeline_lg.py:437-439` | The second carries the comment *"UserMemory does not sanitize collection_name — mirror retreival/retrieval.py:17-21"*. A knowingly-copied invariant. |
+| Collection-name sanitization regex | `retreival/retrieval.py:17-21` and `pipeline_lg.py:437-439` | The second carries the comment *"UserMemory does not sanitize collection_name — mirror retreival/retrieval.py:17-21"*. A knowingly-copied invariant. `[FIXED — see R1]` Both call `ingestion.vector_db.sanitize_collection_name`, which ingestion also uses — the name is now impossible to spell two ways. |
 | `ChatRagPipelineWithMemory` vs `Structure_pipeline` | `pipeline.py:134-244` vs `245-378` | ~95% identical; only the prompt strings differ. 133 lines duplicated to change two prompts. |
 
 ### Modules doing too much
@@ -274,8 +279,8 @@ Each result becomes a `ToolMessage`; the edge `tools → agent` (562) loops back
 
 > **Resolution.** `BuildKnowledge.invoke` now opens the collection with `Chroma(...)` and upserts under a `_chunk_id` fingerprint of *metadata + content* — metadata included so a header repeated on every page of a PDF stays as many distinct chunks rather than collapsing into one. Ids already present are skipped via a `get(ids=..., include=[])` probe, so a warm start costs one metadata read instead of re-embedding the corpus; if that probe fails it falls back to a plain upsert, which is slower but still correct. Measured on `test_pdf's/Pipes_2025.pdf` (48 chunks): collection count across three consecutive builds was `[4, 8, 12]` on the four-doc reproduction before the change and is `[48, 48, 48]` after, with the top-4 retrieval identical on builds 1 and 3.
 
-**B. No embedding-model singleton in `BuildKnowledge`.**
-`ingestion/vector_db.py:10-12` constructs `HuggingFaceEmbeddings` per instance; `ingestion/chunking.py:14-16` does the same in semantic mode. Only `memory/long_term_memory.py:14-22` caches. Every additional pipeline object loads another full MiniLM into RAM (~90 MB + torch overhead), and pays the ~3 s construction the memory module explicitly calls out.
+**B. No embedding-model singleton in `BuildKnowledge`.** `[FIXED — see R1]`
+`ingestion/vector_db.py:10-12` constructed `HuggingFaceEmbeddings` per instance; `ingestion/chunking.py:14-16` still does the same in semantic mode. It now caches like `memory/long_term_memory.py:14-22`, which R1 made load-bearing rather than merely an optimization: ingestion and retrieval became separate calls, and sharing one instance is what makes "both sides embed with the same function" structural instead of a convention. (The two modules still hold *separate* singletons over the same model, from two different import paths — that is M2/R10, untouched.)
 
 **C. `AgentGraph._memory_cache` is unbounded and unsynchronized.**
 `pipeline_lg.py:443`, written at 489 and 496, read at 476. Keyed by `thread_id`, never evicted — a long-lived process serving many conversations leaks one `UserMemory` (each holding a Chroma client handle) per thread forever. The read-modify-write is not lock-protected, so two threads on the same `thread_id` can each construct a `UserMemory` and double-write.
@@ -364,7 +369,7 @@ There is no `trim_history` node in `_build_graph` (546-563) — a deliberate cho
 
 These are the three that pay for themselves; the rest of the codebase does *not* need more indirection.
 
-1. **A `KnowledgeBase` / index-lifecycle object** that separates "build or open an index" from "query an index" — this is the one abstraction that fixes the duplicate-write bug (A) rather than papering over it, and it simultaneously removes the 7-way duplicated constructor block.
+1. ~~**A `KnowledgeBase` / index-lifecycle object** that separates "build or open an index" from "query an index" — this is the one abstraction that fixes the duplicate-write bug (A) rather than papering over it, and it simultaneously removes the 7-way duplicated constructor block.~~ `[BUILT — see R1]` It landed as two functions in `ingestion/ingest.py` rather than a class, because nothing needed to hold state between building and querying: `ensure_ingested` returns a collection name, and `Retrival` opens it. A class would have added a lifetime to manage for no gain.
 2. **A single config/settings object** (`docs/todo.md` §0 already calls for `config/settings.py`) carrying chunk sizes, model names, embedding name, k/lambda defaults, memory cadence, and paths. This collapses ~40 hardcoded literals into one place.
 3. **A shared `BaseRagGraph`** holding `get_history`, `run_chat`, the last-`AIMessage` extraction, and checkpointer wiring — removing 3-6 copies each of four methods in `pipeline_lg.py`.
 
@@ -741,13 +746,24 @@ No trim node in `_build_graph` (546-563), by design (`README.md:267-269`); `Memo
 
 All preserve current behavior. **Not implemented — recommendations only.** Ordered by value-to-risk.
 
-### R1. Split index construction from index querying — *partially done*
+### R1. Split index construction from index querying — *done*
 
 *Problem:* C1, M1, M6, and the tight `Retrival`→`BuildKnowledge` coupling all originate in one decision — `Retrival.__init__` (`retreival/retrieval.py:26-27`) builds the index as a side effect of constructing a querier.
-*Done:* the C1 half — `BuildKnowledge.invoke` now opens-or-creates and upserts by hash id, so re-ingestion is idempotent and a warm start skips embedding. A single batched `get(ids=..., include=[])` turned out to be enough; the manifest file suggested below was not needed.
-*Still open:* the structural half. `Retrival` still *requires* `docs` and still builds its index inside its constructor, so you cannot open an existing collection without re-supplying and re-chunking the source. That is what keeps M1 (the 7× duplicated ingestion block) and the startup cost in §10 alive.
-*Change:* let `Retrival` accept either `docs` (build) or an existing store handle (open), keeping the current signature working so no caller changes.
-*Trade-off:* ids are derived from chunk metadata + text, so changing `chunk_size`/`chunk_overlap` produces entirely new ids and the old chunks linger alongside the new ones. Re-chunking with different parameters still needs a manual collection reset.
+*Done, first half (C1):* `BuildKnowledge.invoke` opens-or-creates and upserts by hash id, so re-ingestion is idempotent and a warm start skips embedding. A single batched `get(ids=..., include=[])` turned out to be enough; the manifest file suggested below was not needed.
+
+> **Resolution of the structural half.** Three changes:
+>
+> 1. **`ingestion/ingest.py`** is new and holds ingestion as its own step: `ingest(...)` runs load → chunk → index and returns the collection name; `ensure_ingested(...)` does that only when the collection is not already on disk; `collection_name_for(file_path)` is the naming convention both sides derive from. It imports downwards only, so the dependency graph stays a DAG — the composition lives in `ingestion/`, and nothing below the top layer imports `retreival/`.
+> 2. **`ingestion/vector_db.py`** gained `sanitize_collection_name` (moved out of `Retrival` — `pipeline_lg.py`'s hand-copy of the same regex now calls it, so the "knowingly-copied invariant" in §2 is gone), `collection_exists`, a `CollectionNotFoundError`, and the process-wide embedding singleton `BuildKnowledge` was missing (§4-B). `docs` is now optional.
+> 3. **`Retrival`** takes `docs=None` to *open* rather than build. The six live pipeline/graph constructors call `ensure_ingested` and then open by name.
+>
+> **Failing loudly was the point.** Opening a collection that does not exist raises `CollectionNotFoundError` naming the collection and how to build it. The alternative — an empty store — would have retrieved zero chunks forever while every prompt answered *"I could not find the answer in the provided context"*, with nothing anywhere saying the index was never built. `collection_exists` counts rows rather than checking presence, so a half-finished ingest is treated as absent, and it goes to `chromadb` directly rather than opening a langchain `Chroma`, whose constructor is get-or-**create** — asking that wrapper whether a collection exists would create the thing being asked about. The existence check therefore runs *before* any `Chroma(...)` call, so a failed open leaves nothing behind.
+>
+> **Measured** on `test_pdf's/Pipes_2025.pdf` (48 chunks), `ChatRagGraph` construction in a fresh process: **12.5 s cold → 7.9 s warm**. What remains in the warm case is a ~4.8 s MiniLM load, which is needed to embed *queries* and is not ingestion. Warm construction now reads the source document zero times — which matters far more for `mode_docs="youtube"` and `"web_url"`, where every construction previously re-hit the network. Retrieval keeps working after the source file is deleted (`tests/test_ingestion_retrieval_split.py`), which is the independence claim stated as sharply as it can be.
+>
+> **Deliberately not changed:** `Structure_pipeline` is a known placeholder and stays on the old build-in-constructor path; `Retrival(docs=...)` still works exactly as before, and a test pins that. `mode="wiki"` with no docs no longer opens a store at all — that branch goes to Wikipedia and never reads one, so demanding a collection it will not touch would fail a valid caller.
+
+*Trade-off:* ids are derived from chunk metadata + text, so changing `chunk_size`/`chunk_overlap` produces entirely new ids and the old chunks linger alongside the new ones. Re-chunking with different parameters still needs a manual collection reset. This is now sharper than before, because the pipelines no longer re-chunk on a warm start: `ensure_ingested` sees a populated collection and skips, so a chunk-size change made in code is silently *not* applied to an existing collection until it is deleted. The defaults live in `ingestion/ingest.py` as `DEFAULT_CHUNK_SIZE`/`DEFAULT_CHUNK_OVERLAP` so at least there is one place to look.
 
 ### R2. Introduce `config/settings.py`
 
@@ -854,14 +870,14 @@ That said, the *graph topology* is not the obstacle. The obstacle is the layer d
 
 **Continuous conversation loops — blocked.**
 - The only loops that exist are `while True: input(...)` (six sites).
-- **Startup latency is fatal to a voice session:** the constructor synchronously loads, chunks, embeds, and writes the entire document (`pipeline_lg.py:419-428`) plus a MiniLM model (`ingestion/vector_db.py:10-12`) before returning. Nothing can be said until that finishes. The C1 fix materially improves the *warm* case — a restart against an existing collection now skips embedding entirely and pays only a metadata read — but the cold case, the model load, and the load+chunk work ahead of it are all untouched, so this remains the first thing to fix for voice.
+- ~~**Startup latency is fatal to a voice session:** the constructor synchronously loads, chunks, embeds, and writes the entire document (`pipeline_lg.py:419-428`) plus a MiniLM model (`ingestion/vector_db.py:10-12`) before returning.~~ `[FIXED — see R1]` Ingestion is now an explicit step and the constructors run it only on a cold index; a warm start opens the existing collection without reading the source at all. Measured 12.5 s → 7.9 s on the 48-chunk test PDF, and the saving grows with corpus size — and with `mode_docs="youtube"`/`"web_url"`, where the old path re-fetched over the network on every construction. **What is left of this is not ingestion:** ~4.8 s of the remaining 7.9 s is the MiniLM load, needed to embed queries, and it is still synchronous and still ahead of the first word. Loading it eagerly at process start, or accepting a pre-built embedding handle, is the next cut.
 - **The memory gate injects a multi-second stall into turns 5, 10, 15…** `_summarize_user_history_node` (512-523) runs a full LLM compression synchronously in the request path, and `UserMemory.invoke` (`memory/long_term_memory.py:47-59`) sends the entire history in one prompt so the stall grows with conversation length. In text this is a pause; in voice it is dead air at a fixed, predictable cadence.
 - **`AgentGraph`'s unbounded history** (§4-F) means time-to-first-token grows monotonically through a long conversation — the exact opposite of what voice needs.
 - Nothing measures latency. There is no instrumentation for time-to-first-token, per-node duration, or tool latency, so there is no baseline to regress against.
 
 ### Recommended sequencing for voice (not implemented)
 
-1. Fix startup cost first (R1) — nothing else matters if the session can't begin.
+1. ~~Fix startup cost first (R1) — nothing else matters if the session can't begin.~~ `[DONE]` The ingestion half is closed; the MiniLM load is what is left of it, and it is a fixed cost rather than one that scales with the corpus.
 2. Make the memory gate non-blocking (background task or incremental summarization) — the fixed-cadence stall is the most audible defect.
 3. Add async node variants and async tool coroutines, then switch the public API to `astream`.
 4. Add a durable checkpointer (R8) before adding cancellation, so a corrupted mid-turn state is recoverable.
@@ -879,7 +895,7 @@ The agent layer (`pipeline_lg.py:327-617` and `tools/tools.py`) is materially be
 
 The three problems identified as blocking further work:
 
-1. ~~**C1** — index construction is welded to querying, so every start re-appends the corpus.~~ `[FIXED]` The re-append is gone and warm starts now skip embedding. The *structural* half — `Retrival` still cannot open a collection without re-supplying `docs` — remains open as R1 and still drives M1 and the voice startup cost.
+1. ~~**C1** — index construction is welded to querying, so every start re-appends the corpus.~~ `[FIXED]` The re-append is gone and warm starts now skip embedding. ~~The *structural* half — `Retrival` still cannot open a collection without re-supplying `docs` — remains open as R1 and still drives M1 and the voice startup cost.~~ `[ALSO FIXED]` The structural half closed under R1: ingestion is an explicit step in `ingestion/ingest.py`, `Retrival(docs=None)` opens what it wrote, and a missing collection raises instead of returning nothing.
 2. ~~**C2** — long-term memory silently defaults to non-durable.~~ `[FIXED]` It is now loud rather than silent. It is still ephemeral by default; callers must pass a path.
 3. ~~**C3** — no dependency manifest, in a project that has already survived one LangGraph version crisis whose resolution is recorded only in a permissions allowlist.~~ `[FIXED]` 21 packages pinned and verified. The known-good baseline now exists in the repository rather than in shell history.
 
@@ -893,7 +909,7 @@ The highest-severity fully-open finding is now **H6** — `UserMemory` writes to
 
 **One caveat carried forward from the H1 fix:** `AgentGraph`'s tool routing has not been re-verified against `llama3.1`, which is not pulled locally. See R4.
 
-**One operational note carried over from C1:** the fix prevents new duplicates but does not remove ones already on disk. Any collection under `db/` built before this change should be deleted and rebuilt, or it will keep serving the copies it already accumulated.
+**One operational note carried over from C1, now sharper under R1:** the fix prevents new duplicates but does not remove ones already on disk. Any collection under `db/` built before this change should be deleted and rebuilt, or it will keep serving the copies it already accumulated. R1 makes this stickier rather than better: `ensure_ingested` sees a populated collection and skips ingestion entirely, so a stale or duplicate-laden collection is now never even re-examined. The same applies to a chunk-size change — deleting the collection directory is the only way to force a rebuild.
 
 For voice specifically: the graph topology is sound and needs no redesign. The work is entirely in the layer above (async, streaming, an event-driven input source, cancellation semantics) and the layer below (startup cost, blocking clients, per-session isolation). The single hardest problem is not async — it is that cancelling mid-ReAct-loop orphans a `tool_calls`/`ToolMessage` pair in a way Ollama rejects. Half of that is now in place: `memory/reconciliation.py:find_safe_cut_point` decides where an interrupted history can be cut, and was written for both callers deliberately. What barge-in still owes is everything around it — cancelling the in-flight generation, deciding what to do with a tool that already started, and getting the cut applied to checkpointed state mid-turn.
 

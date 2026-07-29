@@ -1,5 +1,5 @@
 from langchain_community.retrievers import WikipediaRetriever
-from ingestion.vector_db import BuildKnowledge
+from ingestion.vector_db import BuildKnowledge, sanitize_collection_name
 from langchain_core.runnables import Runnable
 from langchain_core.documents import Document
 from typing import Literal,Optional
@@ -7,24 +7,37 @@ from langchain_community.llms import Ollama
 from langchain_core.prompts import PromptTemplate
 from langchain_core.output_parsers import PydanticOutputParser
 from pydantic import BaseModel,Field
-import re
 class Retrival(Runnable):
-    def __init__(self,docs:list[Document],mode:Literal["mmr","simple","mqr","wiki"],collection_name:Optional[str] = "Default",path : Optional[str] = None):
+    """Query an index. Building one is `ingestion.ingest`'s job, not this class's.
+
+    Pass `docs` to build-then-query, as every caller used to. Omit it to OPEN a
+    collection an earlier run already wrote — no loading, no chunking, no embedding of
+    the corpus, which is what lets a conversation start against an existing index at
+    roughly the cost of the query itself (R1 in docs/architecture_review.md).
+
+    Omitting `docs` when no such collection exists raises `CollectionNotFoundError`
+    rather than quietly querying an empty store.
+    """
+    def __init__(self,docs:Optional[list[Document]] = None,mode:Literal["mmr","simple","mqr","wiki"] = "simple",collection_name:Optional[str] = "Default",path : Optional[str] = None):
         #mqr stands for multi query retrival
         self.docs = docs
         self.mode = mode
         self.path = path
-        clean_name = re.sub(r'[^a-zA-Z0-9._-]', '_', collection_name)
-        clean_name = clean_name.strip('_.-')
-        if len(clean_name) < 3:          
-          clean_name = "VDB_collection"
-        self.collection_name = clean_name
+        #sanitized through the shared helper so the name this queries is byte-identical
+        #to the one ingestion wrote; two copies of the regex is two ways to disagree
+        self.collection_name = sanitize_collection_name(collection_name)
         self.llm = Ollama(model="mistral",temperature = 0)#this llm is only for removing ambiguity not for reasoning
         class schema(BaseModel):
             multi_query : list[str] = Field(description="Write 5 more queries similar to the user's query to remove the ambiguity of the original query.")
         self.parser = PydanticOutputParser(pydantic_object=schema)
-        builder = BuildKnowledge(docs = self.docs,persist_directory_path=self.path)
-        self.vector_store = builder.invoke({"collection_name" : self.collection_name})
+        if self.mode == "wiki" and not self.docs:
+            #the wiki branch goes to Wikipedia and never touches the vector store, so
+            #demanding a collection it will not read would fail a perfectly valid caller.
+            #Docs still build one when given, so nothing that ingested this way regresses.
+            self.vector_store = None
+        else:
+            builder = BuildKnowledge(docs = self.docs,persist_directory_path=self.path)
+            self.vector_store = builder.invoke({"collection_name" : self.collection_name})
     def invoke(self,input,config=None):
         k : int = input.get("k",4)
         lambda_mult : Optional[float] = input.get("lambda_mult",0.5)

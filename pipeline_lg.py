@@ -1,5 +1,4 @@
 import json
-import re
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import TypedDict, Annotated, Optional, Literal, Sequence
@@ -19,8 +18,8 @@ from langchain_core.output_parsers import StrOutputParser
 from langchain_core.runnables import RunnableConfig
 from langchain_community.llms import Ollama
 
-from ingestion.doc_loader import LoadDocs
-from ingestion.chunking import Chunking
+from ingestion.ingest import ensure_ingested
+from ingestion.vector_db import sanitize_collection_name
 from retreival.retrieval import Retrival
 from memory.long_term_memory import UserMemory
 from memory.reconciliation import find_safe_cut_point
@@ -111,14 +110,19 @@ class ChatRagGraph:
                  mode_chunks: Optional[Literal["recursive", "semantic"]] = "recursive",
                  persist_directory_path: Optional[str] = None,
                  mode_retreiver: Optional[Literal["mmr", "simple", "mqr", "wiki"]] = "simple"):
-        loader = LoadDocs(file_path=file_path, mode=mode_docs)
-        docs = loader.invoke({"glob_pattern": glob_pattern} if glob_pattern else {})
-        chunker = Chunking(chunk_size=500, chunk_overlap=50, mode=mode_chunks)
-        chunked = chunker.invoke({"docs": docs})
+        # ingestion runs only when the index is not already on disk, then retrieval OPENS
+        # what it wrote — so a second session over the same document loads, chunks and
+        # embeds nothing (R1). The calling pattern is unchanged.
+        collection = ensure_ingested(
+            file_path=file_path,
+            mode_docs=mode_docs,
+            glob_pattern=glob_pattern,
+            mode_chunks=mode_chunks,
+            persist_directory_path=persist_directory_path,
+        )
         self.retrival = Retrival(
-            docs=chunked,
             mode=mode_retreiver,
-            collection_name=f"VDB for {file_path}",
+            collection_name=collection,
             path=persist_directory_path,
         )
         self.llm = Ollama(model="mistral", temperature=0)
@@ -214,14 +218,16 @@ class ChatRagWithMemoryGraph:
                  persist_directory_path: Optional[str] = None,
                  mode_retreiver: Optional[Literal["mmr", "simple", "mqr", "wiki"]] = "simple",
                  user_history_directory_path: Optional[str] = None):
-        loader = LoadDocs(file_path=file_path, mode=mode_docs)
-        docs = loader.invoke({"glob_pattern": glob_pattern} if glob_pattern else {})
-        chunker = Chunking(chunk_size=500, chunk_overlap=50, mode=mode_chunks)
-        chunked = chunker.invoke({"docs": docs})
+        collection = ensure_ingested(
+            file_path=file_path,
+            mode_docs=mode_docs,
+            glob_pattern=glob_pattern,
+            mode_chunks=mode_chunks,
+            persist_directory_path=persist_directory_path,
+        )
         self.retrival = Retrival(
-            docs=chunked,
             mode=mode_retreiver,
-            collection_name=f"VDB for {file_path}",
+            collection_name=collection,
             path=persist_directory_path,
         )
         self.user_history_directory_path = user_history_directory_path
@@ -579,14 +585,19 @@ class AgentGraph:
                  summary_persist_path: Optional[str] = None):
         from langchain_ollama import ChatOllama
 
-        loader = LoadDocs(file_path=file_path, mode=mode_docs)
-        docs = loader.invoke({"glob_pattern": glob_pattern} if glob_pattern else {})
-        chunker = Chunking(chunk_size=500, chunk_overlap=50, mode=mode_chunks)
-        chunked = chunker.invoke({"docs": docs})
+        # startup cost is the first thing §10 names as fatal to a voice session: this used
+        # to load, chunk and embed the whole document before the agent could say anything.
+        # Now it ingests only on a cold index and otherwise opens the existing one.
+        collection = ensure_ingested(
+            file_path=file_path,
+            mode_docs=mode_docs,
+            glob_pattern=glob_pattern,
+            mode_chunks=mode_chunks,
+            persist_directory_path=persist_directory_path,
+        )
         self.retrival = Retrival(
-            docs=chunked,
             mode=mode_retreiver,
-            collection_name=f"VDB for {file_path}",
+            collection_name=collection,
             path=persist_directory_path,
         )
 
@@ -603,9 +614,10 @@ class AgentGraph:
         # state. Default None keeps UserMemory's own "user_history" name, so this graph shares
         # a profile with ChatRagWithMemoryGraph; pass user_id to separate several users.
         raw_name = "user_history" if user_id is None else f"user_history_{user_id}"
-        # UserMemory does not sanitize collection_name — mirror retreival/retrieval.py:17-21
-        clean_name = re.sub(r'[^a-zA-Z0-9._-]', '_', raw_name).strip('_.-')
-        self.user_memory_collection = clean_name if len(clean_name) >= 3 else "user_history"
+        # UserMemory does not sanitize collection_name. This used to be a hand-copy of the
+        # regex in retreival/retrieval.py; it now calls the one helper both sides use, so
+        # there is no second copy left to drift.
+        self.user_memory_collection = sanitize_collection_name(raw_name, fallback="user_history")
         # thread_id -> (human_message_count, UserMemory): tracks how many of THAT thread's
         # messages are already indexed into the shared collection. Content-hash ids make the
         # overlapping writes idempotent, so reads still span everything the user ever said.
