@@ -58,6 +58,22 @@ ddgs==9.14.4                           # tools/tools.py::web_search — SEE NOTE
 # --- Shared -------------------------------------------------------------------
 pydantic==2.12.4                       # mqr output schema, tool arg schemas
 
+# --- Voice (V1a) --------------------------------------------------------------
+# Same scoping rule as the langchain block above: direct imports, plus the
+# transitive packages that are the actual risk surface. Here that is the three
+# that own a native artifact — a CUDA binding, an espeak-ng DLL, and a G2P model —
+# because those are what break silently rather than at import. SEE NOTES 5-7.
+sounddevice==0.5.5                     # mic capture + playback (voice/audio_io.py)
+silero-vad==6.2.1                      # streaming endpointing (voice/vad.py)
+faster-whisper==1.2.1                  # STT, large-v3-turbo (voice/stt.py)
+ctranslate2==4.8.1                     # transitive; the CUDA/cuDNN half of faster-whisper
+av==18.0.0                             # transitive; faster-whisper audio decode
+kokoro==0.9.4                          # TTS, voice af_heart @24kHz (voice/tts.py)
+misaki==0.9.4                          # transitive; kokoro's G2P — SEE NOTE 6
+espeakng-loader==0.2.4                 # transitive; ships espeak-ng — SEE NOTE 5
+phonemizer-fork==3.3.2                 # transitive; misaki's espeak-ng bridge
+num2words==0.5.14                      # transitive; misaki number expansion
+
 
 # ==============================================================================
 # NOTES
@@ -89,3 +105,25 @@ pydantic==2.12.4                       # mqr output schema, tool arg schemas
 #    repository reads it (no dotenv / os.environ / os.getenv import anywhere).
 #    Add it when configuration is actually wired up — see R2 in
 #    docs/architecture_review.md.
+#
+# 5. espeak-ng is NOT a system dependency here, despite every Kokoro install guide
+#    saying it is. `espeakng-loader` ships the DLL and the language data inside the
+#    wheel, and `phonemizer-fork` loads them from there, so `pip install -r
+#    requirements.txt` is the whole install on Windows — no MSI, no PATH entry, no
+#    admin prompt. Verified: KPipeline(lang_code="a") synthesises with no
+#    espeak-ng.exe anywhere on the machine. This is why the piper-tts fallback
+#    contemplated for V1a was never needed and is not listed.
+#
+# 6. misaki downloads spacy's `en_core_web_sm` (12.8 MB) on FIRST USE, by shelling
+#    out to pip against a GitHub release URL. It is therefore not pinnable here in
+#    any honest way — it is not on PyPI — and the first Kokoro call on a fresh
+#    machine needs network even though every listed package is already installed.
+#    `voice_main.py --check` triggers it deliberately, so that download happens
+#    during setup rather than in the middle of the first spoken answer.
+#
+# 7. faster-whisper on CUDA needs cuDNN 9 for CTranslate2, which is NOT pip-installed
+#    here — it is already present on this machine via the torch cu124 install (note 1).
+#    A machine with CPU-only torch will fail CTranslate2's CUDA init; voice/stt.py
+#    catches exactly that and falls back to device="cpu", compute_type="int8" with a
+#    logged warning rather than dying. Verified working as
+#    device="cuda", compute_type="int8_float16".

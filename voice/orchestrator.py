@@ -1,0 +1,283 @@
+"""The V1a conversation loop: LISTENING -> THINKING -> SPEAKING -> LISTENING.
+
+One utterance at a time, strictly sequential, no barge-in. The state machine is that
+short on purpose — `docs/architecture_review.md` §10 is explicit that cancelling
+mid-turn orphans an `AIMessage.tool_calls` from its `ToolMessage` in a way Ollama
+rejects, and calls that "the single hardest voice problem in the current design".
+V1a does not go near it. Frames that arrive while Marshall is thinking or speaking are
+read and thrown away, which is exactly what "no barge-in" means mechanically.
+
+**Why asyncio at all, when every stage blocks.** Not for throughput — for a loop that
+stays answerable while a stage runs. `agent.invoke` is a synchronous multi-second call
+into LangGraph; run inline it would also freeze frame draining and signal handling.
+In an executor, the loop keeps turning, Ctrl+C is noticed immediately, and shutdown is
+a task cancellation rather than a kill. §10's warning that `ainvoke` on sync nodes
+"works and it blocks a thread — not a solution, a trap" is about pretending the graph
+is async. This does not pretend: the graph is sync, it is called in a thread, and the
+loop above it is honest about that.
+
+Every collaborator is injected. The orchestrator never imports sounddevice, torch,
+faster-whisper or kokoro, so the whole cycle is testable with fakes and no hardware.
+"""
+import asyncio
+import logging
+import time
+from enum import Enum
+from typing import Optional
+
+from voice.config import VoiceConfig
+from voice.telemetry import TelemetryWriter, TurnTelemetry, Stopwatch
+from voice.vad import UtteranceDetector
+
+logger = logging.getLogger(__name__)
+
+
+class State(str, Enum):
+    LISTENING = "listening"
+    THINKING = "thinking"
+    SPEAKING = "speaking"
+    STOPPED = "stopped"
+
+
+class VoiceOrchestrator:
+    """Drives one voice session.
+
+    Collaborators are duck-typed rather than subclassed:
+        mic       .get(timeout) -> frame | None ; .drain() ; .stop()
+        vad       .speech_prob(frame) -> float ; .reset()
+        stt       .transcribe(audio) -> str
+        tts       .engine_name ; .stream_sentences(text) -> (i, sentence, audio)
+        speaker   .play(audio) ; .stop()
+        agent     .invoke(query, config=...) -> str
+    """
+
+    def __init__(self, agent, mic, vad, stt, tts, speaker,
+                 config: Optional[VoiceConfig] = None,
+                 telemetry: Optional[TelemetryWriter] = None,
+                 on_event=None):
+        self.config = config or VoiceConfig()
+        self.agent = agent
+        self.mic = mic
+        self.vad = vad
+        self.stt = stt
+        self.tts = tts
+        self.speaker = speaker
+        self.telemetry = telemetry or TelemetryWriter(self.config.telemetry_path)
+        self.detector = UtteranceDetector(self.config)
+        #: reporting hook, so the CLI can print without the orchestrator importing a UI
+        self._on_event = on_event or (lambda event, payload: None)
+
+        self.state = State.LISTENING
+        self.turn_id = 0
+        self._stopping = asyncio.Event()
+        self.frames_discarded = 0
+        #: completed utterances, reader -> turn handler. Bounded at one in practice:
+        #: `_turn_pending` stops the reader producing another until this one is done.
+        self._utterances: asyncio.Queue = asyncio.Queue()
+        #: closes the window between "the reader emitted an utterance" and "the handler
+        #: set THINKING". Without it the reader keeps feeding the VAD for those few
+        #: milliseconds and can queue a second utterance behind the first — which is
+        #: barge-in, arriving by accident, in the release that is supposed to not have it.
+        self._turn_pending = False
+
+    # --- reporting -------------------------------------------------------------
+
+    def _emit(self, event: str, **payload) -> None:
+        try:
+            self._on_event(event, payload)
+        except Exception:
+            #: a reporting hook must never be able to end a session
+            logger.debug("on_event hook raised", exc_info=True)
+
+    def _set_state(self, state: State) -> None:
+        self.state = state
+        self._emit("state", state=state.value)
+
+    # --- the loop --------------------------------------------------------------
+
+    async def run(self) -> None:
+        """Listen until stopped. Returns cleanly; never raises on Ctrl+C.
+
+        Two concurrent halves: `_read_frames` drains the microphone without pause, and
+        this loop handles one utterance at a time. They are separate because the mic
+        must be read CONTINUOUSLY — a turn can take many seconds, and a reader that
+        stopped for the duration would let those seconds of audio pile up in the queue
+        to be dealt with afterwards, rather than being dropped as they arrive.
+        """
+        loop = asyncio.get_running_loop()
+        self._set_state(State.LISTENING)
+        self._emit("ready", thread_id=self.config.thread_id)
+        reader = asyncio.ensure_future(self._read_frames(loop))
+        try:
+            while not self._stopping.is_set():
+                try:
+                    #: the timeout is the shutdown check interval — without it, a silent
+                    #: room would park here forever and never notice `request_stop`
+                    utterance = await asyncio.wait_for(self._utterances.get(), timeout=0.1)
+                except asyncio.TimeoutError:
+                    continue
+                await self._handle_utterance(utterance, loop)
+        except asyncio.CancelledError:
+            #: expected on shutdown — the caller cancelled us, so unwind quietly
+            pass
+        finally:
+            reader.cancel()
+            await asyncio.gather(reader, return_exceptions=True)
+            self._set_state(State.STOPPED)
+
+    async def _read_frames(self, loop) -> None:
+        """Continuously drain the microphone. Frames outside LISTENING are discarded.
+
+        This is what "no barge-in" means mechanically: the audio is captured and read
+        the whole time Marshall is thinking and speaking, and then thrown away. V1b
+        changes this one branch and nothing else.
+        """
+        while not self._stopping.is_set():
+            #: the executor hop is what keeps this cancellable — mic.get() blocks, but
+            #: only for `timeout`, so cancellation is noticed within one frame
+            frame = await loop.run_in_executor(None, self.mic.get, 0.1)
+            if frame is None:
+                continue
+            if self.state is not State.LISTENING or self._turn_pending:
+                #: read and dropped. Not "not captured": the stream stays open so the
+                #: device is not reopened per turn (see MicrophoneStream).
+                self.frames_discarded += 1
+                continue
+            utterance = await loop.run_in_executor(None, self._feed, frame)
+            if utterance is not None:
+                self._turn_pending = True
+                self._utterances.put_nowait(utterance)
+
+    def _feed(self, frame):
+        """VAD inference plus the state machine. Runs in the executor: silero is a
+        torch forward pass, small but not free, and it has no business on the loop."""
+        return self.detector.process(frame, self.vad.speech_prob(frame))
+
+    async def _handle_utterance(self, utterance, loop) -> None:
+        """One full turn. Every stage failure is contained: the session goes back to
+        LISTENING no matter what, because a voice loop that exits on a bad turn is a
+        voice loop that exits."""
+        #: the clock the user actually feels starts the moment they stop talking
+        speech_ended = time.perf_counter()
+        self.turn_id += 1
+        utterance_s = len(utterance) / self.config.sample_rate
+        telemetry = TurnTelemetry(
+            turn_id=self.turn_id,
+            utterance_s=utterance_s,
+            tts_engine=getattr(self.tts, "engine_name", "unknown"),
+        )
+        self._emit("utterance", turn_id=self.turn_id, seconds=utterance_s)
+
+        try:
+            self._set_state(State.THINKING)
+
+            with Stopwatch() as watch:
+                transcript = await loop.run_in_executor(None, self.stt.transcribe, utterance)
+            telemetry.stt_ms = watch.ms
+            telemetry.transcript_chars = len(transcript or "")
+            self._emit("transcript", turn_id=self.turn_id, text=transcript,
+                       ms=watch.ms)
+
+            if not transcript or not transcript.strip():
+                #: silence, a cough, or a failed decode. Row still written — a turn
+                #: that produced nothing is data about the endpointing thresholds.
+                self._emit("discarded", turn_id=self.turn_id, reason="empty transcript")
+                return
+
+            with Stopwatch() as watch:
+                response = await loop.run_in_executor(None, self._invoke_agent, transcript)
+            telemetry.agent_ms = watch.ms
+            telemetry.response_chars = len(response or "")
+            self._emit("response", turn_id=self.turn_id, text=response, ms=watch.ms)
+
+            if not response or not response.strip():
+                self._emit("discarded", turn_id=self.turn_id, reason="empty response")
+                return
+
+            self._set_state(State.SPEAKING)
+            await self._speak(response, telemetry, speech_ended, loop)
+
+        except asyncio.CancelledError:
+            raise
+        except Exception as exc:
+            #: same contract as the memory gate (H4) and the summariser (H2): a failed
+            #: turn costs the answer, never the session
+            logger.exception("turn %d failed", self.turn_id)
+            self._emit("error", turn_id=self.turn_id, error=f"{type(exc).__name__}: {exc}")
+        finally:
+            self.telemetry.write(telemetry)
+            self._back_to_listening()
+
+    def _invoke_agent(self, transcript: str) -> str:
+        """The one call into `pipeline_lg`. Sync, unchanged, unaware of any of this."""
+        return self.agent.invoke(
+            transcript, config={"configurable": {"thread_id": self.config.thread_id}})
+
+    async def _speak(self, response, telemetry, speech_ended, loop) -> None:
+        """Synthesise sentence by sentence and play each in order."""
+        sentences = await loop.run_in_executor(
+            None, lambda: list(self.tts.stream_sentences(response)))
+        for index, sentence, audio in sentences:
+            if self._stopping.is_set():
+                #: mid-answer shutdown: stop talking rather than finishing the speech
+                break
+            if index == 0:
+                #: the two headline numbers, both fixed at the first audible sample
+                telemetry.tts_first_sentence_ms = (
+                    time.perf_counter() - speech_ended) * 1000 - (
+                        (telemetry.stt_ms or 0) + (telemetry.agent_ms or 0))
+                telemetry.speech_end_to_first_audio_ms = (
+                    time.perf_counter() - speech_ended) * 1000
+            self._emit("speaking", turn_id=self.turn_id, index=index, text=sentence)
+            await loop.run_in_executor(None, self.speaker.play, audio)
+
+    def _back_to_listening(self) -> None:
+        """Reset everything that could carry Marshall's own voice into the next turn."""
+        self.detector.reset()
+        try:
+            self.vad.reset()
+        except Exception:
+            logger.debug("VAD reset failed", exc_info=True)
+        dropped = self.mic.drain()
+        if dropped:
+            self.frames_discarded += dropped
+        if not self._stopping.is_set():
+            self._set_state(State.LISTENING)
+        #: last, and only after the state is back to LISTENING — the reader gates on
+        #: this, so clearing it earlier would reopen the window it exists to close
+        self._turn_pending = False
+
+    # --- shutdown --------------------------------------------------------------
+
+    def request_stop(self) -> None:
+        """Ask the loop to finish. Safe from a signal handler and safe to call twice."""
+        self._stopping.set()
+
+    def close(self) -> None:
+        """Release hardware. Idempotent, and never raises — this runs on the way out."""
+        for closer in (self.speaker.stop, self.mic.stop):
+            try:
+                closer()
+            except Exception:
+                logger.debug("shutdown step failed", exc_info=True)
+
+
+async def run_session(orchestrator: VoiceOrchestrator) -> None:
+    """Run until Ctrl+C, then shut down without a traceback.
+
+    `KeyboardInterrupt` is caught here rather than installing a signal handler: on
+    Windows, `loop.add_signal_handler` raises NotImplementedError, and asyncio already
+    surfaces Ctrl+C as KeyboardInterrupt out of the awaited task.
+    """
+    task = asyncio.ensure_future(orchestrator.run())
+    try:
+        await task
+    except (KeyboardInterrupt, asyncio.CancelledError):
+        orchestrator.request_stop()
+        task.cancel()
+        #: gather rather than await: the task is already cancelled, and this is the
+        #: form that will not re-raise the CancelledError we just caused
+        await asyncio.gather(task, return_exceptions=True)
+    finally:
+        orchestrator.request_stop()
+        orchestrator.close()
