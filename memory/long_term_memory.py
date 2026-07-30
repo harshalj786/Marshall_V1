@@ -22,11 +22,20 @@ def _get_embedding_model():
         )
     return _EMBEDDING_MODEL
 
+#: default compression model. Kept as the pre-existing "mistral" so every current caller
+#: behaves exactly as before; the parameter exists so the voice path can name the model it
+#: already has resident. Ollama serves one model at a time per GPU, so a memory gate that
+#: asks for mistral while the agent holds llama3.1 forces a swap — a multi-second unload +
+#: reload landing squarely in the request path, on top of the compression itself (finding J).
+DEFAULT_MEMORY_MODEL = "mistral"
+
+
 class UserMemory(Runnable):
-    def __init__(self,chat_history : list[str] = None,collection_name = "user_history",persist_directory_path : Optional[str] = None):
+    def __init__(self,chat_history : list[str] = None,collection_name = "user_history",persist_directory_path : Optional[str] = None,model : str = DEFAULT_MEMORY_MODEL):
         self.chat_history = chat_history or []
         self.collection_name = collection_name
         self.persist_directory_path = persist_directory_path
+        self.model = model
         self.human_messages = [msg for msg in self.chat_history if isinstance(msg,HumanMessage)]
         self.ai_messages = [msg for msg in self.chat_history if isinstance(msg,AIMessage)]
         self.embedding_model = _get_embedding_model()
@@ -59,7 +68,7 @@ class UserMemory(Runnable):
     def invoke(self,input,config=None):
         #here the invoke function compress the human from chat_history and then give it to the llm for personal context
         #no input for this function just call this function to get the compressed user_history
-        llm = Ollama(model = "mistral",temperature = 0)
+        llm = Ollama(model = self.model,temperature = 0)
         parser = StrOutputParser()
         template = PromptTemplate(
             template=""" You are an ai assistant that would be given an user's chat_history just compress it and keep the personal things and relations about the user \n 

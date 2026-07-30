@@ -21,7 +21,7 @@ from langchain_community.llms import Ollama
 from ingestion.ingest import ensure_ingested
 from ingestion.vector_db import sanitize_collection_name
 from retreival.retrieval import Retrival
-from memory.long_term_memory import UserMemory
+from memory.long_term_memory import UserMemory, DEFAULT_MEMORY_MODEL
 from memory.reconciliation import find_safe_cut_point
 from tools import (
     calculator,
@@ -217,7 +217,8 @@ class ChatRagWithMemoryGraph:
                  mode_chunks: Optional[Literal["recursive", "semantic"]] = "recursive",
                  persist_directory_path: Optional[str] = None,
                  mode_retreiver: Optional[Literal["mmr", "simple", "mqr", "wiki"]] = "simple",
-                 user_history_directory_path: Optional[str] = None):
+                 user_history_directory_path: Optional[str] = None,
+                 memory_model: str = DEFAULT_MEMORY_MODEL):
         collection = ensure_ingested(
             file_path=file_path,
             mode_docs=mode_docs,
@@ -231,6 +232,9 @@ class ChatRagWithMemoryGraph:
             path=persist_directory_path,
         )
         self.user_history_directory_path = user_history_directory_path
+        # the model UserMemory compresses with, separate from this graph's generation model:
+        # they are two different jobs and the voice path needs to name them independently
+        self.memory_model = memory_model
         self.llm = Ollama(model="mistral", temperature=0)
         self.parser = StrOutputParser()
         self.base_prompt = ChatPromptTemplate.from_messages([
@@ -269,6 +273,7 @@ class ChatRagWithMemoryGraph:
             memory = UserMemory(
                 chat_history=state["messages"],
                 persist_directory_path=self.user_history_directory_path,
+                model=self.memory_model,
             )
             return {"user_history_summary": memory.invoke({})}
         except Exception:
@@ -368,6 +373,7 @@ class ChatRagWithMemoryGraph:
         memory = UserMemory(
             chat_history=messages,
             persist_directory_path=self.user_history_directory_path,
+            model=self.memory_model,
         )
         summary = memory.invoke({})
         print(summary)
@@ -582,7 +588,9 @@ class AgentGraph:
                  user_id: Optional[str] = None,
                  summarize_every_n_turns: int = SUMMARY_EVERY_N_TURNS,
                  summary_keep_recent: int = SUMMARY_KEEP_RECENT,
-                 summary_persist_path: Optional[str] = None):
+                 summary_persist_path: Optional[str] = None,
+                 memory_model: str = DEFAULT_MEMORY_MODEL,
+                 keep_alive: Optional[str | int] = None):
         from langchain_ollama import ChatOllama
 
         # startup cost is the first thing §10 names as fatal to a voice session: this used
@@ -602,6 +610,11 @@ class AgentGraph:
         )
 
         self.user_history_directory_path = user_history_directory_path
+        # Ollama serves one model per GPU at a time, so a memory gate asking for a DIFFERENT
+        # model than the agent holds costs an unload + reload on turns 5, 10, 15… — finding J's
+        # stall with a model swap stacked on top. Default is unchanged ("mistral"); the voice
+        # path passes its own generation model so the gate runs against a resident one.
+        self.memory_model = memory_model
         self.memory_every_n_turns = memory_every_n_turns
         self.summarize_every_n_turns = summarize_every_n_turns
         self.summary_keep_recent = summary_keep_recent
@@ -637,8 +650,11 @@ class AgentGraph:
             recall_guidelines=_RECALL_GUIDELINES if enable_recall_tool else "",
         )
 
-        # tool list must be final before bind_tools; ToolNode(self.tools) then picks it up
-        base_llm = ChatOllama(model=model, temperature=0)
+        # tool list must be final before bind_tools; ToolNode(self.tools) then picks it up.
+        # keep_alive=None is ChatOllama's own default, so passing it through changes nothing
+        # until a caller asks for something else. The voice path pins the model resident
+        # ("-1"/"30m") so no turn pays a cold load mid-conversation.
+        base_llm = ChatOllama(model=model, temperature=0, keep_alive=keep_alive)
         self.llm = base_llm.bind_tools(self.tools)
         # the summariser must be the UNBOUND handle: asked to compress a transcript full of
         # tool calls while holding tools itself, llama3.1 answers with a tool_call instead
@@ -671,6 +687,7 @@ class AgentGraph:
                 chat_history=[],
                 collection_name=self.user_memory_collection,
                 persist_directory_path=self.user_history_directory_path,
+                model=self.memory_model,
             )
             self._memory_cache[thread_id] = (fingerprint, memory)
             return memory
@@ -678,6 +695,7 @@ class AgentGraph:
             chat_history=humans,
             collection_name=self.user_memory_collection,
             persist_directory_path=self.user_history_directory_path,
+            model=self.memory_model,
         )
         self._memory_cache[thread_id] = (fingerprint, memory)
         return memory

@@ -9,6 +9,7 @@ Factories (built at agent-init because they close over live agent state):
 """
 import ast
 import operator
+import threading
 from typing import Annotated, Optional
 
 from langchain_core.tools import tool, BaseTool
@@ -16,6 +17,55 @@ from langchain_core.runnables import RunnableConfig
 from langchain_community.retrievers import WikipediaRetriever
 from langchain_community.utilities import DuckDuckGoSearchAPIWrapper
 from langgraph.prebuilt import InjectedState
+
+
+#: hard wall-clock budget for one network tool call (finding K, docs/architecture_review.md:309).
+#: `wikipedia_lookup` was measured at 53-82 s inside the agent against 22.6 s standalone under
+#: R4, which in §10 terms is that many seconds of dead air on a turn that routed correctly. A
+#: tool that gives up is strictly better than one that answers late: the model can narrate a
+#: timeout, but nothing downstream can un-stall a turn that already blocked.
+TOOL_TIMEOUT_SECONDS = 10.0
+
+
+def _timeout_message(tool_name: str) -> str:
+    #: `:g` so the default budget reads "10s" rather than "10.0s". Split out from
+    #: `_run_with_timeout` so the exact wording can be asserted without a test that waits.
+    return f"{tool_name} error: timed out after {TOOL_TIMEOUT_SECONDS:g}s"
+
+
+def _run_with_timeout(tool_name: str, func, *args, **kwargs) -> str:
+    """Run `func` under `TOOL_TIMEOUT_SECONDS`, returning a tool-style error string on expiry.
+
+    The worker is NOT killed — Python cannot interrupt a thread, and the blocking call is
+    down inside urllib/requests — so what unblocks is the turn, not the socket. The orphan
+    finishes into a result nobody reads.
+
+    A daemon thread rather than `ThreadPoolExecutor` for exactly that reason: the pool's
+    workers are non-daemon and joined by an atexit hook, so a single hung lookup would hold
+    the process open at shutdown — and the voice loop's Ctrl+C must not hang behind it.
+
+    Exceptions are re-raised in the calling thread rather than converted, so this wrapper
+    changes WHEN a tool returns and nothing about WHAT it returns. That matters here: the
+    tools already convert their own failures to `"<name> error: ..."` strings, and
+    `wikipedia_lookup`'s bare `import wikipedia` deliberately still escapes to `ToolNode`.
+    """
+    outcome: list[tuple[bool, object]] = []
+
+    def _target() -> None:
+        try:
+            outcome.append((True, func(*args, **kwargs)))
+        except BaseException as exc:      # re-raised below, never swallowed
+            outcome.append((False, exc))
+
+    worker = threading.Thread(target=_target, name=f"marshall-{tool_name}", daemon=True)
+    worker.start()
+    worker.join(TOOL_TIMEOUT_SECONDS)
+    if worker.is_alive():
+        return _timeout_message(tool_name)
+    succeeded, value = outcome[0]
+    if succeeded:
+        return value
+    raise value
 
 
 _ALLOWED_BINOPS = {
@@ -61,12 +111,9 @@ def calculator(expression: str) -> str:
         return f"calculator error: {e}"
 
 
-@tool
-def wikipedia_lookup(query: str, k: int = 3) -> str:
-    """Look up a topic on Wikipedia and return the joined page content of the top-k articles.
-
-    Use for general factual questions about people, places, historical events, science
-    concepts — anything encyclopedic that is not tied to the currently loaded document."""
+def _wikipedia_lookup_body(query: str, k: int) -> str:
+    #: the whole body — both attempts — shares ONE budget, because the retry is part of what
+    #: made this slow: two serial network round-trips with no delay between them.
     import wikipedia
     wikipedia.set_user_agent("Marshall-V1/0.1 (educational RAG agent)")
     last_err: Optional[Exception] = None
@@ -84,10 +131,19 @@ def wikipedia_lookup(query: str, k: int = 3) -> str:
 
 
 @tool
-def web_search(query: str, k: int = 5) -> str:
-    """Search the web via DuckDuckGo and return the joined text snippets of the top-k results.
+def wikipedia_lookup(query: str, k: int = 3) -> str:
+    """Look up a topic on Wikipedia and return the joined page content of the top-k articles.
 
-    Use for current events, news, or anything time-sensitive that Wikipedia will not have."""
+    Use for general factual questions about people, places, historical events, science
+    concepts — anything encyclopedic that is not tied to the currently loaded document."""
+    #: name, docstring and signature above are byte-identical to the pre-timeout version and
+    #: must stay that way: R4 measured tool routing against exactly these, and the docstrings
+    #: are load-bearing prompt engineering rather than documentation. The timeout wraps
+    #: EXECUTION only. tests/test_voice_prep.py pins the interface against the old values.
+    return _run_with_timeout("wikipedia_lookup", _wikipedia_lookup_body, query, k)
+
+
+def _web_search_body(query: str, k: int) -> str:
     try:
         wrapper = DuckDuckGoSearchAPIWrapper(max_results=k)
         results = wrapper.results(query, max_results=k)
@@ -102,6 +158,15 @@ def web_search(query: str, k: int = 5) -> str:
         return "\n\n".join(parts)
     except Exception as e:
         return f"web_search error: {e}"
+
+
+@tool
+def web_search(query: str, k: int = 5) -> str:
+    """Search the web via DuckDuckGo and return the joined text snippets of the top-k results.
+
+    Use for current events, news, or anything time-sensitive that Wikipedia will not have."""
+    #: interface frozen for the same reason as `wikipedia_lookup` above.
+    return _run_with_timeout("web_search", _web_search_body, query, k)
 
 
 def make_search_current_doc(retrival) -> BaseTool:
