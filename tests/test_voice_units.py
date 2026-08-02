@@ -370,5 +370,138 @@ def test_resample_of_empty_audio_is_empty():
     assert len(resample_linear(np.zeros(0, dtype=np.float32), 24_000, 16_000)) == 0
 
 
+# ==========================================================================
+# device resolution
+#
+# Modelled on a real machine, where the SAME Realtek microphone is enumerated once
+# per host API and only some of those can do 16 kHz: the WASAPI view is 48 kHz-native
+# and refuses, while the MME and DirectSound views resample and accept. Picking by
+# index alone hits that trap roughly half the time, and the index itself moves when a
+# Bluetooth controller connects.
+# ==========================================================================
+
+#: (name, hostapi, max_in, max_out, rates this device will actually accept)
+_FAKE_DEVICES = [
+    ("Microsoft Sound Mapper - Input",        "MME",                2, 0, {44100}),
+    ("Headset Microphone (Wireless Co",       "MME",                1, 0, {16000, 44100}),
+    ("Microphone Array (2- Realtek(R)",       "MME",                2, 0, {16000, 44100}),
+    ("Headset Microphone (Wireless Controller)", "Windows DirectSound", 1, 0, {16000}),
+    ("Microphone Array (2- Realtek(R) Audio)", "Windows DirectSound", 2, 0, {16000, 44100}),
+    ("Headset Microphone (Wireless Controller)", "Windows WASAPI",   1, 0, {16000}),
+    ("Microphone Array (2- Realtek(R) Audio)", "Windows WASAPI",     2, 0, {48000}),
+    ("Speakers (2- Realtek(R) Audio)",        "Windows DirectSound", 0, 2, {24000, 48000}),
+    ("Speakers (2- Realtek(R) Audio)",        "Windows WASAPI",      0, 2, {48000}),
+]
+
+
+@pytest.fixture
+def fake_sounddevice(monkeypatch):
+    """Install a stand-in `sounddevice`. `resolve_device` imports it inside the
+    function, so replacing the module entry is enough and no real audio stack loads."""
+    import sys as _sys
+    import types
+
+    hostapis = []
+    for _n, host, *_ in _FAKE_DEVICES:
+        if host not in hostapis:
+            hostapis.append(host)
+
+    def _entry(spec):
+        name, host, max_in, max_out, _rates = spec
+        return {"name": name, "hostapi": hostapis.index(host),
+                "max_input_channels": max_in, "max_output_channels": max_out,
+                "default_samplerate": 44100.0}
+
+    module = types.ModuleType("sounddevice")
+    module.query_devices = lambda index=None: (
+        [_entry(s) for s in _FAKE_DEVICES] if index is None else _entry(_FAKE_DEVICES[index]))
+    module.query_hostapis = lambda i: {"name": hostapis[i]}
+
+    def _check(want_input):
+        def check(device=None, samplerate=None, channels=None, dtype=None):
+            name, host, max_in, max_out, rates = _FAKE_DEVICES[device]
+            slots = max_in if want_input else max_out
+            if slots < (channels or 1) or samplerate not in rates:
+                raise ValueError("Invalid sample rate [PaErrorCode -9997]")
+        return check
+
+    module.check_input_settings = _check(True)
+    module.check_output_settings = _check(False)
+    monkeypatch.setitem(_sys.modules, "sounddevice", module)
+    return module
+
+
+def test_resolve_none_means_system_default(fake_sounddevice):
+    from voice.audio_io import resolve_device
+    assert resolve_device(None, 16_000) is None
+
+
+def test_resolve_by_name_skips_the_host_api_that_cannot_do_16k(fake_sounddevice):
+    """The regression this whole function exists for: index 6 is the WASAPI view of
+    the Realtek array and is 48 kHz-only, so it must not be chosen."""
+    from voice.audio_io import resolve_device
+    assert resolve_device("Realtek", 16_000) == 4        # the DirectSound view
+
+
+def test_resolve_prefers_the_lowest_latency_usable_host_api(fake_sounddevice):
+    """Both the MME (2) and DirectSound (4) views work; DirectSound is the better one.
+    WASAPI would win if it were usable, which for this device it is not."""
+    from voice.audio_io import resolve_device
+    assert resolve_device("Microphone Array", 16_000) == 4
+
+
+def test_resolve_picks_wasapi_when_it_is_usable(fake_sounddevice):
+    """For a natively-16 kHz headset every host API works, so the ranking decides."""
+    from voice.audio_io import resolve_device
+    assert resolve_device("Wireless Co", 16_000) == 5     # the WASAPI view
+
+
+def test_resolve_is_case_insensitive(fake_sounddevice):
+    from voice.audio_io import resolve_device
+    assert resolve_device("realtek", 16_000) == resolve_device("REALTEK", 16_000)
+
+
+def test_resolve_accepts_an_explicit_index(fake_sounddevice):
+    from voice.audio_io import resolve_device
+    assert resolve_device(2, 16_000) == 2
+    assert resolve_device("2", 16_000) == 2, "an index arriving as a CLI string"
+
+
+def test_explicit_index_is_never_silently_substituted(fake_sounddevice):
+    """Naming one device and getting another is worse than an error."""
+    from voice.audio_io import resolve_device, DeviceNotUsableError
+    with pytest.raises(DeviceNotUsableError, match="cannot run at 16000 Hz"):
+        resolve_device(6, 16_000)                         # the 48 kHz-only WASAPI view
+
+
+def test_unusable_index_error_names_the_fix(fake_sounddevice):
+    from voice.audio_io import resolve_device, DeviceNotUsableError
+    with pytest.raises(DeviceNotUsableError) as excinfo:
+        resolve_device(6, 16_000)
+    message = str(excinfo.value)
+    assert "--input-device" in message and "Microphone Array" in message
+    assert message.isascii(), "error text is printed to a Windows console"
+
+
+def test_no_match_names_the_next_step(fake_sounddevice):
+    from voice.audio_io import resolve_device, DeviceNotUsableError
+    with pytest.raises(DeviceNotUsableError, match="--list-devices"):
+        resolve_device("no such microphone", 16_000)
+
+
+def test_all_matches_unusable_lists_what_was_rejected(fake_sounddevice):
+    """A rate nothing supports must report the candidates, not just fail."""
+    from voice.audio_io import resolve_device, DeviceNotUsableError
+    with pytest.raises(DeviceNotUsableError, match="none can run at 96000"):
+        resolve_device("Realtek", 96_000)
+
+
+def test_input_and_output_are_resolved_separately(fake_sounddevice):
+    """A name matching both a mic and a speaker must not cross over."""
+    from voice.audio_io import resolve_device
+    assert resolve_device("Realtek", 16_000, want_input=True) == 4
+    assert resolve_device("Realtek", 24_000, channels=1, want_input=False) == 7
+
+
 if __name__ == "__main__":
     sys.exit(pytest.main([__file__, "-v", "--no-header", "-p", "no:cacheprovider"]))

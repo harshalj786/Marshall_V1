@@ -156,12 +156,56 @@ def boot(config, file_path: str, report=print) -> dict:
 # --check
 # ==========================================================================
 
-def run_check(config, file_path: str) -> int:
-    """Load every model, print each load time, then TTS -> speakers -> STT round trip.
+def check_microphone(config, seconds: float = 1.5) -> tuple:
+    """Open the real capture path and confirm audio is flowing. Returns (ok, summary).
 
-    Exercises both audio models end to end without a microphone, so a failure here is
+    Nobody has to speak: this asks whether the device opens at 16 kHz mono, whether
+    frames arrive at the expected rate, and whether they carry any signal at all. That
+    is the difference between "the stack works" and "the stack works on this machine
+    with this microphone" — and it is the half a synthesized round trip cannot cover.
+    """
+    import numpy as np
+    from voice.audio_io import MicrophoneStream
+
+    mic = MicrophoneStream(config)
+    try:
+        mic.start()
+    except Exception as exc:
+        return False, f"could not open the input device: {type(exc).__name__}: {exc}"
+    try:
+        frames = []
+        deadline = time.perf_counter() + seconds
+        while time.perf_counter() < deadline:
+            frame = mic.get(0.1)
+            if frame is not None:
+                frames.append(frame)
+    finally:
+        mic.stop()
+
+    if not frames:
+        return False, "the device opened but delivered no frames"
+    audio = np.concatenate(frames)
+    rms, peak = float(np.sqrt((audio ** 2).mean())), float(np.abs(audio).max())
+    expected = seconds * config.sample_rate / config.blocksize
+    summary = (f"{len(frames)} frames in {len(audio)/config.sample_rate:.2f}s "
+               f"(expected ~{expected:.0f}), rms={rms:.4f} peak={peak:.4f}, "
+               f"overflows={mic.overflow_count}")
+    if peak == 0.0:
+        #: opens and delivers digital silence — a muted device or the wrong input
+        return False, summary + "  -> SILENT: muted, or the wrong input selected"
+    if rms < 1e-4:
+        #: not a failure. A quiet room is quiet, and failing the check for it would
+        #: teach the user to ignore the check.
+        return True, summary + "  -> very quiet (fine if the room is silent)"
+    return True, summary + "  -> LIVE"
+
+
+def run_check(config, file_path: str) -> int:
+    """Load every model, print each load time, probe the mic, then TTS -> STT round trip.
+
+    Exercises both audio models end to end without anyone speaking, so a failure here is
     unambiguous: if `--check` passes and a live session does not, the problem is the
-    mic or the room, not the stack.
+    room or the thresholds, not the stack or the devices.
     """
     from voice.audio_io import list_devices, Speaker, resample_linear
 
@@ -175,6 +219,17 @@ def run_check(config, file_path: str) -> int:
     print("MODEL LOAD")
     print("=" * 72)
     parts = boot(config, file_path)
+    print()
+
+    print("=" * 72)
+    print("MICROPHONE  (no need to speak)")
+    print("=" * 72)
+    import sounddevice as sd
+    chosen = ("system default" if config.input_device is None
+              else f"[{config.input_device}] {sd.query_devices(config.input_device)['name']}")
+    print(f"  device     {chosen}")
+    mic_ok, mic_summary = check_microphone(config)
+    print(f"  capture    {mic_summary}")
     print()
 
     print("=" * 72)
@@ -209,15 +264,22 @@ def run_check(config, file_path: str) -> int:
     print(f"  round trip {synth_ms + stt_ms:.0f}ms (synthesis + transcription)")
     print()
 
-    ok = overlap >= 0.8
+    round_trip_ok = overlap >= 0.8
     print("=" * 72)
-    if ok:
+    if round_trip_ok and mic_ok:
         print("CHECK PASSED - the voice stack is wired end to end.")
     else:
-        print(f"CHECK FAILED - round trip lost too much: {overlap:.0%} token overlap "
-              "(need 80%).")
+        if not round_trip_ok:
+            print(f"CHECK FAILED - round trip lost too much: {overlap:.0%} token "
+                  "overlap (need 80%).")
+        if not mic_ok:
+            #: reported separately because the fix is different: the round trip is the
+            #: models, the microphone is the device selection
+            print("CHECK FAILED - the microphone did not produce usable audio. "
+                  "Pick another with --list-devices then "
+                  '--input-device "<name>".')
     print("=" * 72)
-    return 0 if ok else 1
+    return 0 if (round_trip_ok and mic_ok) else 1
 
 
 def token_overlap(expected: str, actual: str) -> float:
@@ -288,10 +350,12 @@ def parse_args(argv=None):
                         help="load every model, run a TTS->STT round trip, exit")
     parser.add_argument("--list-devices", action="store_true",
                         help="print audio devices and exit")
-    parser.add_argument("--input-device", type=int, default=None,
-                        help="input device index (see --list-devices)")
-    parser.add_argument("--output-device", type=int, default=None,
-                        help="output device index (see --list-devices)")
+    #: str, not int: a name substring survives PortAudio renumbering devices when
+    #: something connects, and picks the host API that can actually do 16 kHz
+    parser.add_argument("--input-device", default=None,
+                        help='input device index or name substring, e.g. 15 or "Realtek"')
+    parser.add_argument("--output-device", default=None,
+                        help='output device index or name substring, e.g. 20 or "Realtek"')
     parser.add_argument("--thread", default="voice-main",
                         help="conversation thread_id; fixed across runs so H2's "
                              "summary reload carries continuity (default: voice-main)")
@@ -312,9 +376,23 @@ def main(argv=None) -> int:
         print(list_devices())
         return 0
 
+    #: resolved to concrete indices at startup, so an unusable device fails HERE with a
+    #: message naming the fix — rather than as a raw PortAudioError from inside the
+    #: audio callback once the models are already loaded
+    from voice.audio_io import resolve_device, DeviceNotUsableError
+    from voice.config import VAD_SAMPLE_RATE
+    try:
+        input_device = resolve_device(args.input_device, VAD_SAMPLE_RATE,
+                                      channels=1, want_input=True)
+        output_device = resolve_device(args.output_device, VoiceConfig().tts_sample_rate,
+                                       channels=1, want_input=False)
+    except DeviceNotUsableError as exc:
+        print(f"audio device error: {exc}", file=sys.stderr)
+        return 2
+
     config = VoiceConfig(
-        input_device=args.input_device,
-        output_device=args.output_device,
+        input_device=input_device,
+        output_device=output_device,
         thread_id=args.thread,
     )
     config.validate()

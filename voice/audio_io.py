@@ -9,9 +9,105 @@ other side of a `queue.Queue`, which is the one structure that is safe to `put` 
 from a real-time thread and safe to `get` from anywhere else.
 """
 import queue
-from typing import Optional
+from typing import Optional, Union
 
 import numpy as np
+
+
+#: preference among host APIs when several expose the SAME microphone, best first.
+#: This is a real-time capture path, so latency is the tiebreak: WASAPI is the modern
+#: low-latency API, DirectSound is middling, MME is the oldest and adds the most, and
+#: WDM-KS bypasses the mixer so it usually cannot be shared with another application.
+#: Lower rank wins; anything unlisted sorts last.
+_HOST_API_RANK = {"windows wasapi": 0, "windows directsound": 1, "mme": 2, "windows wdm-ks": 3}
+
+
+def _host_rank(sd, device: dict) -> int:
+    return _HOST_API_RANK.get(sd.query_hostapis(device["hostapi"])["name"].lower(), 9)
+
+
+class DeviceNotUsableError(RuntimeError):
+    """A named device exists but cannot run at the rate the pipeline needs.
+
+    Its own class because the raw PortAudio failure — `Invalid sample rate
+    [PaErrorCode -9997]` — names the symptom and not one thing you can act on. The
+    message this carries names the cause and the fix.
+    """
+
+
+def resolve_device(spec: Optional[Union[int, str]],
+                   samplerate: int,
+                   channels: int = 1,
+                   want_input: bool = True) -> Optional[int]:
+    """Turn a device spec — index, name substring, or None — into a device index.
+
+    **Why names are supported at all.** PortAudio indices are positional and shift
+    whenever a device appears or disappears: connecting one Bluetooth controller
+    renumbers everything after it. An index written down today can silently address a
+    different microphone tomorrow, and the failure is a session that hears nothing
+    rather than an error. A substring survives that.
+
+    **Why a match is then TESTED rather than returned.** The same physical microphone
+    is enumerated once per host API, and they do not have the same capabilities: the
+    WASAPI view of a 48 kHz Realtek input cannot open at 16 kHz, while the MME and
+    DirectSound views of that identical microphone resample in software and can. Name
+    matching alone would pick whichever came first and fail roughly half the time, so
+    every candidate is checked against the settings actually required and the first
+    usable one wins.
+
+    Among usable candidates the lowest-latency host API wins (see `_HOST_API_RANK`).
+
+    None means "system default", which is what the old behaviour was and still is.
+    """
+    import sounddevice as sd
+
+    if spec is None:
+        return None
+
+    check = sd.check_input_settings if want_input else sd.check_output_settings
+    kind = "input" if want_input else "output"
+
+    def _usable(index: int) -> bool:
+        try:
+            check(device=index, samplerate=samplerate, channels=channels, dtype="float32")
+            return True
+        except Exception:
+            return False
+
+    #: an explicit index is honoured as given — the caller named one device, so
+    #: silently substituting another would be worse than failing
+    if isinstance(spec, int) or (isinstance(spec, str) and spec.strip().lstrip("-").isdigit()):
+        index = int(spec)
+        if not _usable(index):
+            name = sd.query_devices(index)["name"]
+            raise DeviceNotUsableError(
+                f"{kind} device [{index}] {name!r} cannot run at {samplerate} Hz / "
+                f"{channels}ch. The same device is usually listed again under a host API "
+                f"that resamples (DirectSound or MME). Select it by name instead of index: "
+                f"--{kind}-device \"{name.split('(')[0].strip()}\"")
+        return index
+
+    needle = spec.strip().lower()
+    matches, rejected = [], []
+    for index, device in enumerate(sd.query_devices()):
+        slots = device["max_input_channels"] if want_input else device["max_output_channels"]
+        if slots <= 0 or needle not in device["name"].lower():
+            continue
+        (matches if _usable(index) else rejected).append((index, device["name"]))
+
+    if matches:
+        #: stable sort on (host rank, index): among the several host-API views of one
+        #: microphone take the lowest-latency one, and break remaining ties by
+        #: enumeration order so the choice is deterministic run to run
+        return min(matches, key=lambda m: (_host_rank(sd, sd.query_devices(m[0])), m[0]))[0]
+    if rejected:
+        raise DeviceNotUsableError(
+            f"{len(rejected)} {kind} device(s) match {spec!r} but none can run at "
+            f"{samplerate} Hz / {channels}ch: "
+            + ", ".join(f"[{i}] {n}" for i, n in rejected)
+            + ". Every host API for this device refused the rate.")
+    raise DeviceNotUsableError(
+        f"no {kind} device matches {spec!r}. Run --list-devices to see what is available.")
 
 
 def resample_linear(audio: np.ndarray, from_rate: int, to_rate: int) -> np.ndarray:
