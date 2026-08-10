@@ -397,8 +397,9 @@ Configure retrieval parameters at query time:
 
 ### Memory System
 The `UserMemory` class embeds the user's own messages into a separate ChromaDB collection to
-provide personalized context in future conversations. It exposes two paths:
+provide personalized context in future conversations. It exposes three paths:
 
+- `.index(messages=None)` — the **only** write. Defaults to the object's own `chat_history`
 - `.invoke({})` — compresses the user's messages into a short personal profile via `mistral`
 - `.retreival(query, k)` — semantic search over those messages, used by `recall_user_memory`
 
@@ -407,6 +408,12 @@ memory gate on a growing conversation will not duplicate earlier messages (which
 otherwise shrink effective recall diversity to `k/m` after `m` gate hits). The collection is
 opened lazily rather than built from documents, so an empty history is safe and a persisted
 collection can be reopened in a later session.
+
+**Constructing a `UserMemory` writes nothing.** It used to: the write was a constructor side
+effect, so every reader was also a writer — `recall_user_memory` indexed the user's question
+and then searched a collection that now contained it, retrieving the question back at `k=1`.
+`AgentGraph` therefore keeps two funnels over one implementation: `_build_user_memory`
+(the memory gate, writes) and `_read_user_memory` (the recall tool, does not).
 
 ---
 

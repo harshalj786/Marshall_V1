@@ -81,8 +81,13 @@ def results():
     Module-scoped because the cost is the model, not the assertions: a per-test agent would
     re-open the index and re-seed six times over. Each route still gets its own thread, so
     sharing the agent shares no conversation.
+
+    `fresh=True` rebuilds the check's memory store from the seed every run. Determinism is
+    worth the second it costs: a store carrying rows from an earlier run — including, from
+    before H6 was fixed, the routes' own questions — would make the recall assertions pass
+    or fail on history rather than on this commit.
     """
-    agent = build_check_agent()
+    agent = build_check_agent(fresh=True)
     seed_memory(agent)
     return {route.name: run_route(agent, route) for route in ROUTES}
 
@@ -128,6 +133,31 @@ def test_route_reaches_an_answer(results, route):
     """
     result = results[route.name]
     assert result.answer.strip(), f"{route.name} produced no answer"
+
+
+# --------------------------------------------------------------------------
+# H6's witness, live: recall must return the memory, not the question
+# --------------------------------------------------------------------------
+
+@needs_llama31
+def test_recall_returns_the_seeded_fact_not_the_query(results):
+    """The end-to-end half of `tests/test_memory_read_path.py`.
+
+    Routing correctly to `recall_user_memory` was never the hard part — this route passed
+    before H6 was fixed. What it returned was the user's own question, because
+    `UserMemory.__init__` indexed the query on the way in and `k=1` then retrieved it. The
+    reply still said "Your name is Harshal" for an unrelated reason (the system prompt
+    names him), which is why only the tool's own output can witness this.
+    """
+    result = results["user"]
+    returned = " ".join(text for name, text in result.returns
+                        if name == "recall_user_memory")
+
+    assert returned.strip(), "recall_user_memory was called but returned nothing"
+    assert "Harshal" in returned, (
+        f"recall returned {returned[:120]!r} — not the seeded fact")
+    assert "what is my name" not in returned.lower(), (
+        "the query came back as a memory: the read path is writing again (H6)")
 
 
 # --------------------------------------------------------------------------

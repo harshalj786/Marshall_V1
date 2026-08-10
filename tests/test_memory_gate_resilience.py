@@ -60,6 +60,12 @@ class _Works:
     def __init__(self, *a, **kw):
         pass
 
+    #: since H6 the write is an explicit .index() call rather than a constructor side
+    #: effect, and the chat graph makes it inside this same try — so a double without
+    #: one fails the node for a reason the fix is supposed to have removed
+    def index(self, *a, **kw):
+        return 0
+
     def invoke(self, *a, **kw):
         return "SENTINEL_SUMMARY"
 

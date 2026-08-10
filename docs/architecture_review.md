@@ -16,10 +16,11 @@
 | **R1** — retrieval welded to index construction | `[FIXED]` — `ingestion/ingest.py`, `ingestion/vector_db.py`, `retreival/retrieval.py` |
 | **K / M10** — network tools with no timeout | `[PARTIALLY FIXED]` — `tools/tools.py` (10 s budget; no output-size cap) |
 | **R4 routing caveat** — tool selection verified once, by hand | `[FIXED]` — `scripts/check_routing.py`, `tests/test_routing_matrix.py` |
+| **H6** — memory written from the constructor, so reads wrote too | `[FIXED]` — `memory/long_term_memory.py`, `pipeline_lg.py` |
 | **R8** — checkpointer still `MemorySaver` (H2's remaining half) | open |
-| **H3, H5, H6, M1–M9, L1–L14** | open |
+| **H3, H5, M1–M9, L1–L14** | open |
 
-All three criticals plus H1, H2 and H4 are closed. **H2's second half is not, and it is the half that loses data.** The agent's context no longer grows without bound — `summarize_and_trim` sees to that — but `MemorySaver` is still in-RAM and still per-object, so every checkpoint of every thread dies with the process. The only thing that survives a restart today is `{summary_persist_path}/conversation_summary.json`, reloaded by `invoke` when a thread has no in-RAM history; the message list itself, the turn count and the compressed profile do not. `SqliteSaver` (R8, `docs/roadmap.md` Phase 1, already specified by `docs/tech_stack.md` §2) is what remains of H2. **H6** (`UserMemory` writes from its constructor) is now the highest-severity fully-open finding.
+All three criticals plus H1, H2 and H4 are closed. **H2's second half is not, and it is the half that loses data.** The agent's context no longer grows without bound — `summarize_and_trim` sees to that — but `MemorySaver` is still in-RAM and still per-object, so every checkpoint of every thread dies with the process. The only thing that survives a restart today is `{summary_persist_path}/conversation_summary.json`, reloaded by `invoke` when a thread has no in-RAM history; the message list itself, the turn count and the compressed profile do not. `SqliteSaver` (R8, `docs/roadmap.md` Phase 1, already specified by `docs/tech_stack.md` §2) is what remains of H2. ~~**H6** (`UserMemory` writes from its constructor) is now the highest-severity fully-open finding.~~ `[FIXED]` H6 is closed — construction opens, `.index()` writes, and the recall tool holds a read-only handle. It was closed *because* it stopped being theoretical: the routing gate caught the read path retrieving the query it had just written. **R8 is now the highest-severity open finding**, and the two remaining HIGHs (H3, H5) are both in `pipeline.py`.
 
 R1 is listed in the table because its structural half is now closed too: ingestion is an explicit step (`ingestion/ingest.py`) and `Retrival` can open a collection it did not build. That was the first item in the §10 voice sequencing, and it is what M1 and the startup-cost finding both rested on.
 
@@ -121,7 +122,7 @@ Memory is **user-scoped, not thread-scoped** — deliberate, and documented at `
 
 `AgentGraph._build_user_memory` (464-497) is the single funnel used by both the passive gate and the active recall tool, so the two can never disagree. It filters human messages, fingerprints them as `(count, last_content)` — not just a count, so two threads at the same message count can't collide — checks the cache, and otherwise constructs a `UserMemory`.
 
-`UserMemory.__init__` (`memory/long_term_memory.py:25-46`) opens the Chroma collection *lazily* (constructing `Chroma(...)` rather than `Chroma.from_documents(...)`), so an empty history doesn't crash and a persisted collection is reopened rather than rebuilt; then upserts the human messages under SHA-1 content-hash ids, making re-indexing idempotent.
+`UserMemory.__init__` (`memory/long_term_memory.py:25-46`) opens the Chroma collection *lazily* (constructing `Chroma(...)` rather than `Chroma.from_documents(...)`), so an empty history doesn't crash and a persisted collection is reopened rather than rebuilt. ~~then upserts the human messages under SHA-1 content-hash ids, making re-indexing idempotent.~~ `[CHANGED — see H6]` Opening is now all it does; the upsert under SHA-1 content-hash ids moved to `.index()`, still idempotent, and no longer something a reader performs by accident.
 
 Two directions:
 - **Passive:** every `memory_every_n_turns` turns, `_summarize_user_history_node` (512-523) compresses history to a prose profile stored in `state["user_history_summary"]`. `_agent_node` (537-544) folds it into a *freshly constructed* `SystemMessage` per call via `_with_profile` (525-535) and never writes it back — so the profile also applies on post-tool re-entry and cannot compound.
@@ -231,7 +232,7 @@ Back in `AgentGraph.__init__`: memory collection name computed (436-439), `_memo
 
 **Stage 3a — Memory write + compress (only when the gate fires).**
 `_summarize_user_history_node` (512-523) → extracts `thread_id` from the injected `RunnableConfig` (515) → `_build_user_memory(state["messages"], thread_id)` (516, defined 464-497) → filters `HumanMessage`s (472) → fingerprints `(len, last_content)` (475) → cache hit returns early (476-478) → otherwise `UserMemory(chat_history=humans, collection_name=..., persist_directory_path=...)` (491-495).
-Inside `UserMemory.__init__` (`memory/long_term_memory.py:25-46`): human/AI split (29-30) → `_get_embedding_model()` singleton (31) → `Chroma(collection_name=..., embedding_function=..., persist_directory=...)` opened lazily (35-39) → **`add_documents(human_docs, ids=[sha1(content)])` — the vector write happens here, in the constructor** (43-46).
+Inside `UserMemory.__init__` (`memory/long_term_memory.py:25-46`): human/AI split (29-30) → `_get_embedding_model()` singleton (31) → `Chroma(collection_name=..., embedding_function=..., persist_directory=...)` opened lazily (35-39) → ~~**`add_documents(human_docs, ids=[sha1(content)])` — the vector write happens here, in the constructor** (43-46).~~ `[CHANGED — see H6]` the constructor stops here. `_build_user_memory` then calls **`memory.index(humans)`** → `add_documents(human_docs, ids=[sha1(content)])`, because this is the gate; the recall tool's funnel skips it.
 Back in the node: `memory.invoke({})` (`memory/long_term_memory.py:47-59`) → builds a fresh `Ollama(mistral)` (50) → `PromptTemplate | llm | StrOutputParser` over `"\n".join(all human message contents)` (52-58) → prose profile string → wrapped in try/except (`pipeline_lg.py:519-523`) → written to `state["user_history_summary"]`.
 
 **Stage 4 — LLM call.**
@@ -246,7 +247,7 @@ Back in the node: `memory.invoke({})` (`memory/long_term_memory.py:47-59`) → b
 - `search_current_doc` (`tools/tools.py:114-127`, closure over `retrival`): `retrival.invoke({"query", "k"})` → `Retrival.invoke` simple/mmr/mqr/wiki branch → `result.get("context", [])` → joined `page_content`.
 - `wikipedia_lookup` (64-83): `import wikipedia` (70, **outside** the try), `set_user_agent`, up to 2 attempts constructing a `WikipediaRetriever` and calling `.invoke(query)`.
 - `web_search` (86-104): `DuckDuckGoSearchAPIWrapper(max_results=k).results(...)`, formats `title / snippet / link` triples.
-- `recall_user_memory` (141-176): pulls `messages` from `InjectedState`, `thread_id` from `RunnableConfig`, calls the injected `build_memory` callback → `AgentGraph._build_user_memory` → `UserMemory` (**which writes on construction, even on this read path**) → `memory.retreival(query, k)` (`memory/long_term_memory.py:60-65`) → `as_retriever(search_kwargs={"k":k}).invoke(query)` → joined `page_content`.
+- `recall_user_memory` (141-176): pulls `messages` from `InjectedState`, `thread_id` from `RunnableConfig`, calls the injected `build_memory` callback → ~~`AgentGraph._build_user_memory` → `UserMemory` (**which writes on construction, even on this read path**)~~ `[FIXED — see H6]` `AgentGraph._read_user_memory` → `_build_user_memory(..., index=False)` → a `UserMemory` that opened the collection and wrote nothing → `memory.retreival(query, k)` (`memory/long_term_memory.py:60-65`) → `as_retriever(search_kwargs={"k":k}).invoke(query)` → joined `page_content`.
 
 Each result becomes a `ToolMessage`; the edge `tools → agent` (562) loops back to Stage 4.
 
@@ -478,7 +479,7 @@ The integration is textbook-correct and the ordering constraints are real:
 
 ### How memory reads and writes interact with graph state
 
-- **Write path.** The Chroma write is a **side effect of `UserMemory.__init__`** (`memory/long_term_memory.py:40-46`), not of `.invoke()`. So *constructing* a `UserMemory` persists data. Both the passive gate (`pipeline_lg.py:516`) and the active recall tool (`tools/tools.py:168`) route through `_build_user_memory`, which means **the read path writes too**. The `_memory_cache` fingerprint (475) makes this a no-op when nothing has changed, and content-hash ids (`memory/long_term_memory.py:45`) make repeats idempotent — so it is safe, but it is surprising.
+- **Write path.** ~~The Chroma write is a **side effect of `UserMemory.__init__`** (`memory/long_term_memory.py:40-46`), not of `.invoke()`. So *constructing* a `UserMemory` persists data. Both the passive gate (`pipeline_lg.py:516`) and the active recall tool (`tools/tools.py:168`) route through `_build_user_memory`, which means **the read path writes too**. The `_memory_cache` fingerprint (475) makes this a no-op when nothing has changed, and content-hash ids (`memory/long_term_memory.py:45`) make repeats idempotent — so it is safe, but it is surprising.~~ `[FIXED — see H6]` It was surprising *and* it was not safe: the fingerprint made repeat construction a no-op but did nothing about the first build of a turn, which is the one the recall tool triggers. The write is now `UserMemory.index(...)`, called by the gate and not by the tool; both still route through `_build_user_memory`, which differs between them by one argument.
 - **Passive read.** `state["user_history_summary"]` → `_agent_node` (539) → `_with_profile` (525-535) builds a **new** `SystemMessage` per call and never returns it in a `{"messages": ...}` update. That is the crucial detail: a copied message would keep its `.id`, `add_messages` would overwrite the stored system prompt, and the profile block would compound on every gate hit. Composing per-call also means the profile survives post-tool re-entry into `agent` (comment 541).
 - **Active read.** `recall_user_memory` → `build_memory(...)` → `UserMemory.retreival(query, k)` (`memory/long_term_memory.py:60-65`). Its result enters state as a `ToolMessage` like any other tool output — it does not touch `user_history_summary`.
 - **Scope boundary.** Graph state is thread-scoped (via `thread_id`); the Chroma memory collection is user-scoped (`pipeline_lg.py:436-439`). This is what lets thread `"tue"` answer *"what is my name?"* from what thread `"mon"` was told, as demonstrated in `README.md:251-255`.
@@ -512,13 +513,13 @@ The consequences follow directly from the absent metadata:
 
 ### Persistent storage mechanism
 
-`Chroma(collection_name=..., embedding_function=..., persist_directory=...)` opened lazily at `memory/long_term_memory.py:35-39`, then `add_documents(..., ids=[sha1(...)])` at 43-46. The two comments there (33-34, 41-42) capture the reasoning precisely: lazy open so an empty history doesn't crash and a persisted collection reopens across sessions; content-hash ids so `add_documents` upserts and re-indexing a growing conversation doesn't duplicate earlier messages.
+`Chroma(collection_name=..., embedding_function=..., persist_directory=...)` opened lazily at `memory/long_term_memory.py:35-39`, then `add_documents(..., ids=[sha1(...)])` — in `.index()` since H6, in the constructor before it. The two comments there capture the reasoning precisely: lazy open so an empty history doesn't crash and a persisted collection reopens across sessions; content-hash ids so `add_documents` upserts and re-indexing a growing conversation doesn't duplicate earlier messages. Both survived the split unchanged; what changed is *who* triggers the write.
 
 `AgentGraph` sanitizes the collection name before passing it (`pipeline_lg.py:437-439`), because — as its comment says — `UserMemory` itself does no sanitization and Chroma rejects several characters. `ChatRagWithMemoryGraph` passes no `collection_name` at all and relies on the `"user_history"` default (`memory/long_term_memory.py:25`).
 
 ### How memories are written, retrieved, and updated
 
-- **Written:** in `UserMemory.__init__` (40-46), as a constructor side effect, from whatever `chat_history` is handed in. `AgentGraph._build_user_memory` (472) pre-filters to human messages; `ChatRagWithMemoryGraph` (228) passes all messages and lets `UserMemory` filter internally (29).
+- **Written:** ~~in `UserMemory.__init__` (40-46), as a constructor side effect,~~ `[FIXED — see H6]` by an explicit `UserMemory.index(chat_history=None)` call, from whatever `chat_history` is handed in — the object's own by default. `AgentGraph._build_user_memory` (472) pre-filters to human messages and indexes only when asked to; `ChatRagWithMemoryGraph` (228) passes all messages, calls `.index()` inside its H4 guard, and lets `UserMemory` filter internally (29).
 - **Retrieved, two ways:**
   - *Compression* — `UserMemory.invoke({})` (47-59): a single mistral call over `"\n".join(all human contents)` producing a prose profile. Used by the passive gate.
   - *Semantic search* — `UserMemory.retreival(query, k)` (60-65): plain top-k similarity over the collection, joined with `\n\n`. Used by `recall_user_memory`.
@@ -556,7 +557,7 @@ The `AgentGraph` short-circuit is the `_memory_cache` fingerprint (`pipeline_lg.
 
 6. **`user_history_summary` is sticky and stale.** Once set it is never cleared or invalidated; between gate hits the agent personalizes against a summary up to `n-1` turns old.
 
-7. **Memory is written on the read path** (§5), which is safe today only because of the fingerprint cache and hash ids.
+7. ~~**Memory is written on the read path** (§5), which is safe today only because of the fingerprint cache and hash ids.~~ `[FIXED — see H6]` It was not safe: the recall tool wrote the query it was about to search for and then retrieved it at `k=1`. Construction no longer writes; `.index()` does, and only the gate calls it.
 
 8. **No PII controls.** Raw user utterances are stored verbatim, unencrypted, with no masking — against `docs/security.md` §5 (encryption at rest) and §7 (PII masking).
 
@@ -698,7 +699,7 @@ No trim node in `_build_graph` (546-563), by design (`README.md:267-269`); `Memo
 
 > **Resolution.** `ChatRagWithMemoryGraph._summarize_user_history_node` now carries the same guard, returning `{}` on failure so the turn completes and any previous summary survives — `user_history_summary` uses the default overwrite reducer, so an absent key means "no update" whereas returning the key with a blank value would erase a good profile.
 >
-> **The guard is deliberately wider than the one it mirrors.** `AgentGraph` wraps only `memory.invoke({})`, because it constructs its `UserMemory` in `_build_user_memory`, outside the try. The chat graph constructs it *inside* the node — and construction is what performs the Chroma write (see H6) — so guarding only `.invoke()` would have left a failed write still killing the turn. Both signatures are unchanged; in particular the chat graph's node did **not** gain `AgentGraph`'s `config` parameter, which it has no use for.
+> **The guard is deliberately wider than the one it mirrors.** `AgentGraph` wraps only `memory.invoke({})`, because it constructs its `UserMemory` in `_build_user_memory`, outside the try. The chat graph constructs it *inside* the node — and construction is what performed the Chroma write (see H6) — so guarding only `.invoke()` would have left a failed write still killing the turn. *(H6 moved that write to an explicit `.index()` call, which sits inside this same try for the same reason. The guard's width was correct then and is correct now.)* Both signatures are unchanged; in particular the chat graph's node did **not** gain `AgentGraph`'s `config` parameter, which it has no use for.
 >
 > **Verified against the pre-fix code.** `tests/test_memory_gate_resilience.py` covers compression failure, construction failure, the `{}`-not-blank distinction, the happy path, parity between the two graphs, and two end-to-end runs proving a gate-tripping turn still returns an answer and a good profile survives a later failure. Run against the unguarded version, 6 of the 9 fail; the 3 that pass are the two signature assertions and the happy path, which the fix should not affect. The end-to-end tests skip automatically when Ollama is unreachable.
 
@@ -706,9 +707,23 @@ No trim node in `_build_graph` (546-563), by design (`README.md:267-269`); `Memo
 `pipeline.py:245-378`; variable mismatch between the template at 302/309 and the invocation at 361.
 *Risk:* turns 1-4 raise. It is also ~95% duplicated from `ChatRagPipelineWithMemory`, so any fix to the memory logic must be applied twice. (Known placeholder — flagged, not touched.)
 
-**H6. `UserMemory` writes to Chroma from its constructor.**
+**H6. `UserMemory` writes to Chroma from its constructor.** `[FIXED]`
 `memory/long_term_memory.py:40-46`.
 *Risk:* every code path that merely *reads* memory also writes it, including the `recall_user_memory` tool. Safe today only because of the `_memory_cache` fingerprint and content-hash ids — both of which are `AgentGraph`'s doing, not `UserMemory`'s. Any new caller that constructs a `UserMemory` inherits the write.
+
+> **It was not safe, and the routing gate caught it in the wild.** Asked *"what is my name?"*, `recall_user_memory` routed correctly and returned the string `"what is my name?"` — the user's own question. `_build_user_memory` had constructed a `UserMemory` over the live conversation on the way in, the constructor indexed that question into the collection, and at `k=1` the nearest neighbour to "my name" was the row written microseconds earlier rather than the seeded *"My name is Harshal."*
+>
+> **The reply looked right anyway**, which is the part worth remembering: Marshall answered "Your name is Harshal" because the system prompt says *"You are Marshall, the AI son of Harshal"* (`pipeline_lg.py:396`). A human reading the transcript sees a working recall. Only the `ToolMessage` shows the tool returned nothing useful — and it took `scripts/check_routing.py` printing raw tool output to make that visible. R4's warning about the *answer* not being evidence turned out to apply to more than routing.
+>
+> **Resolution (R5's shape).** `UserMemory.__init__` now only opens the collection. `UserMemory.index(chat_history=None)` is the single write path, defaulting to the object's own history so the old behaviour is one visible call, and returning the number of rows written. `AgentGraph._build_user_memory` gained `index: bool = True` and a sibling `_read_user_memory` that passes `index=False`; `make_recall_user_memory` is handed the read-only one. `tools/tools.py` did not change at all — the callback contract is still `(messages, thread_id)`, so which funnel the tool gets is `AgentGraph`'s decision, at one line.
+>
+> **The cache entry grew a third field, and it is load-bearing.** `_memory_cache` is now `(fingerprint, memory, indexed)`. Without `indexed`, a read-only build would populate the cache and the gate's later write for that same fingerprint would hit the cache and return early — passive memory would silently stop, which is a worse bug than the one being fixed. A gate hit on an unwritten cached entry now indexes it and marks it.
+>
+> **Every other write path is explicit rather than incidental.** `ChatRagWithMemoryGraph._summarize_user_history_node` and `.user_summary` call `.index()`, both *inside* the H4 guard, since a failed write must still not cost the turn. `scripts/check_routing.py`'s seed calls it too.
+>
+> **Verified.** `tests/test_memory_read_path.py` — 16 tests, no LLM: construction writes nothing; `.index()` writes, is idempotent under content-hash ids, stores humans only, and no-ops on an empty list; the C2 durability warning still fires; the gate funnel still writes; the read funnel does not; a cached read-only handle is still indexed when the gate runs; and the bound `recall_user_memory` tool writes nothing when called directly. **Run against the pre-fix code, 14 of the 16 fail.** The witness itself is pinned twice — once as a unit test that a reader built from the live conversation retrieves the seed and not the query, and once live in `tests/test_routing_matrix.py`, which now asserts the recall route's `ToolMessage` contains the seeded fact. Re-measured: `returned recall_user_memory: My name is Harshal.`
+>
+> *Not changed:* `UserMemory.retreival` keeps its typo (L3 — renaming ripples into `tools/tools.py`), and `pipeline.py` was left alone as WIP. **The legacy pipelines' memory writes therefore stop** until each of their three `UserMemory(...)` sites gains a `.index()` call — a one-line edit each, deliberately deferred rather than made silently in a file holding uncommitted work. Nothing in `pipeline.py` reads that collection back, so the visible effect is that a legacy REPL session no longer contributes to the profile `AgentGraph` recalls.
 
 ### MEDIUM
 
@@ -842,13 +857,17 @@ All preserve current behavior. **Not implemented — recommendations only.** Ord
 >
 > **Re-measured on this commit** (llama3.1:latest, memory seeded, each route on its own `thread_id`, never `voice-main`): `calculator` 6.7 s, `search_current_doc` 3.3 s, `recall_user_memory` 1.3 s, `wikipedia_lookup` 8.4 s, `web_search` 5.1 s, no-tool → `wikipedia_lookup` 10.5 s. **5/5 must-pass correct, 0 prose-narrated, exit 0** — identical routing to R4's original run, including the miss. Those timings are also the warm latency baseline §10 now cites.
 
-### R5. Give `UserMemory` a durability guard and a read-only mode — *partially done*
+### R5. Give `UserMemory` a durability guard and a read-only mode — *done*
 
 *Problem:* C2 (silent in-memory fallback) and H6 (constructor writes on the read path).
 *Done:* the C2 half — the durability guard, as a `UserWarning`.
-*Still open:* H6. The Chroma write is still a side effect of `UserMemory.__init__`, so `recall_user_memory` still writes while reading.
+*~~Still open:~~* ~~H6. The Chroma write is still a side effect of `UserMemory.__init__`, so `recall_user_memory` still writes while reading.~~ `[FIXED]`
 *Change:* separate the write from construction with an explicit `.index(messages)` method, and have `make_recall_user_memory`'s callback request a read-only handle.
 *Trade-off:* changes `UserMemory`'s public contract, and `AgentGraph._build_user_memory` currently *relies* on the constructor write to index a new thread's messages before recall. That call site must be updated in the same change.
+
+> **Implemented exactly as recommended above**, including the caveat: `_build_user_memory` did rely on the constructor write, and it was updated in the same change via an `index: bool = True` parameter, with `_read_user_memory` as the read-only sibling the tool is given. The one thing the recommendation did not anticipate is the `_memory_cache` interaction — a read-only handle in the cache can satisfy a later gate hit and swallow its write — so the cache entry carries an `indexed` flag. Full account under H6 in §8; the callers that had to become explicit are listed there.
+>
+> **The remaining half of this recommendation is not H6 but C2's default.** Memory is still ephemeral unless a caller passes `user_history_directory_path` — now loud, still off. That is deliberate (writing user data to disk unbidden is the worse failure) and is what `voice_main._ensure_durable_memory` exists to prove at boot rather than assume.
 
 ### R6. Add metadata to memory documents
 
@@ -987,7 +1006,9 @@ The three problems identified as blocking further work:
 
 **What remains of H2 is the checkpointer, and it should not be filed as a leftover.** `MemorySaver` is still in-RAM and still per-object: nothing survives a restart except `conversation_summary.json`, two `AgentGraph` instances over the same document share no history, and every checkpoint of every thread is retained for the process lifetime with no cap. The trim work made this *more* visible rather than less — a conversation now has a compressed record worth persisting, and the only piece of it that reaches disk is the summary. `SqliteSaver` (R8) is the fix, `docs/tech_stack.md` §2 already specifies it, and §10 sequencing puts it before cancellation for a reason: a mid-turn kill leaves a checkpoint in the orphaned-`ToolMessage` state, and an in-RAM checkpointer gives you nothing to recover from.
 
-The highest-severity fully-open finding is now **H6** — `UserMemory` writes to Chroma from its constructor, so every read path also writes.
+~~The highest-severity fully-open finding is now **H6** — `UserMemory` writes to Chroma from its constructor, so every read path also writes.~~ `[FIXED]` **H6 is closed, and how it closed is the point.** The review had called it "safe today only because of the `_memory_cache` fingerprint and content-hash ids". It was not safe: the fingerprint makes *repeat* construction a no-op and says nothing about the first build of a turn, which is exactly the one `recall_user_memory` triggers. Asked *"what is my name?"*, the tool wrote that question into the collection and then retrieved it back at `k=1` — and the reply still read as correct, because the system prompt names Harshal. It took `scripts/check_routing.py` printing raw tool output to see it. A finding that had been reasoned about twice and marked safe both times was settled in one line of a test harness's output.
+
+**The highest-severity open finding is now R8** — the checkpointer. The two remaining HIGHs, H3 and H5, are both in `pipeline.py`, which is legacy and deliberately untouched.
 
 ~~**One caveat carried forward from the H1 fix:** `AgentGraph`'s tool routing has not been re-verified against `llama3.1`, which is not pulled locally. See R4.~~ `[DISCHARGED, AND NOW GATED]` `llama3.1` was pulled and routing measured against both the current and the pre-H1 prompt: identical on every route, so the H1/H2 prompt edits did not shift tool selection. That measurement is no longer a one-off — `scripts/check_routing.py` and `tests/test_routing_matrix.py` run all six rows against the real model and fail on a routing miss or a prose-narrated call. Full results under R4.
 
@@ -999,4 +1020,4 @@ For voice specifically: the graph topology is sound and needs no redesign. The w
 
 ---
 
-*Original review conducted read-only against commit `c100c2e`. Updated in place as findings were closed — C1, C2, C3, H1, H4, H2 (context growth), M11, R1, then finding K's timeout half and R4's routing caveat, which is now a committed gate rather than a one-off measurement. §10's latency baseline was corrected at the same time: the first agent turn of a process pays Ollama's model load and is not a steady-state number. Findings not named in that list are as first written and unverified against later changes.*
+*Original review conducted read-only against commit `c100c2e`. Updated in place as findings were closed — C1, C2, C3, H1, H4, H2 (context growth), M11, R1, then finding K's timeout half and R4's routing caveat, which is now a committed gate rather than a one-off measurement, and then H6/R5 once that gate caught the read path writing. §10's latency baseline was corrected at the same time: the first agent turn of a process pays Ollama's model load and is not a steady-state number. Findings not named in that list are as first written and unverified against later changes.*

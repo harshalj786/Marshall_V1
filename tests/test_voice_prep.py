@@ -292,6 +292,11 @@ def test_agent_graph_passes_memory_model_to_user_memory(monkeypatch):
         def __init__(self, **kw):
             captured.update(kw)
 
+        #: the write is an explicit call since H6 — the funnel makes it, so the double
+        #: has to answer it. What is under test here is still only `model=`.
+        def index(self, *a, **kw):
+            return 0
+
     monkeypatch.setattr(pipeline_lg, "UserMemory", _FakeUserMemory)
 
     agent = AgentGraph.__new__(AgentGraph)          # no ingestion; only the funnel is exercised
@@ -315,6 +320,10 @@ def test_chat_graph_passes_memory_model_to_user_memory(monkeypatch):
     class _FakeUserMemory:
         def __init__(self, **kw):
             captured.update(kw)
+
+        #: see the agent-side double above — H6 moved the write out of __init__
+        def index(self, *a, **kw):
+            return 0
 
         def invoke(self, *a, **kw):
             return "SUMMARY"

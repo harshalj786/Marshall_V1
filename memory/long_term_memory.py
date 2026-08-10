@@ -50,7 +50,6 @@ class UserMemory(Runnable):
                 UserWarning,
                 stacklevel=2,
             )
-        human_docs = [Document(page_content=msg.content) for msg in self.human_messages]
         #open (or create) the collection lazily so an empty chat_history does not crash,
         #and so an existing persisted collection can be reopened across sessions
         self.vector_store_user_data = Chroma(
@@ -58,13 +57,35 @@ class UserMemory(Runnable):
             embedding_function=self.embedding_model,
             persist_directory=self.persist_directory_path
         )
-        if human_docs:
-            #content-hash ids make re-indexing idempotent (add_texts upserts), so
-            #rebuilding on a later turn will not duplicate earlier messages
-            self.vector_store_user_data.add_documents(
-                human_docs,
-                ids=[hashlib.sha1(doc.page_content.encode("utf-8")).hexdigest() for doc in human_docs]
-            )
+        #opening is ALL construction does. The write used to happen right here, which made
+        #every reader a writer too (H6): recall_user_memory indexed the user's question and
+        #then searched a collection that now contained it — at k=1 it retrieved the question
+        #back. See .index() below and tests/test_memory_read_path.py.
+
+    def index(self,chat_history = None) -> int:
+        """Write the user's messages to Chroma. The ONLY write path. Returns rows written.
+
+        Defaults to this object's own chat_history, so `UserMemory(chat_history=h,...).index()`
+        reproduces the old constructor behaviour in one visible call; pass a list to index
+        something else without rebuilding the object.
+
+        Only HumanMessages are stored — Marshall's own replies are not facts about the user.
+        Filtering here as well as in __init__ is deliberate: an explicitly passed list has not
+        been through the constructor's split.
+        """
+        messages = self.chat_history if chat_history is None else chat_history
+        human_docs = [Document(page_content=msg.content)
+                      for msg in messages if isinstance(msg,HumanMessage)]
+        if not human_docs:
+            return 0
+        #content-hash ids make re-indexing idempotent (add_documents upserts), so
+        #rebuilding on a later turn will not duplicate earlier messages
+        self.vector_store_user_data.add_documents(
+            human_docs,
+            ids=[hashlib.sha1(doc.page_content.encode("utf-8")).hexdigest() for doc in human_docs]
+        )
+        return len(human_docs)
+
     def invoke(self,input,config=None):
         #here the invoke function compress the human from chat_history and then give it to the llm for personal context
         #no input for this function just call this function to get the compressed user_history

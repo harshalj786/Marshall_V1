@@ -281,12 +281,15 @@ def seed_memory(agent) -> None:
     from memory.long_term_memory import UserMemory
 
     Path(agent.user_history_directory_path).mkdir(parents=True, exist_ok=True)
+    #: `.index()` is explicit since H6 — constructing a UserMemory opens the collection and
+    #: writes nothing. Without it the seed would never reach Chroma and the recall route
+    #: would fail for a reason that has nothing to do with routing.
     UserMemory(
         chat_history=[HumanMessage(content=text) for text in SEED_MESSAGES],
         collection_name=agent.user_memory_collection,
         persist_directory_path=agent.user_history_directory_path,
         model=voice_main.VOICE_MODEL,
-    )
+    ).index()
 
 
 def run_route(agent, route: Route) -> RouteResult:

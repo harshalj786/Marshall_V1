@@ -275,13 +275,17 @@ class ChatRagWithMemoryGraph:
                 persist_directory_path=self.user_history_directory_path,
                 model=self.memory_model,
             )
+            # explicit since H6: construction only opens the collection now, so this graph
+            # would have silently stopped remembering anything without it. This IS the write
+            # path — the gate — and it stays inside the try for the reason below.
+            memory.index()
             return {"user_history_summary": memory.invoke({})}
         except Exception:
             # a memory failure must never destroy the user's turn; keep the previous summary.
             # Mirrors AgentGraph._summarize_user_history_node. The guard is wider than that
-            # one because this node also CONSTRUCTS the UserMemory, and construction is what
-            # writes to Chroma — AgentGraph does that in _build_user_memory, outside its try,
-            # so guarding only .invoke() here would still let a failed write kill the turn.
+            # one because this node also constructs the UserMemory AND writes it, while
+            # AgentGraph does both in _build_user_memory, outside its try — so guarding only
+            # .invoke() here would still let a failed write kill the turn.
             # Returning {} leaves user_history_summary untouched rather than blanking it:
             # the key uses the default overwrite reducer, so absence means "no update".
             return {}
@@ -375,6 +379,9 @@ class ChatRagWithMemoryGraph:
             persist_directory_path=self.user_history_directory_path,
             model=self.memory_model,
         )
+        # on-demand compression is still a write path — it is what the gate would have done
+        # on this thread — so it indexes explicitly now that construction does not (H6)
+        memory.index()
         summary = memory.invoke({})
         print(summary)
         return summary
@@ -631,15 +638,18 @@ class AgentGraph:
         # regex in retreival/retrieval.py; it now calls the one helper both sides use, so
         # there is no second copy left to drift.
         self.user_memory_collection = sanitize_collection_name(raw_name, fallback="user_history")
-        # thread_id -> (human_message_count, UserMemory): tracks how many of THAT thread's
+        # thread_id -> (fingerprint, UserMemory, indexed): tracks how many of THAT thread's
         # messages are already indexed into the shared collection. Content-hash ids make the
         # overlapping writes idempotent, so reads still span everything the user ever said.
-        self._memory_cache: dict[str, tuple[int, UserMemory]] = {}
+        # `indexed` says whether the entry has actually been WRITTEN for that fingerprint —
+        # False when the read-only funnel built it, so a later gate hit still writes (H6).
+        self._memory_cache: dict[str, tuple[tuple, UserMemory, bool]] = {}
 
         search_current_doc = make_search_current_doc(self.retrival)
         self.tools = [calculator, wikipedia_lookup, web_search, search_current_doc]
         if enable_recall_tool:
-            self.tools.append(make_recall_user_memory(self._build_user_memory))
+            # the READ-ONLY funnel: recalling a memory must not write one (H6)
+            self.tools.append(make_recall_user_memory(self._read_user_memory))
         if extra_tools:
             self.tools.extend(extra_tools)
 
@@ -664,12 +674,16 @@ class AgentGraph:
         self.graph = self._build_graph()
 
     def _build_user_memory(self, messages: list[BaseMessage],
-                           thread_id: str = "default") -> Optional[UserMemory]:
+                           thread_id: str = "default",
+                           index: bool = True) -> Optional[UserMemory]:
         """Build (or reuse) the UserMemory for one thread. Returns None if nothing to remember.
 
         Single funnel used by both the memory gate and the `recall_user_memory` tool, so the
-        two paths never disagree. Indexes this thread's human messages into the user-scoped
-        collection, so a later conversation can recall what was said in an earlier one.
+        two paths never disagree — they differ in exactly one argument. With `index=True`
+        (the gate) this thread's human messages are written into the user-scoped collection,
+        so a later conversation can recall what was said in an earlier one. With
+        `index=False` (`_read_user_memory`, which is what the tool is handed) nothing is
+        written at all: H6.
         """
         humans = [m for m in messages if isinstance(m, HumanMessage)]
         # fingerprint, not just a count: two threads at the same message count must never
@@ -677,7 +691,14 @@ class AgentGraph:
         fingerprint = (len(humans), humans[-1].content if humans else "")
         cached = self._memory_cache.get(thread_id)
         if cached and cached[0] == fingerprint:
-            return cached[1]
+            _, memory, indexed = cached
+            # a cached entry built by the READ path has not been written. Without this the
+            # first recall of a turn would satisfy the cache and the gate's write would be
+            # skipped for that fingerprint — passive memory would silently stop.
+            if index and not indexed:
+                memory.index(humans)
+                self._memory_cache[thread_id] = (fingerprint, memory, True)
+            return memory
         if not humans:
             # nothing of this thread's own to index; fall back to reading the shared store,
             # which may still hold messages from earlier conversations
@@ -689,7 +710,8 @@ class AgentGraph:
                 persist_directory_path=self.user_history_directory_path,
                 model=self.memory_model,
             )
-            self._memory_cache[thread_id] = (fingerprint, memory)
+            # nothing to write either way, so this entry is "written" for any caller
+            self._memory_cache[thread_id] = (fingerprint, memory, True)
             return memory
         memory = UserMemory(
             chat_history=humans,
@@ -697,8 +719,26 @@ class AgentGraph:
             persist_directory_path=self.user_history_directory_path,
             model=self.memory_model,
         )
-        self._memory_cache[thread_id] = (fingerprint, memory)
+        if index:
+            memory.index(humans)
+        self._memory_cache[thread_id] = (fingerprint, memory, index)
         return memory
+
+    def _read_user_memory(self, messages: list[BaseMessage],
+                          thread_id: str = "default") -> Optional[UserMemory]:
+        """Read-only handle over the same funnel. This is what `recall_user_memory` gets.
+
+        A separate method rather than a partial or a tool-side flag, for two reasons: the
+        tool's callback contract stays `(messages, thread_id)` so `tools/tools.py` needed no
+        change at all, and "who reads without writing" is greppable.
+
+        The bug this exists to prevent is not theoretical. Asked *"what is my name?"*, the
+        old path indexed that question into the collection and then searched it — and at
+        `k=1` the nearest neighbour to "my name" was the question, not the answer. It read
+        as a working recall because the reply was right for an unrelated reason: the system
+        prompt names Harshal.
+        """
+        return self._build_user_memory(messages, thread_id, index=False)
 
     def _count_turn_node(self, state: AgentState) -> dict:
         # Sits between START and `agent` so it runs exactly once per invoke(). Counting inside
