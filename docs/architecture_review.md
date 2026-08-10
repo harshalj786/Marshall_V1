@@ -14,13 +14,16 @@
 | **H4** — divergent error handling between the memory gates | `[FIXED]` — `pipeline_lg.py` |
 | **H2** — unbounded agent context | `[FIXED]` — `pipeline_lg.py`, `memory/reconciliation.py` |
 | **R1** — retrieval welded to index construction | `[FIXED]` — `ingestion/ingest.py`, `ingestion/vector_db.py`, `retreival/retrieval.py` |
-| **H3, H5, H6, M1–M10, L1–L14** | open |
+| **K / M10** — network tools with no timeout | `[PARTIALLY FIXED]` — `tools/tools.py` (10 s budget; no output-size cap) |
+| **R4 routing caveat** — tool selection verified once, by hand | `[FIXED]` — `scripts/check_routing.py`, `tests/test_routing_matrix.py` |
+| **R8** — checkpointer still `MemorySaver` (H2's remaining half) | open |
+| **H3, H5, H6, M1–M9, L1–L14** | open |
 
-All three criticals plus H1, H2 and H4 are closed. H2's second half is not: the agent's context no longer grows without bound, but `MemorySaver` is still in-RAM, so **the checkpointer** (`SqliteSaver`, `docs/roadmap.md` Phase 1) is what remains of it. **H6** (`UserMemory` writes from its constructor) is now the highest-severity fully-open finding.
+All three criticals plus H1, H2 and H4 are closed. **H2's second half is not, and it is the half that loses data.** The agent's context no longer grows without bound — `summarize_and_trim` sees to that — but `MemorySaver` is still in-RAM and still per-object, so every checkpoint of every thread dies with the process. The only thing that survives a restart today is `{summary_persist_path}/conversation_summary.json`, reloaded by `invoke` when a thread has no in-RAM history; the message list itself, the turn count and the compressed profile do not. `SqliteSaver` (R8, `docs/roadmap.md` Phase 1, already specified by `docs/tech_stack.md` §2) is what remains of H2. **H6** (`UserMemory` writes from its constructor) is now the highest-severity fully-open finding.
 
 R1 is listed in the table because its structural half is now closed too: ingestion is an explicit step (`ingestion/ingest.py`) and `Retrival` can open a collection it did not build. That was the first item in the §10 voice sequencing, and it is what M1 and the startup-cost finding both rested on.
 
-The repository also now has its first tests, in `tests/` — see the H4, H2 and R1 resolutions.
+The repository also now has its first tests, in `tests/` — see the H4, H2 and R1 resolutions. One of them is a different kind: `tests/test_routing_matrix.py` and `scripts/check_routing.py` run the **real** llama3.1 and assert which tool it chose, which is what closes the standing R4 worry that routing was verified once and would rot unwatched.
 
 **Note on line references:** the H1 fix restructured the prompt constants at the top of `pipeline_lg.py`, so line numbers cited in §1–§7 for anything above `ChatRagGraph` have shifted. Symbol names are still accurate.
 
@@ -306,8 +309,18 @@ There is no `trim_history` node in `_build_graph` (546-563) — a deliberate cho
 **J. The memory gate injects a synchronous multi-second LLM call into the request path.**
 `pipeline_lg.py:512-523` and `226-232`. Turn 5, 10, 15… each carry an extra full compression round-trip before the user's answer starts. In text this is a visible pause; in voice (§10) it is a dead-air stall.
 
-**K. Network tools have no timeout, backoff, or rate-limit handling.**
+**K. Network tools have no timeout, backoff, or rate-limit handling.** `[FIXED — timeout; backoff and rate-limit handling still absent]`
 `tools/tools.py:73-83` retries Wikipedia exactly twice by reconstructing the retriever, with no delay. `tools/tools.py:91-104` calls DuckDuckGo with no retry at all — DDG rate-limits aggressively under repeated agent use, and the failure surfaces to the model as the string `"web_search error: ..."`, which it may then narrate to the user.
+
+> **Resolution (the timeout half).** `wikipedia_lookup` and `web_search` now run their bodies under a hard `TOOL_TIMEOUT_SECONDS = 10.0` wall-clock budget (`tools/tools.py:27`) and return `"<tool> error: timed out after 10s"` on expiry — an ordinary tool-result string, so the model narrates a timeout instead of the turn stalling. The measurement that set the number is R4's: `wikipedia_lookup` took **53–82 s inside the agent** against 22.6 s standalone, which in §10 terms is that many seconds of dead air on a turn that routed *correctly*. A tool that gives up beats one that answers late — the model can narrate a timeout, but nothing downstream can un-stall a turn that already blocked.
+>
+> **The retry shares the budget.** Both Wikipedia attempts run inside one 10 s window, because the retry is part of what made it slow: two serial round-trips with no delay between them.
+>
+> **A daemon thread, and the worker is not killed.** Python cannot interrupt a thread and the blocking call is down inside urllib, so what unblocks is the *turn*, not the socket; the orphan finishes into a result nobody reads. `threading.Thread(daemon=True)` rather than `ThreadPoolExecutor` specifically because the pool's workers are non-daemon and joined by an `atexit` hook — one hung lookup would hold the process open at shutdown, and the voice loop's Ctrl+C must not queue behind it. Exceptions are re-raised in the calling thread rather than converted, so the wrapper changes *when* a tool returns and nothing about *what*.
+>
+> **Name, docstring and signature are byte-identical to the pre-timeout versions,** and `tests/test_voice_prep.py` pins them against hard-coded literals captured from the old code. That is not tidiness: R4 measured tool routing against exactly these strings, and §7 is explicit that the docstrings are prompt engineering rather than documentation. The timeout wraps execution only.
+>
+> *Still open:* no backoff, no rate-limit detection, and no output-size cap (M10). A DDG rate-limit still surfaces as a string the model may narrate, and `wikipedia_lookup(k=3)` can still return tens of thousands of characters — now merely within 10 s.
 
 **L. Chat graphs retrieve unconditionally.**
 `pipeline_lg.py:99-106` and `208-218` run a vector search for every turn including `"hi"`. Under `mqr` that is 6 model/store calls to answer a greeting.
@@ -566,7 +579,7 @@ Two categories, both in `tools/tools.py`:
 
 **The docstrings are the interface.** `recall_user_memory`'s docstring (146-164) is 19 lines of behavioral specification — when to call, four explicit *do not* cases, and what to do with the result. This is not documentation; it is prompt engineering, and it is load-bearing on an 8B model. Any edit to it changes routing behavior.
 
-**Metadata:** none beyond name/description/args-schema. No categories, no cost or latency hints, no permission or side-effect flags, no versioning, no timeouts. All five tools return `str` and swallow their own exceptions into `"<toolname> error: {e}"` strings (the sole exception being `import wikipedia` at line 70, which sits outside the try).
+**Metadata:** none beyond name/description/args-schema. No categories, no cost or latency hints, no permission or side-effect flags, no versioning. (Timeouts are no longer absent, but they are also not metadata: the 10 s budget from §4-K is applied inside the two network tools' bodies, not declared anywhere the registry or the model can see.) All five tools return `str` and swallow their own exceptions into `"<toolname> error: {e}"` strings (the sole exception being `import wikipedia` at line 70, which sits outside the try).
 
 ### How tools are registered
 
@@ -610,7 +623,7 @@ Tool *results* are always `ToolMessage`s carrying a string. Errors are strings t
 2. **Optional tools require a bespoke splice pattern.** The `_RECALL_TOOL_ENTRY`/`_RECALL_GUIDELINES`/`{recall_tool_entry}`/`{recall_guidelines}` mechanism is four coordinated pieces per optional tool. It does not generalize — a second optional tool means a second quadruple.
 3. **`AGENT_SYSTEM_PROMPT` (367-370) is a module constant computed at import time with recall enabled.** It is exported "for callers/tests" but is *not* what a `enable_recall_tool=False` agent uses (which computes its own at 454-457). A test asserting against the constant tests the wrong prompt.
 4. **Factory tools cannot be registered statically** — they need agent state, so they can only be constructed inside `AgentGraph.__init__`, which is why the tool list can't move to `tools/`.
-5. **No shared tool infrastructure.** Each tool reimplements its own try/except-to-string, its own retry (`wikipedia_lookup` retries twice; `web_search` doesn't), its own result formatting. No timeouts anywhere, no output-size cap — `wikipedia_lookup` with `k=3` can return tens of thousands of characters straight into the context.
+5. **No shared tool infrastructure.** Each tool reimplements its own try/except-to-string, its own retry (`wikipedia_lookup` retries twice; `web_search` doesn't), its own result formatting. No output-size cap — `wikipedia_lookup` with `k=3` can return tens of thousands of characters straight into the context. Timeouts are now the one piece that *is* shared: `_run_with_timeout` (§4-K) is a single helper both network tools call, and it is the obvious seed for the rest of this if a `@timed_tool` decorator or the R7 registry ever lands.
 6. **`recall_user_memory` is not unit-testable in isolation** — `InjectedState` means it only works inside a `ToolNode`.
 7. **Only `AgentGraph` has tools.** The two chat graphs and all four `pipeline.py` classes cannot use them.
 8. **The tool count itself has a measured cost.** `README.md:261-265` records that adding the fifth tool costs roughly one spurious call per four conversational turns on llama3.1. Tool-set growth is not free on an 8B model, and the codebase is the rare one that has actually measured it.
@@ -717,7 +730,7 @@ No trim node in `_build_graph` (546-563), by design (`README.md:267-269`); `Memo
 
 **M9. `import wikipedia` sits outside its try block.** `tools/tools.py:70` vs the try at 74. `ImportError` escapes the tool's error contract.
 
-**M10. No output-size cap or timeout on any tool.** `tools/tools.py` throughout. `wikipedia_lookup(k=3)` can inject tens of thousands of characters into the context in one `ToolMessage`.
+**M10. No output-size cap or timeout on any tool.** `[PARTIALLY FIXED]` `tools/tools.py` throughout. `wikipedia_lookup(k=3)` can inject tens of thousands of characters into the context in one `ToolMessage`. The **timeout** half is closed — both network tools now run under a 10 s budget (§4-K) — and it is the half that mattered for voice. The **size cap** is untouched: a tool result is still unbounded, which is a context-window and latency cost rather than a dead-air one.
 
 **M11. `mode_docs="scanned_pdf"` is broken in the working environment.** `[FIXED]` `ingestion/doc_loader.py:33-38`. `pdfplumber` was not installed, so `PDFPlumberLoader` imported fine (langchain defers the underlying import) and then raised `ImportError: pdfplumber package not found` at `.load()`. Verified by running it, not inferred from the import list. `README.md:280` and `WHAT_I_BUILT.md:63` both advertise the mode as working. *Discovered while pinning dependencies.*
 
@@ -777,7 +790,7 @@ All preserve current behavior. **Not implemented — recommendations only.** Ord
 *Change:* a base class owning ingestion (delegating to R1), the checkpointer, `get_history`, `run_chat`, and `_last_answer`. The three graph classes then contribute only their nodes and edges.
 *Trade-off:* inheritance across three classes whose graph shapes genuinely differ — `AgentGraph` has no `context` in state and no retrieve node. Keep the base strictly to plumbing; do **not** try to unify `ChatState` and `AgentState`, which are correctly different.
 
-### R4. Move retrieved context and the user profile out of the system message — *done for the graphs; routing caveat discharged*
+### R4. Move retrieved context and the user profile out of the system message — *done for the graphs; routing caveat discharged and now gated by a test*
 
 *Problem:* H1 — prompt injection from ingested documents, against the project's own `docs/security.md` §4.
 *Done:* implemented for all three LangGraph classes, as described under H1 in §8. Answer quality was re-checked on the real PDF across a two-turn exchange — answers stayed grounded and the follow-up still resolved against history.
@@ -809,7 +822,25 @@ All preserve current behavior. **Not implemented — recommendations only.** Ord
 >
 > **A trap for whoever tests a tool next.** `llama3.1` emits proper structured `tool_calls` with four or five tools bound, but falls back to writing the call out as prose JSON when only **one** tool is bound — and it mangles the name, emitting the description's first word rather than the function's. The system prompt makes no difference either way. `AgentGraph` always binds four or five, so it never hits this, but a minimal one-tool reproduction will show a failure that the real system does not have. This is the same prose-instead-of-`tool_call` symptom the code comments warn about, reached by a different route.
 >
-> **Still not covered by any test.** Every `AgentGraph` test monkeypatches `agent.llm` — `test_summarization_cycle.py` does so at 15 sites, deliberately, because faking the model is what makes the graph behaviour assertable. The result is that **no test in the repository exercises tool routing**, and the numbers above came from a throwaway harness. Routing is verified as of this commit and will silently rot; pinning even one route as a `needs_llama31`-marked test would be the cheap fix.
+> ~~**Still not covered by any test.** Every `AgentGraph` test monkeypatches `agent.llm` — `test_summarization_cycle.py` does so at 15 sites, deliberately, because faking the model is what makes the graph behaviour assertable. The result is that **no test in the repository exercises tool routing**, and the numbers above came from a throwaway harness. Routing is verified as of this commit and will silently rot; pinning even one route as a `needs_llama31`-marked test would be the cheap fix.~~ `[FIXED]` All six rows are pinned, not one.
+
+> **The table above is now a committed gate.** `scripts/check_routing.py` is the harness, no longer throwaway; `tests/test_routing_matrix.py` imports it so the runnable script and the gate can never measure two different things.
+>
+> ```
+> python scripts/check_routing.py              # all six, exit 1 on a routing miss
+> python scripts/check_routing.py --route math # one route, for a fast retry
+> pytest tests/test_routing_matrix.py -v       # the same matrix, skipped without llama3.1
+> ```
+>
+> **It closes the gap `voice_main.py --check` leaves.** That check loads every model, probes the microphone and runs a TTS → STT round trip — and never sends a prompt to the LLM. `boot()` constructs the `AgentGraph`, which opens the index and builds `ChatOllama`, but nothing invokes it, so `--check` passes identically on a machine where llama3.1 was never pulled or where it answers but no longer routes.
+>
+> **What is asserted is the `tool_calls` on the `AIMessage`,** read back off the graph state via `get_history(thread_id)` — never the answer text. The system prompt contains "Harshal", so an answer naming him proves nothing about `recall_user_memory`; and a correctly-routed `wikipedia_lookup` that returns `"timed out after 10s"` under §4-K's budget still passes, because whether Wikipedia answered today says nothing about whether the model routed.
+>
+> **The prose-narration failure is detected explicitly.** An `AIMessage` that *describes* a call — `<function=calculator`, a JSON blob — with no structured `tool_calls` behind it is a FAIL, not a pass. That is the symptom the code comments and the one-tool trap above both warn about, and it is invisible to a human reading the transcript because the reply looks like an answer. The detector is deliberately narrow (a bare tool name is a mention; only a call-shaped token is a call) and only condemns a turn that emitted no real call, so it cannot fail a route that worked. Eight of its tests need no model at all, so the detector itself cannot rot while the model-dependent half sits skipped.
+>
+> **The two nuances above are encoded, not just written down.** The no-tool row reports as `KNOWN-BOUNDARY` and xfails rather than failing the build — it is a category judgement measured identically on the pre-H1 prompt, not a regression. The five must-pass rows are the exit code. And the harness always binds all five tools, with the one-tool trap restated where anyone about to trim the list would read it.
+>
+> **Re-measured on this commit** (llama3.1:latest, memory seeded, each route on its own `thread_id`, never `voice-main`): `calculator` 6.7 s, `search_current_doc` 3.3 s, `recall_user_memory` 1.3 s, `wikipedia_lookup` 8.4 s, `web_search` 5.1 s, no-tool → `wikipedia_lookup` 10.5 s. **5/5 must-pass correct, 0 prose-narrated, exit 0** — identical routing to R4's original run, including the miss. Those timings are also the warm latency baseline §10 now cites.
 
 ### R5. Give `UserMemory` a durability guard and a read-only mode — *partially done*
 
@@ -880,7 +911,7 @@ That said, the *graph topology* is not the obstacle. The obstacle is the layer d
 **Async execution — blocked, but shallowly.**
 - No async anywhere. LangGraph will run sync nodes in a threadpool under `.ainvoke()`, so you get *concurrency* almost for free — but not *cancellation*, because a blocked HTTP call in a worker thread cannot be interrupted.
 - The `Runnable` base gives `ainvoke` by delegation to `invoke` in an executor. It works and it blocks a thread. Not a solution, a trap.
-- Every network call is sync with no timeout: Ollama (543), Chroma (`retreival/retrieval.py:48, 59, 76`; `memory/long_term_memory.py:63`), Wikipedia (`tools/tools.py:76`), DuckDuckGo (`tools/tools.py:93`).
+- Every network call is sync, and all but two have no timeout: Ollama (543), Chroma (`retreival/retrieval.py:48, 59, 76`; `memory/long_term_memory.py:63`). Wikipedia and DuckDuckGo are now bounded at 10 s (§4-K) — but bounded is not cancellable: the budget expires the *turn*, while the worker thread keeps running to nobody.
 - **Shared mutable state on a single graph object blocks concurrent sessions:** `self._memory_cache` (`pipeline_lg.py:443`) is written without synchronization at 489 and 496; `self.tools` and `self.llm` are shared; `_EMBEDDING_MODEL` (`memory/long_term_memory.py:12`) has a check-then-set race. One `AgentGraph` serving several simultaneous voice sessions will interleave these.
 
 **Event-driven state transitions — partially supported.**
@@ -899,8 +930,30 @@ That said, the *graph topology* is not the obstacle. The obstacle is the layer d
 - The only loops that exist are `while True: input(...)` (six sites).
 - ~~**Startup latency is fatal to a voice session:** the constructor synchronously loads, chunks, embeds, and writes the entire document (`pipeline_lg.py:419-428`) plus a MiniLM model (`ingestion/vector_db.py:10-12`) before returning.~~ `[FIXED — see R1]` Ingestion is now an explicit step and the constructors run it only on a cold index; a warm start opens the existing collection without reading the source at all. Measured 12.5 s → 7.9 s on the 48-chunk test PDF, and the saving grows with corpus size — and with `mode_docs="youtube"`/`"web_url"`, where the old path re-fetched over the network on every construction. **What is left of this is not ingestion:** ~4.8 s of the remaining 7.9 s is the MiniLM load, needed to embed queries, and it is still synchronous and still ahead of the first word. Loading it eagerly at process start, or accepting a pre-built embedding handle, is the next cut.
 - **The memory gate injects a multi-second stall into turns 5, 10, 15…** `_summarize_user_history_node` (512-523) runs a full LLM compression synchronously in the request path, and `UserMemory.invoke` (`memory/long_term_memory.py:47-59`) sends the entire history in one prompt so the stall grows with conversation length. In text this is a pause; in voice it is dead air at a fixed, predictable cadence.
-- **`AgentGraph`'s unbounded history** (§4-F) means time-to-first-token grows monotonically through a long conversation — the exact opposite of what voice needs.
-- Nothing measures latency. There is no instrumentation for time-to-first-token, per-node duration, or tool latency, so there is no baseline to regress against.
+- **`AgentGraph`'s unbounded history** (§4-F) means time-to-first-token grows monotonically through a long conversation — the exact opposite of what voice needs. `[FIXED — see H2]` The `summarize_and_trim` cadence bounds the list, so this no longer climbs; the checkpointer half of H2 is unaffected either way.
+- ~~Nothing measures latency. There is no instrumentation for time-to-first-token, per-node duration, or tool latency, so there is no baseline to regress against.~~ `[FIXED]` `voice/telemetry.py` appends one JSON row per turn to `voice_logs/turns.jsonl` — `stt_ms`, `agent_ms`, `tts_first_sentence_ms` and the headline `speech_end_to_first_audio_ms`, which is the only number the user experiences directly. The writer never raises: the same contract as H4 and H2, instrumentation may lose data and may never lose the turn. The baseline it was built to establish is below.
+
+### Latency baseline — and the cold-start correction
+
+**Correct the first number this project recorded.** V1a's commit cited `agent_ms = 10102` from `voice_logs/turns.jsonl` as the agent-side baseline. That row is turn 1 of a fresh process, and it is **a cold-start artifact, not a steady-state cost**. `boot()` loads embeddings, the document index, silero, faster-whisper and Kokoro, and then hands the agent to the loop *without ever calling the LLM* — so the first `invoke` is where Ollama pays to pull llama3.1 (4.9 GB) into VRAM. That load is charged, once, to whichever turn happens to be first.
+
+**The warm baseline, measured by the committed routing matrix** (`scripts/check_routing.py`, same model, same document, same `keep_alive="30m"`, one turn per thread):
+
+| Turn | Tool | Wall clock |
+|---|---|---|
+| first invoke of the process | `calculator` | 6.7 s — *includes the model load* |
+| warm | `recall_user_memory` | 1.3 s |
+| warm | `search_current_doc` | 3.3 s |
+| warm | `web_search` | 5.1 s |
+| warm | `wikipedia_lookup` | 8.4 s |
+| warm | `wikipedia_lookup` (no-tool row) | 10.5 s |
+
+So a warm agent turn is **1.3–8.4 s across the five R4 routes**, and the spread is owned by the *tool*, not the model: the local ones (recall, document) sit at 1.3–3.3 s, and the two network tools take 5.1–10.5 s under §4-K's 10 s ceiling. A single-digit-second turn is the number V1b–V1d have to beat; **10.1 s is not, and re-quoting it would set the bar three times too low.**
+
+Two consequences for the voice work:
+
+1. **The first turn of a session is always the slowest, by several seconds, for a reason that has nothing to do with the pipeline.** Either warm the model at boot with a throwaway generation — the same argument `warmup.warm_embeddings()` already makes for MiniLM, and boot time is where nobody is waiting — or accept it and never read a turn-1 row as a baseline. Nothing in the telemetry marks a row cold, which is exactly how the 10.1 s number got quoted; a `cold: true` flag on the first row of a process would close that.
+2. **Comparisons must hold the route fixed.** `agent_ms` mixes a local Chroma lookup and a 10 s-capped network call into one field, so an aggregate over mixed turns measures which tools were chosen, not how fast the agent is. `turns.jsonl` records no tool name (§10's instrumentation is per-stage, not per-route), so the routing matrix is currently the only per-route timing that exists.
 
 ### Recommended sequencing for voice (not implemented)
 
@@ -930,11 +983,15 @@ The three problems identified as blocking further work:
 
 **H4 is closed too** — `ChatRagWithMemoryGraph` now shares `AgentGraph`'s error-handling discipline, and the repository has its first tests as a result.
 
-**H2's first half is closed** — `AgentGraph` now compresses and trims its own history on a cadence, so time-to-first-token stops climbing with conversation length. The pair-reconciliation problem that made it look expensive was solved as a separate primitive rather than inside the node, precisely because §10 needs the same one for barge-in: `find_safe_cut_point` is a pure function over a message list and knows nothing about the graph. What remains of H2 is the checkpointer — `MemorySaver` is still in-RAM and per-object, so only the summary file survives a restart.
+**H2's first half is closed** — `AgentGraph` now compresses and trims its own history on a cadence, so time-to-first-token stops climbing with conversation length. The pair-reconciliation problem that made it look expensive was solved as a separate primitive rather than inside the node, precisely because §10 needs the same one for barge-in: `find_safe_cut_point` is a pure function over a message list and knows nothing about the graph.
+
+**What remains of H2 is the checkpointer, and it should not be filed as a leftover.** `MemorySaver` is still in-RAM and still per-object: nothing survives a restart except `conversation_summary.json`, two `AgentGraph` instances over the same document share no history, and every checkpoint of every thread is retained for the process lifetime with no cap. The trim work made this *more* visible rather than less — a conversation now has a compressed record worth persisting, and the only piece of it that reaches disk is the summary. `SqliteSaver` (R8) is the fix, `docs/tech_stack.md` §2 already specifies it, and §10 sequencing puts it before cancellation for a reason: a mid-turn kill leaves a checkpoint in the orphaned-`ToolMessage` state, and an in-RAM checkpointer gives you nothing to recover from.
 
 The highest-severity fully-open finding is now **H6** — `UserMemory` writes to Chroma from its constructor, so every read path also writes.
 
-~~**One caveat carried forward from the H1 fix:** `AgentGraph`'s tool routing has not been re-verified against `llama3.1`, which is not pulled locally. See R4.~~ `[DISCHARGED]` `llama3.1` was pulled and routing measured against both the current and the pre-H1 prompt: identical on every route, so the H1/H2 prompt edits did not shift tool selection. Full results under R4.
+~~**One caveat carried forward from the H1 fix:** `AgentGraph`'s tool routing has not been re-verified against `llama3.1`, which is not pulled locally. See R4.~~ `[DISCHARGED, AND NOW GATED]` `llama3.1` was pulled and routing measured against both the current and the pre-H1 prompt: identical on every route, so the H1/H2 prompt edits did not shift tool selection. That measurement is no longer a one-off — `scripts/check_routing.py` and `tests/test_routing_matrix.py` run all six rows against the real model and fail on a routing miss or a prose-narrated call. Full results under R4.
+
+**One number in the project's own history is corrected here:** the `agent_ms = 10102` recorded as V1a's baseline is a first-invoke row that includes Ollama pulling llama3.1 into VRAM. Warm, the same agent answers in 1.3–8.4 s depending on which tool it picked. See §10's latency baseline — the distinction matters because every remaining voice milestone is latency work measured against it.
 
 **One operational note carried over from C1, now sharper under R1:** the fix prevents new duplicates but does not remove ones already on disk. Any collection under `db/` built before this change should be deleted and rebuilt, or it will keep serving the copies it already accumulated. R1 makes this stickier rather than better: `ensure_ingested` sees a populated collection and skips ingestion entirely, so a stale or duplicate-laden collection is now never even re-examined. The same applies to a chunk-size change — deleting the collection directory is the only way to force a rebuild.
 
@@ -942,4 +999,4 @@ For voice specifically: the graph topology is sound and needs no redesign. The w
 
 ---
 
-*Original review conducted read-only against commit `c100c2e`. Subsequently updated in place as C1 and C2 were fixed; every other finding is as first written and unverified against later changes.*
+*Original review conducted read-only against commit `c100c2e`. Updated in place as findings were closed — C1, C2, C3, H1, H4, H2 (context growth), M11, R1, then finding K's timeout half and R4's routing caveat, which is now a committed gate rather than a one-off measurement. §10's latency baseline was corrected at the same time: the first agent turn of a process pays Ollama's model load and is not a steady-state number. Findings not named in that list are as first written and unverified against later changes.*
