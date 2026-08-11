@@ -1,16 +1,23 @@
-"""The V1a loop, driven entirely by fakes: LISTENING -> THINKING -> SPEAKING -> LISTENING.
+"""The turn loop, driven entirely by fakes: LISTENING -> THINKING -> SPEAKING -> LISTENING.
 
 No microphone, no GPU, no models, no Ollama. `VoiceOrchestrator` takes every
 collaborator as a constructor argument and never imports sounddevice, torch,
 faster-whisper or kokoro, so the full cycle — including the parts that only happen on
-a real turn, like discarding frames while Marshall is talking — is assertable here.
+a real turn, like being interrupted mid-answer — is assertable here.
 
-The three things these tests exist to pin:
+What these tests pin:
 
 1. a complete cycle runs and returns to LISTENING;
-2. frames arriving during THINKING/SPEAKING are DISCARDED, which is what "no barge-in"
-   means mechanically, and is the property V1b will deliberately break;
-3. shutdown cancels cleanly — no traceback, no stranded task, hardware released.
+2. frames arriving during THINKING are DISCARDED, and so are frames during SPEAKING when
+   `barge_in_mode="off"` — that is V1a's behaviour, kept as an explicit mode;
+3. **barge-in (V1b)**: sustained speech during SPEAKING stops playback, drops the rest of
+   the answer, truncates the stored history to what was heard, and hands the captured
+   audio to the next utterance. A transient does none of that;
+4. shutdown cancels cleanly — no traceback, no stranded task, hardware released.
+
+The one fake worth reading closely is `FakeSpeaker`: its `stop()` releases a blocked
+`play()`, because that is exactly what `sd.stop()` does to `sd.wait()` and it is the
+mechanism the whole interrupt path rests on.
 
     pytest tests/test_voice_orchestrator.py -v
     python tests/test_voice_orchestrator.py
@@ -29,8 +36,14 @@ import pytest
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 
 from voice.config import VoiceConfig, VAD_FRAME_SAMPLES
-from voice.orchestrator import VoiceOrchestrator, State, run_session
+from voice.orchestrator import (
+    INTERRUPTION_MARKER,
+    State,
+    VoiceOrchestrator,
+    run_session,
+)
 from voice.telemetry import TelemetryWriter
+from voice.tts import split_sentences
 
 
 def asyncio_test(fn):
@@ -76,6 +89,11 @@ class FakeMic:
     def push(self, frame):
         self._queue.put(frame)
 
+    def pending(self) -> int:
+        """Frames captured but not yet read. Lets a test wait on consumption rather
+        than on a sleep."""
+        return self._queue.qsize()
+
     def drain(self):
         dropped = 0
         while True:
@@ -118,12 +136,30 @@ class FakeStt:
         return self.transcript
 
 
+class ScriptedStt(FakeStt):
+    """One transcript per call, in order; the last one repeats.
+
+    A false barge-in needs both halves: a real first turn to get Marshall talking, and
+    an empty second one for the interruption that turned out to be a cough.
+    """
+
+    def __init__(self, *transcripts):
+        super().__init__(transcripts[0])
+        self._script = list(transcripts)
+
+    def transcribe(self, audio):
+        self.calls.append(len(audio))
+        return self._script.pop(0) if len(self._script) > 1 else self._script[0]
+
+
 class FakeAgent:
-    """Stands in for AgentGraph. Records the exact call the orchestrator makes."""
+    """Stands in for AgentGraph. Records the exact calls the orchestrator makes."""
 
     def __init__(self, response="OPVC pipes are rated for cold water service."):
         self.response = response
         self.calls = []
+        self.truncations = []          # (content, thread_id) per barge-in
+        self.truncate_result = True
         self.barrier = None            # set to an Event to hold a turn open
 
     def invoke(self, query, config=None):
@@ -131,6 +167,10 @@ class FakeAgent:
         if self.barrier is not None:
             self.barrier.wait(5)
         return self.response
+
+    def truncate_last_response(self, content, thread_id="default"):
+        self.truncations.append((content, thread_id))
+        return self.truncate_result
 
 
 class FakeTts:
@@ -140,24 +180,42 @@ class FakeTts:
         self.calls = []
 
     def stream_sentences(self, text):
-        for index, sentence in enumerate(s for s in text.split(". ") if s.strip()):
+        #: the REAL splitter — the double exists to avoid Kokoro, not to avoid splitting,
+        #: and the truncation assertions are about the exact sentence text
+        for index, sentence in enumerate(split_sentences(text)):
             self.calls.append(sentence)
             yield index, sentence, np.full(240, 0.1, dtype=np.float32)
 
 
 class FakeSpeaker:
+    """Playback that blocks, and a `stop()` that aborts it.
+
+    `stop()` releasing a blocked `play()` is not decoration: `Speaker.play` is
+    `sd.play()` + `sd.wait()`, and `sd.stop()` unblocking that wait is the entire
+    mechanism barge-in uses to cut a sentence short. A fake without it would let the
+    interrupt tests pass while the real path deadlocked.
+    """
+
     def __init__(self):
         self.played = []
         self.stopped = False
+        self.stops = 0
         self.barrier = None            # set to an Event to hold SPEAKING open
 
     def play(self, audio):
         self.played.append(len(audio))
-        if self.barrier is not None:
-            self.barrier.wait(5)
+        #: read once: a test may clear `self.barrier` to let the rest of an answer run
+        barrier = self.barrier
+        if barrier is not None:
+            barrier.wait(5)
+            #: one release per sentence, so setting it does not free the whole queue
+            barrier.clear()
 
     def stop(self):
         self.stopped = True
+        self.stops += 1
+        if self.barrier is not None:
+            self.barrier.set()
 
 
 def frame(prob: float) -> np.ndarray:
@@ -170,9 +228,19 @@ def utterance_frames(config: VoiceConfig, speech: int = 3):
     return [frame(0.9)] * speech + [frame(0.0)] * config.silence_frames
 
 
-def build(tmp_path, frames=(), **overrides):
+def interrupt_frames(config: VoiceConfig):
+    """Exactly enough sustained over-threshold speech to fire the barge-in guard."""
+    return [frame(0.95)] * config.barge_in_sustained_frames
+
+
+def transient_frames(config: VoiceConfig):
+    """One frame short of the guard's run — a cough, a door, a chair."""
+    return [frame(0.95)] * (config.barge_in_sustained_frames - 1) + [frame(0.0)] * 3
+
+
+def build(tmp_path, frames=(), config_kwargs=None, **overrides):
     config = VoiceConfig(telemetry_path=str(tmp_path / "turns.jsonl"),
-                         thread_id="test-thread")
+                         thread_id="test-thread", **(config_kwargs or {}))
     parts = dict(
         agent=FakeAgent(), mic=FakeMic(frames), vad=FakeVad(),
         stt=FakeStt(), tts=FakeTts(), speaker=FakeSpeaker(),
@@ -181,6 +249,20 @@ def build(tmp_path, frames=(), **overrides):
     orchestrator = VoiceOrchestrator(
         config=config, telemetry=TelemetryWriter(config.telemetry_path), **parts)
     return orchestrator, parts, config
+
+
+async def wait_for(predicate, timeout=5.0) -> bool:
+    """Poll the loop until `predicate()` holds. False if it never did."""
+    for _ in range(int(timeout / 0.01)):
+        if predicate():
+            return True
+        await asyncio.sleep(0.01)
+    return False
+
+
+def read_rows(config) -> list:
+    text = Path(config.telemetry_path).read_text(encoding="utf-8").strip()
+    return [json.loads(line) for line in text.splitlines()] if text else []
 
 
 async def run_until_stopped(orchestrator, timeout=10.0):
@@ -309,28 +391,238 @@ async def test_frames_arriving_during_thinking_are_discarded(tmp_path):
 
 
 @asyncio_test
-async def test_frames_arriving_during_speaking_are_discarded(tmp_path):
-    """Marshall's own voice must not be heard as the user's next utterance."""
+async def test_frames_during_speaking_are_discarded_when_barge_in_is_off(tmp_path):
+    """V1a's behaviour, kept as an explicit mode.
+
+    `barge_in_mode="off"` is what a user on speakers runs: with no echo cancellation in
+    the stack, Marshall's own voice would otherwise reach the mic and interrupt him. So
+    the frames are still read — the stream never closes — and still thrown away.
+    """
     speaker = FakeSpeaker()
     speaker.barrier = threading.Event()
     orchestrator, parts, config = build(
-        tmp_path, utterance_frames(VoiceConfig()), speaker=speaker)
+        tmp_path, utterance_frames(VoiceConfig()), speaker=speaker,
+        config_kwargs={"barge_in_mode": "off"})
 
     task = asyncio.ensure_future(orchestrator.run())
-    for _ in range(200):
-        await asyncio.sleep(0.01)
-        if speaker.played:
-            break
+    assert await wait_for(lambda: bool(speaker.played))
     assert orchestrator.state is State.SPEAKING
 
-    for _ in range(10):
-        parts["mic"].push(frame(0.9))
-    await asyncio.sleep(0.2)
+    #: loud enough to fire the guard, and sustained well past its duration
+    for _ in range(config.barge_in_sustained_frames * 3):
+        parts["mic"].push(frame(0.95))
+    assert await wait_for(
+        lambda: orchestrator.frames_discarded >= config.barge_in_sustained_frames * 3)
 
-    assert orchestrator.frames_discarded >= 10
+    assert not speaker.stopped, "playback was interrupted with barge-in off"
     assert not orchestrator.detector.is_speaking
+    assert orchestrator.guard.speech_run == 0, "a disabled guard was still counting"
 
     speaker.barrier.set()
+    orchestrator.request_stop()
+    await asyncio.gather(task, return_exceptions=True)
+
+
+# ==========================================================================
+# barge-in (V1b) — sustained speech during SPEAKING stops him
+# ==========================================================================
+
+FOUR_SENTENCES = "First one. Second one. Third one. Fourth one."
+
+
+async def speak_until_sentence(speaker, index: int) -> None:
+    """Let playback run to the start of sentence `index`, blocking there.
+
+    Sentences 0..index-1 are played to COMPLETION, which is what makes
+    `sentences_played` and the truncation boundary predictable.
+    """
+    for wanted in range(index + 1):
+        assert await wait_for(lambda: len(speaker.played) == wanted + 1), (
+            f"playback never reached sentence {wanted}")
+        if wanted < index:
+            speaker.barrier.set()
+
+
+@asyncio_test
+async def test_sustained_speech_stops_playback_and_clears_the_queue(tmp_path):
+    """The headline. Four sentences, cut during the second: the remaining two are never
+    played at all — there is no resumable queue by design."""
+    speaker = FakeSpeaker()
+    speaker.barrier = threading.Event()
+    orchestrator, parts, config = build(
+        tmp_path, utterance_frames(VoiceConfig()),
+        agent=FakeAgent(FOUR_SENTENCES), speaker=speaker)
+
+    task = asyncio.ensure_future(orchestrator.run())
+    await speak_until_sentence(speaker, 1)
+    assert orchestrator.state is State.SPEAKING
+
+    for captured in interrupt_frames(config):
+        parts["mic"].push(captured)
+
+    assert await wait_for(lambda: orchestrator.state is State.LISTENING), (
+        "the interrupt never landed")
+    assert speaker.stopped, "playback was not stopped"
+    assert len(speaker.played) == 2, "the rest of the answer was played anyway"
+
+    #: and the captured audio is now the head of the user's next utterance, so they do
+    #: not have to repeat the words they interrupted with
+    assert orchestrator.detector.is_speaking
+    assert orchestrator.detector.buffered_frames == config.barge_in_sustained_frames
+
+    orchestrator.request_stop()
+    await asyncio.gather(task, return_exceptions=True)
+
+
+@asyncio_test
+async def test_a_transient_does_not_interrupt(tmp_path):
+    """A cough, a door, a keyboard. One frame short of the sustained run, and the answer
+    must finish — this is the whole reason the guard is not just a threshold."""
+    speaker = FakeSpeaker()
+    speaker.barrier = threading.Event()
+    orchestrator, parts, config = build(
+        tmp_path, utterance_frames(VoiceConfig()),
+        agent=FakeAgent(FOUR_SENTENCES), speaker=speaker)
+
+    task = asyncio.ensure_future(orchestrator.run())
+    await speak_until_sentence(speaker, 0)
+
+    for captured in transient_frames(config):
+        parts["mic"].push(captured)
+    assert await wait_for(lambda: parts["mic"].pending() == 0)
+    #: a full half-second to fire in, and it must not
+    assert not await wait_for(lambda: speaker.stopped, timeout=0.5), (
+        "a transient interrupted Marshall")
+    assert orchestrator.state is State.SPEAKING
+
+    #: let the rest of the answer run — clear the barrier so later sentences do not
+    #: block, then release the one currently waiting
+    blocked, speaker.barrier = speaker.barrier, None
+    blocked.set()
+    assert await wait_for(lambda: orchestrator.state is State.LISTENING)
+
+    assert len(speaker.played) == 4, "the answer did not finish"
+    assert parts["agent"].truncations == [], "an uninterrupted turn rewrote history"
+
+    row = read_rows(config)[0]
+    assert row["was_interrupted"] is False
+    assert row["sentences_played"] == row["sentences_total"] == 4
+
+    orchestrator.request_stop()
+    await asyncio.gather(task, return_exceptions=True)
+
+
+@asyncio_test
+async def test_history_is_truncated_to_the_sentences_actually_heard(tmp_path):
+    """H2's summariser and UserMemory both compress from the stored history, so it has
+    to hold what the user heard — not the answer Marshall meant to give."""
+    speaker = FakeSpeaker()
+    speaker.barrier = threading.Event()
+    orchestrator, parts, config = build(
+        tmp_path, utterance_frames(VoiceConfig()),
+        agent=FakeAgent(FOUR_SENTENCES), speaker=speaker)
+
+    task = asyncio.ensure_future(orchestrator.run())
+    await speak_until_sentence(speaker, 2)      # two played in full
+    for captured in interrupt_frames(config):
+        parts["mic"].push(captured)
+    assert await wait_for(lambda: orchestrator.state is State.LISTENING)
+
+    assert parts["agent"].truncations == [
+        (f"First one. Second one. {INTERRUPTION_MARKER}", "test-thread")]
+
+    orchestrator.request_stop()
+    await asyncio.gather(task, return_exceptions=True)
+
+
+@asyncio_test
+async def test_an_interrupt_before_the_first_sentence_ends_stores_only_the_marker(tmp_path):
+    """The partly-played sentence is dropped rather than half-claimed: playback stops at
+    sentence granularity, so there is no sub-sentence position to report honestly."""
+    speaker = FakeSpeaker()
+    speaker.barrier = threading.Event()
+    orchestrator, parts, config = build(
+        tmp_path, utterance_frames(VoiceConfig()),
+        agent=FakeAgent(FOUR_SENTENCES), speaker=speaker)
+
+    task = asyncio.ensure_future(orchestrator.run())
+    await speak_until_sentence(speaker, 0)
+    for captured in interrupt_frames(config):
+        parts["mic"].push(captured)
+    assert await wait_for(lambda: orchestrator.state is State.LISTENING)
+
+    assert parts["agent"].truncations == [(INTERRUPTION_MARKER, "test-thread")]
+    assert read_rows(config)[0]["sentences_played"] == 0
+
+    orchestrator.request_stop()
+    await asyncio.gather(task, return_exceptions=True)
+
+
+@asyncio_test
+async def test_a_false_barge_in_stays_stopped_and_keeps_the_truncation(tmp_path):
+    """The guard fired, the transcript came back empty — a cough that lasted long enough.
+
+    There is no resume path by design: Marshall stays stopped, the truncation stands, and
+    the session returns to LISTENING so the user can simply say something. The guard gets
+    corrected from telemetry instead, which is what the new columns are for.
+    """
+    speaker = FakeSpeaker()
+    speaker.barrier = threading.Event()
+    orchestrator, parts, config = build(
+        tmp_path, utterance_frames(VoiceConfig()),
+        agent=FakeAgent(FOUR_SENTENCES), speaker=speaker,
+        stt=ScriptedStt("tell me about pipes", ""))
+
+    task = asyncio.ensure_future(orchestrator.run())
+    await speak_until_sentence(speaker, 1)
+    for captured in interrupt_frames(config):
+        parts["mic"].push(captured)
+    assert await wait_for(lambda: orchestrator.turn_id == 1
+                          and orchestrator.state is State.LISTENING)
+
+    #: the "interruption" now goes quiet, so the seeded utterance endpoints and is
+    #: transcribed — to nothing
+    for silent in [frame(0.0)] * config.silence_frames:
+        parts["mic"].push(silent)
+    assert await wait_for(lambda: orchestrator.turn_id == 2)
+    assert await wait_for(lambda: orchestrator.state is State.LISTENING)
+
+    #: the second utterance carried the interrupt's own audio, not just the silence
+    assert parts["stt"].calls[1] == (
+        (config.barge_in_sustained_frames + config.silence_frames) * VAD_FRAME_SAMPLES)
+    #: nothing was said and nothing was un-said
+    assert len(parts["agent"].calls) == 1, "an empty transcript reached the agent"
+    assert len(speaker.played) == 2, "Marshall resumed after a false barge-in"
+    assert len(parts["agent"].truncations) == 1, "the truncation was undone"
+
+    orchestrator.request_stop()
+    await asyncio.gather(task, return_exceptions=True)
+
+
+@asyncio_test
+async def test_a_failing_truncation_costs_the_history_not_the_session(tmp_path):
+    """Same contract as everything else on this path: the loop survives."""
+    class Boom(FakeAgent):
+        def truncate_last_response(self, content, thread_id="default"):
+            raise RuntimeError("checkpointer unavailable")
+
+    speaker = FakeSpeaker()
+    speaker.barrier = threading.Event()
+    orchestrator, parts, config = build(
+        tmp_path, utterance_frames(VoiceConfig()),
+        agent=Boom(FOUR_SENTENCES), speaker=speaker)
+    errors = []
+    orchestrator._on_event = lambda e, p: errors.append(p) if e == "error" else None
+
+    task = asyncio.ensure_future(orchestrator.run())
+    await speak_until_sentence(speaker, 1)
+    for captured in interrupt_frames(config):
+        parts["mic"].push(captured)
+    assert await wait_for(lambda: orchestrator.state is State.LISTENING)
+
+    assert errors and "checkpointer unavailable" in errors[0]["error"]
+    assert read_rows(config)[0]["was_interrupted"] is True
+
     orchestrator.request_stop()
     await asyncio.gather(task, return_exceptions=True)
 
@@ -379,6 +671,153 @@ async def test_a_discarded_turn_still_writes_a_row(tmp_path):
     row = json.loads(Path(config.telemetry_path).read_text(encoding="utf-8").strip())
     assert row["transcript_chars"] == 0
     assert row["agent_ms"] is None, "an unreached stage must stay null, not 0"
+
+
+@asyncio_test
+async def test_a_clean_turn_reports_no_interruption_and_a_full_answer(tmp_path):
+    """The other half of the barge-in columns: they have to be right when nothing
+    happened, or a run's interrupt RATE cannot be read off the log."""
+    orchestrator, parts, config = build(
+        tmp_path, utterance_frames(VoiceConfig()), agent=FakeAgent(FOUR_SENTENCES))
+    await run_until_stopped(orchestrator)
+
+    row = read_rows(config)[0]
+    assert row["was_interrupted"] is False
+    assert row["sentences_total"] == 4
+    assert row["sentences_played"] == 4
+    assert row["time_to_silence_ms"] is None, "nothing was stopped, so nothing was timed"
+
+
+@asyncio_test
+async def test_an_interrupted_turn_records_what_was_cut_and_how_fast(tmp_path):
+    """These four columns are the whole reason the guessed guard parameters are
+    defensible: they are what corrects them from a real run."""
+    speaker = FakeSpeaker()
+    speaker.barrier = threading.Event()
+    orchestrator, parts, config = build(
+        tmp_path, utterance_frames(VoiceConfig()),
+        agent=FakeAgent(FOUR_SENTENCES), speaker=speaker)
+
+    task = asyncio.ensure_future(orchestrator.run())
+    await speak_until_sentence(speaker, 2)               # two played in full
+    for captured in interrupt_frames(config):
+        parts["mic"].push(captured)
+    assert await wait_for(lambda: orchestrator.state is State.LISTENING)
+
+    row = read_rows(config)[0]
+    assert row["was_interrupted"] is True
+    assert row["sentences_played"] == 2
+    assert row["sentences_total"] == 4
+    assert row["time_to_silence_ms"] is not None and row["time_to_silence_ms"] >= 0
+
+    orchestrator.request_stop()
+    await asyncio.gather(task, return_exceptions=True)
+
+
+# ==========================================================================
+# the history rewrite itself — the real AgentGraph, no Ollama
+#
+# The orchestrator tests above stop at "truncate_last_response was called with this
+# text". This section is the other side of that contract, and it is where the load-
+# bearing detail lives: the rewrite must REPLACE the stored answer, not append a second
+# one. That is `add_messages` matching on `.id`, so the id is what is asserted.
+#
+# The graph is built for real — nodes, edges, checkpointer — with only the model handle
+# faked, exactly as tests/test_summarization_cycle.py does it.
+# ==========================================================================
+
+@pytest.fixture(scope="module")
+def truncation_agent():
+    """One real AgentGraph over a one-line document. ~8s of embeddings + Chroma."""
+    import shutil
+    import tempfile
+
+    from langchain_core.messages import AIMessage
+
+    from pipeline_lg import AgentGraph
+
+    root = Path(tempfile.mkdtemp(prefix="marshall_v1b_"))
+    (root / "doc.txt").write_text("Marshall answers questions about a document.\n",
+                                  encoding="utf-8")
+    agent = AgentGraph(
+        file_path=str(root / "doc.txt"),
+        mode_docs="txt",
+        mode_retreiver="simple",
+        persist_directory_path=str(root / "vdb"),
+        user_history_directory_path=str(root / "mem"),
+        memory_every_n_turns=0,        # isolate this from the long-term-memory gate
+        summarize_every_n_turns=0,     # ... and from H2's trim cycle
+        summary_persist_path=str(root / "summaries"),
+    )
+
+    class PlainChat:
+        """One plain reply per call: a turn is exactly two messages."""
+        def invoke(self, messages, **kwargs):
+            return AIMessage(content="First one. Second one. Third one.")
+
+    agent.llm = PlainChat()
+    yield agent
+    shutil.rmtree(root, ignore_errors=True)
+
+
+def last_ai(agent, thread_id):
+    from langchain_core.messages import AIMessage
+    return [m for m in agent.get_history(thread_id) if isinstance(m, AIMessage)][-1]
+
+
+def test_truncation_replaces_the_stored_answer_in_place(truncation_agent):
+    """The `.id` is the whole mechanism: `add_messages` matches on it, so reusing it
+    REPLACES the answer where a fresh message would leave two of them in history."""
+    thread = "replace"
+    truncation_agent.invoke("tell me about it",
+                            config={"configurable": {"thread_id": thread}})
+    before = last_ai(truncation_agent, thread)
+    original_length = len(truncation_agent.get_history(thread))
+
+    assert truncation_agent.truncate_last_response(
+        f"First one. {INTERRUPTION_MARKER}", thread) is True
+
+    after = last_ai(truncation_agent, thread)
+    assert after.id == before.id, "the rewrite did not reuse the message id"
+    assert after.content == f"First one. {INTERRUPTION_MARKER}"
+    assert len(truncation_agent.get_history(thread)) == original_length, (
+        "the rewrite appended a second answer instead of replacing the first")
+
+
+def test_truncation_leaves_the_rest_of_the_conversation_alone(truncation_agent):
+    """The user's own turn is not the assistant's to edit."""
+    from langchain_core.messages import HumanMessage
+
+    thread = "intact"
+    truncation_agent.invoke("what does it do?",
+                            config={"configurable": {"thread_id": thread}})
+    truncation_agent.truncate_last_response(INTERRUPTION_MARKER, thread)
+
+    humans = [m for m in truncation_agent.get_history(thread)
+              if isinstance(m, HumanMessage)]
+    assert [m.content for m in humans] == ["what does it do?"]
+
+
+def test_the_next_turn_carries_the_truncated_text_not_the_original(truncation_agent):
+    """The point of the whole exercise: what H2's summariser and UserMemory later
+    compress is what the user actually heard."""
+    thread = "carried"
+    truncation_agent.invoke("first question",
+                            config={"configurable": {"thread_id": thread}})
+    truncation_agent.truncate_last_response(f"First one. {INTERRUPTION_MARKER}", thread)
+    truncation_agent.invoke("second question",
+                            config={"configurable": {"thread_id": thread}})
+
+    text = " ".join(str(m.content) for m in truncation_agent.get_history(thread))
+    assert INTERRUPTION_MARKER in text
+    assert "Third one." in text, "the SECOND answer should still be complete"
+    assert text.count("Second one.") == 1, "the interrupted answer kept unheard text"
+
+
+def test_truncating_an_empty_thread_reports_that_it_did_nothing(truncation_agent):
+    """No history to rewrite. False, not an exception — the voice path calls this on a
+    turn that is already going wrong."""
+    assert truncation_agent.truncate_last_response("anything", "never-spoken") is False
 
 
 # ==========================================================================

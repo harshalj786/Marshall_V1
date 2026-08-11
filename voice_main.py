@@ -1,19 +1,23 @@
-"""Talk to Marshall. V1a — open mic, one utterance at a time.
+"""Talk to Marshall. V1b — open mic, one utterance at a time, interruptible.
 
     python voice_main.py --check                 # verify the stack, exit
     python voice_main.py --list-devices          # audio devices, exit
     python voice_main.py                         # talk to it
     python voice_main.py --file path/to/doc.pdf  # over a different document
+    python voice_main.py --barge-in off          # V1a behaviour, for speakers
 
 Mic -> VAD endpoint -> Whisper -> the existing synchronous `AgentGraph.invoke` ->
-Kokoro -> speakers -> back to listening. No wake word, no barge-in, no streaming.
+Kokoro -> speakers -> back to listening. No wake word, no streaming. V1b adds barge-in
+while Marshall is SPEAKING: talk over him and he stops, and what you said becomes your
+next turn. **That mode assumes headphones** — there is no echo cancellation in this
+stack, so through speakers his own voice interrupts him. `--barge-in off` is the escape.
 
 **Boot order matters and is not incidental.** Embeddings are warmed first, because
 `docs/architecture_review.md` §10 measures the MiniLM load at ~4.8 s and says it is
 "still synchronous and still ahead of the first word". Then the agent is built with
 one model for both generation and memory compression, pinned resident, so no turn
-pays a model swap. Then the audio models. Every second of it is boot time, where
-nobody is waiting on a reply.
+pays a model swap. Then the audio models. Then one throwaway turn to pull the LLM into
+VRAM. Every second of it is boot time, where nobody is waiting on a reply.
 """
 import argparse
 import asyncio
@@ -47,6 +51,18 @@ USER_HISTORY_PATH = "db/voice_user_history"
 SUMMARY_PATH = "db/voice_summaries"
 
 CHECK_PHRASE = "The quick brown fox jumps over the lazy dog."
+
+#: One throwaway turn at boot, to pull llama3.1 into VRAM. Without it the FIRST answer of
+#: every session pays Ollama's cold model load on top of its own generation — the last
+#: multi-second stall V1a left in the request path, and the one the user actually feels
+#: because it lands on the first thing they ever say.
+#:
+#: The thread id is deliberately NOT the session's: a warm-up is not conversation, and on
+#: `voice-main` it would sit in history as turn one of every session and be carried into
+#: H2's persisted summary forever. The prompt is one the agent's own system prompt names
+#: as needing no tool ("hi" -> greet back), so warming cannot fire a network lookup.
+WARMUP_THREAD_ID = "voice-warmup"
+WARMUP_PROMPT = "hi"
 
 
 # ==========================================================================
@@ -102,6 +118,27 @@ def build_agent(file_path: str, quiet: bool = False):
     )
 
 
+def warm_llm(agent, report=print) -> "float | None":
+    """Make the generation model resident before the first real turn. Never fatal.
+
+    Returns the seconds it took, or None if it did not complete. A failure here is
+    reported and stepped over on purpose: if Ollama is not up, the session has a larger
+    problem than a cold model, and it should surface on a real turn — with the real
+    error — rather than as a refusal to boot.
+    """
+    started = time.perf_counter()
+    try:
+        agent.invoke(WARMUP_PROMPT,
+                     config={"configurable": {"thread_id": WARMUP_THREAD_ID}})
+    except Exception as exc:
+        report(f"  ! llm warm-up failed ({type(exc).__name__}: {exc})"
+               " — the first turn will pay the model load")
+        return None
+    elapsed = time.perf_counter() - started
+    report(f"  {'llm warm-up':<22} {elapsed:6.2f}s")
+    return elapsed
+
+
 def _timed(label: str, build, report) -> tuple:
     started = time.perf_counter()
     result = build()
@@ -135,6 +172,10 @@ def boot(config, file_path: str, report=print) -> dict:
     vad, _ = _timed("silero-vad", lambda: SileroVad(config), report)
     stt, _ = _timed("faster-whisper", lambda: Transcriber(config), report)
     tts, _ = _timed("kokoro", lambda: build_engine(config), report)
+
+    #: last, once everything else has taken the VRAM it needs, so the model that has to
+    #: STAY resident is the one loaded against what is actually left
+    warm_llm(agent, report)
 
     if getattr(stt, "fell_back", False):
         report(f"  ! STT fell back to {stt.device}/{stt.compute_type} — see the warning above")
@@ -309,11 +350,19 @@ def _make_reporter():
                       "speaking": "[<<]", "stopped": "[--]"}.get(payload["state"], "[??]")
             print(f"\r{symbol} {payload['state']:<10}", end="", flush=True)
         elif event == "ready":
-            print(f"\nlistening on thread {payload['thread_id']!r}. Ctrl+C to stop.\n")
+            print(f"\nlistening on thread {payload['thread_id']!r} "
+                  f"(barge-in: {payload['barge_in']}). Ctrl+C to stop.\n")
         elif event == "transcript" and payload.get("text"):
             print(f"\r  you   ({payload['ms']:.0f}ms)  {payload['text']}")
         elif event == "response" and payload.get("text"):
             print(f"  M     ({payload['ms']:.0f}ms)  {payload['text']}")
+        elif event == "barge_in":
+            #: printed the moment playback stops, because this is the line the guard gets
+            #: tuned from: too many of these means the thresholds are too eager
+            print(f"\r  ><    interrupted — silent in {payload['ms']:.0f}ms")
+        elif event == "truncated":
+            print(f"  ...   kept {payload['sentences_played']} of "
+                  f"{payload['sentences_total']} sentence(s) in history")
         elif event == "discarded":
             print(f"\r  ...   discarded ({payload['reason']})")
         elif event == "error":
@@ -343,7 +392,8 @@ async def run_voice(config, file_path: str) -> int:
 def parse_args(argv=None):
     parser = argparse.ArgumentParser(
         prog="voice_main.py",
-        description="Talk to Marshall (V1a: open mic, no wake word, no barge-in).")
+        description="Talk to Marshall (V1b: open mic, no wake word, barge-in while "
+                    "he is speaking).")
     parser.add_argument("--file", default=DEFAULT_DOCUMENT,
                         help=f"document to load (default: {DEFAULT_DOCUMENT})")
     parser.add_argument("--check", action="store_true",
@@ -356,6 +406,12 @@ def parse_args(argv=None):
                         help='input device index or name substring, e.g. 15 or "Realtek"')
     parser.add_argument("--output-device", default=None,
                         help='output device index or name substring, e.g. 20 or "Realtek"')
+    #: the escape hatch for a speaker user. There is no echo cancellation in the stack,
+    #: so on speakers Marshall's own voice reaches the mic and trips the interrupt guard;
+    #: "off" is V1a's behaviour and is better than fighting it.
+    parser.add_argument("--barge-in", choices=("vad", "off"), default="vad",
+                        help="interrupt Marshall while he speaks. 'vad' needs headphones "
+                             "(no echo cancellation); 'off' disables it (default: vad)")
     parser.add_argument("--thread", default="voice-main",
                         help="conversation thread_id; fixed across runs so H2's "
                              "summary reload carries continuity (default: voice-main)")
@@ -394,6 +450,7 @@ def main(argv=None) -> int:
         input_device=input_device,
         output_device=output_device,
         thread_id=args.thread,
+        barge_in_mode=args.barge_in,
     )
     config.validate()
 

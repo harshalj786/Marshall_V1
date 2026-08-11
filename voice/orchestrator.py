@@ -1,11 +1,21 @@
-"""The V1a conversation loop: LISTENING -> THINKING -> SPEAKING -> LISTENING.
+"""The conversation loop: LISTENING -> THINKING -> SPEAKING -> LISTENING.
 
-One utterance at a time, strictly sequential, no barge-in. The state machine is that
-short on purpose — `docs/architecture_review.md` §10 is explicit that cancelling
+One utterance at a time, strictly sequential. V1b adds exactly one way out of that
+sequence: **while Marshall is SPEAKING, sustained speech from the user stops him.**
+
+Why only SPEAKING. `docs/architecture_review.md` §10 is explicit that cancelling
 mid-turn orphans an `AIMessage.tool_calls` from its `ToolMessage` in a way Ollama
-rejects, and calls that "the single hardest voice problem in the current design".
-V1a does not go near it. Frames that arrive while Marshall is thinking or speaking are
-read and thrown away, which is exactly what "no barge-in" means mechanically.
+rejects, and calls that "the single hardest voice problem in the current design". That
+risk lives entirely in THINKING, which is where the ReAct loop runs — and THINKING is
+also the phase not worth interrupting (§10 measures warm agent turns at 1.3-8.4 s, most
+far shorter). SPEAKING carries none of it: `agent.invoke` is synchronous, so by the time
+the first word is spoken the answer is a COMPLETE `AIMessage` with no pending tool calls.
+Truncating it is a plain content edit, which is why nothing here calls
+`memory/reconciliation.py:find_safe_cut_point` — that primitive is for the streaming case
+(V1c), where an interrupt really can land between a tool call and its result.
+
+Frames arriving during THINKING are still read and thrown away, exactly as in V1a.
+Frames arriving during SPEAKING now go to `BargeInGuard` instead.
 
 **Why asyncio at all, when every stage blocks.** Not for throughput — for a loop that
 stays answerable while a stage runs. `agent.invoke` is a synchronous multi-second call
@@ -27,9 +37,31 @@ from typing import Optional
 
 from voice.config import VoiceConfig
 from voice.telemetry import TelemetryWriter, TurnTelemetry, Stopwatch
-from voice.vad import UtteranceDetector
+from voice.vad import BargeInGuard, UtteranceDetector
 
 logger = logging.getLogger(__name__)
+
+#: appended to an interrupted answer in the stored history. Present so the record says
+#: WHY it stops mid-thought: without it a later turn reads a truncated answer as
+#: Marshall's complete one, and so do H2's summariser and UserMemory.
+INTERRUPTION_MARKER = "[interrupted by user]"
+
+
+def truncate_to_spoken(sentences, sentences_played: int) -> str:
+    """The answer as far as the user actually heard it, plus the marker.
+
+    Sentence granularity, and only sentences played to COMPLETION. Playback is stopped
+    per sentence (`sd.stop()`), so the one cut mid-word has no reportable position — and
+    between claiming a sentence the user half-heard and dropping one they fully heard,
+    dropping is the safe error: the transcript then under-states what Marshall said,
+    which is recoverable, rather than asserting he said something he did not.
+
+    `sentences_played == 0` leaves the marker alone, which is the honest record of an
+    interruption that landed before the first sentence finished.
+    """
+    heard = [text.strip() for text in list(sentences)[:max(0, sentences_played)]
+             if text and text.strip()]
+    return " ".join(heard + [INTERRUPTION_MARKER])
 
 
 class State(str, Enum):
@@ -47,8 +79,9 @@ class VoiceOrchestrator:
         vad       .speech_prob(frame) -> float ; .reset()
         stt       .transcribe(audio) -> str
         tts       .engine_name ; .stream_sentences(text) -> (i, sentence, audio)
-        speaker   .play(audio) ; .stop()
+        speaker   .play(audio) ; .stop()          .stop() must abort a blocked .play()
         agent     .invoke(query, config=...) -> str
+                  .truncate_last_response(content, thread_id) -> bool   (barge-in only)
     """
 
     def __init__(self, agent, mic, vad, stt, tts, speaker,
@@ -64,6 +97,7 @@ class VoiceOrchestrator:
         self.speaker = speaker
         self.telemetry = telemetry or TelemetryWriter(self.config.telemetry_path)
         self.detector = UtteranceDetector(self.config)
+        self.guard = BargeInGuard(self.config)
         #: reporting hook, so the CLI can print without the orchestrator importing a UI
         self._on_event = on_event or (lambda event, payload: None)
 
@@ -79,6 +113,14 @@ class VoiceOrchestrator:
         #: milliseconds and can queue a second utterance behind the first — which is
         #: barge-in, arriving by accident, in the release that is supposed to not have it.
         self._turn_pending = False
+        #: barge-in state for the turn in flight. All three are touched only from the
+        #: event loop — the reader sets them, `_speak` reads them, `_back_to_listening`
+        #: clears them — so no lock is involved and none is needed.
+        self._interrupted = False
+        #: the user's own words, from the guard's window onward. Handed to the detector
+        #: as the head of their next utterance so nobody has to repeat themselves.
+        self._interrupt_frames: list = []
+        self._time_to_silence_ms: Optional[float] = None
 
     # --- reporting -------------------------------------------------------------
 
@@ -106,7 +148,8 @@ class VoiceOrchestrator:
         """
         loop = asyncio.get_running_loop()
         self._set_state(State.LISTENING)
-        self._emit("ready", thread_id=self.config.thread_id)
+        self._emit("ready", thread_id=self.config.thread_id,
+                   barge_in=self.config.barge_in_mode)
         reader = asyncio.ensure_future(self._read_frames(loop))
         try:
             while not self._stopping.is_set():
@@ -126,11 +169,15 @@ class VoiceOrchestrator:
             self._set_state(State.STOPPED)
 
     async def _read_frames(self, loop) -> None:
-        """Continuously drain the microphone. Frames outside LISTENING are discarded.
+        """Continuously drain the microphone and route each frame by state.
 
-        This is what "no barge-in" means mechanically: the audio is captured and read
-        the whole time Marshall is thinking and speaking, and then thrown away. V1b
-        changes this one branch and nothing else.
+            LISTENING   -> the endpointer, which may finish an utterance
+            SPEAKING    -> the barge-in guard (V1b), or discarded when it is off
+            THINKING    -> discarded
+
+        Frames are never simply un-captured: the input stream stays open for the whole
+        session so the device is not reopened per turn (see `MicrophoneStream`), and what
+        changes between states is only where the frames go.
         """
         while not self._stopping.is_set():
             #: the executor hop is what keeps this cancellable — mic.get() blocks, but
@@ -138,9 +185,12 @@ class VoiceOrchestrator:
             frame = await loop.run_in_executor(None, self.mic.get, 0.1)
             if frame is None:
                 continue
+            #: before the `_turn_pending` check, which is set for the whole turn and
+            #: would otherwise swallow SPEAKING along with everything else
+            if self.state is State.SPEAKING and self.config.barge_in_enabled:
+                await self._watch_for_barge_in(frame, loop)
+                continue
             if self.state is not State.LISTENING or self._turn_pending:
-                #: read and dropped. Not "not captured": the stream stays open so the
-                #: device is not reopened per turn (see MicrophoneStream).
                 self.frames_discarded += 1
                 continue
             utterance = await loop.run_in_executor(None, self._feed, frame)
@@ -153,6 +203,40 @@ class VoiceOrchestrator:
         torch forward pass, small but not free, and it has no business on the loop."""
         return self.detector.process(frame, self.vad.speech_prob(frame))
 
+    def _feed_guard(self, frame):
+        """The same inference, into the interrupt guard. Same executor, same reason."""
+        return self.guard.process(frame, self.vad.speech_prob(frame))
+
+    async def _watch_for_barge_in(self, frame, loop) -> None:
+        """One frame captured while Marshall is talking.
+
+        Two jobs, in sequence. Before the cut, run the guard. After it, KEEP COLLECTING:
+        the user is still mid-sentence and those frames are the rest of what they are
+        saying, so they go on the same pile the guard's window started.
+        """
+        if self._interrupted:
+            self._interrupt_frames.append(frame)
+            return
+
+        captured = await loop.run_in_executor(None, self._feed_guard, frame)
+        if captured is None:
+            return
+
+        fired = time.perf_counter()
+        #: set BEFORE stopping playback, so the `_speak` loop sees it the moment its
+        #: blocked `play()` returns and plays no further sentence
+        self._interrupted = True
+        self._interrupt_frames = captured
+
+        #: `speaker.stop()` blocks while PortAudio aborts the stream (~197 ms measured),
+        #: so it goes to the executor rather than onto the loop: this reader has to keep
+        #: draining the mic straight through the cut, or the words the user is speaking
+        #: at exactly that moment are the ones that get lost.
+        await loop.run_in_executor(None, self.speaker.stop)
+        self._time_to_silence_ms = (time.perf_counter() - fired) * 1000
+        self._emit("barge_in", turn_id=self.turn_id, ms=self._time_to_silence_ms,
+                   frames=len(captured))
+
     async def _handle_utterance(self, utterance, loop) -> None:
         """One full turn. Every stage failure is contained: the session goes back to
         LISTENING no matter what, because a voice loop that exits on a bad turn is a
@@ -160,6 +244,12 @@ class VoiceOrchestrator:
         #: the clock the user actually feels starts the moment they stop talking
         speech_ended = time.perf_counter()
         self.turn_id += 1
+        #: a turn starts uninterrupted. `_back_to_listening` already cleared these; doing
+        #: it again here is what makes that ordering non-load-bearing.
+        self._interrupted = False
+        self._interrupt_frames = []
+        self._time_to_silence_ms = None
+        self.guard.reset()
         utterance_s = len(utterance) / self.config.sample_rate
         telemetry = TurnTelemetry(
             turn_id=self.turn_id,
@@ -195,7 +285,11 @@ class VoiceOrchestrator:
                 return
 
             self._set_state(State.SPEAKING)
-            await self._speak(response, telemetry, speech_ended, loop)
+            sentences = await self._speak(response, telemetry, speech_ended, loop)
+
+            if self._interrupted:
+                await loop.run_in_executor(
+                    None, self._truncate_interrupted_answer, sentences, telemetry)
 
         except asyncio.CancelledError:
             raise
@@ -205,21 +299,36 @@ class VoiceOrchestrator:
             logger.exception("turn %d failed", self.turn_id)
             self._emit("error", turn_id=self.turn_id, error=f"{type(exc).__name__}: {exc}")
         finally:
+            interrupted = self._interrupted
+            telemetry.was_interrupted = interrupted
+            telemetry.time_to_silence_ms = self._time_to_silence_ms
             self.telemetry.write(telemetry)
-            self._back_to_listening()
+            self._back_to_listening(interrupted=interrupted)
 
     def _invoke_agent(self, transcript: str) -> str:
         """The one call into `pipeline_lg`. Sync, unchanged, unaware of any of this."""
         return self.agent.invoke(
             transcript, config={"configurable": {"thread_id": self.config.thread_id}})
 
-    async def _speak(self, response, telemetry, speech_ended, loop) -> None:
-        """Synthesise sentence by sentence and play each in order."""
+    async def _speak(self, response, telemetry, speech_ended, loop) -> list:
+        """Synthesise sentence by sentence and play each in order. Returns the sentences.
+
+        The list comes back so an interrupted turn can be truncated to the part that was
+        actually heard; `telemetry.sentences_played` counts only sentences played to
+        COMPLETION. Stopping mid-sentence drops that sentence entirely — there is no
+        queue held for a resume, because V1b has no resume path: the user cut Marshall
+        off, and the answer to that is to listen, not to pick the sentence back up.
+        """
         sentences = await loop.run_in_executor(
             None, lambda: list(self.tts.stream_sentences(response)))
+        telemetry.sentences_total = len(sentences)
+        telemetry.sentences_played = 0
         for index, sentence, audio in sentences:
             if self._stopping.is_set():
                 #: mid-answer shutdown: stop talking rather than finishing the speech
+                break
+            if self._interrupted:
+                #: the queue is "cleared" by never playing the rest of it
                 break
             if index == 0:
                 #: the two headline numbers, both fixed at the first audible sample
@@ -230,17 +339,71 @@ class VoiceOrchestrator:
                     time.perf_counter() - speech_ended) * 1000
             self._emit("speaking", turn_id=self.turn_id, index=index, text=sentence)
             await loop.run_in_executor(None, self.speaker.play, audio)
+            if self._interrupted:
+                #: `play` returned because `speaker.stop()` aborted it, not because the
+                #: sentence finished — so it is not claimed as played
+                break
+            telemetry.sentences_played = index + 1
+        return [sentence for _index, sentence, _audio in sentences]
 
-    def _back_to_listening(self) -> None:
-        """Reset everything that could carry Marshall's own voice into the next turn."""
-        self.detector.reset()
+    def _truncate_interrupted_answer(self, sentences, telemetry) -> None:
+        """Rewrite the stored answer down to what the user actually heard.
+
+        This is the half of barge-in that outlives the turn. H2's summariser and
+        UserMemory both compress from the agent's history, so an untruncated answer
+        teaches both of them a conversation that did not happen — and the next turn's
+        "what you just said" would refer to sentences nobody ever heard.
+
+        Runs in the executor because `update_state` writes a checkpoint. Failure is
+        logged and swallowed, same contract as everything else on this path: a history
+        that is too long is a worse answer, a raised exception here is a lost session.
+        """
+        played, total = telemetry.sentences_played or 0, telemetry.sentences_total or 0
+        if total and played >= total:
+            #: the guard fired on the tail of the last sentence. Everything was heard,
+            #: so there is nothing to remove and no marker to justify.
+            return
+        content = truncate_to_spoken(sentences, played)
         try:
-            self.vad.reset()
-        except Exception:
-            logger.debug("VAD reset failed", exc_info=True)
-        dropped = self.mic.drain()
-        if dropped:
-            self.frames_discarded += dropped
+            rewritten = self.agent.truncate_last_response(content, self.config.thread_id)
+        except Exception as exc:
+            logger.exception("could not truncate the interrupted answer")
+            self._emit("error", turn_id=self.turn_id,
+                       error=f"truncation failed: {type(exc).__name__}: {exc}")
+            return
+        self._emit("truncated", turn_id=self.turn_id, sentences_played=played,
+                   sentences_total=total, stored=bool(rewritten))
+
+    def _back_to_listening(self, interrupted: bool = False) -> None:
+        """Reset everything that could carry Marshall's own voice into the next turn.
+
+        A barge-in inverts two of these steps, because on that path the microphone is not
+        holding Marshall's voice — it is holding the user's, mid-sentence:
+
+        * the detector is SEEDED with the guard's capture rather than left empty, so the
+          words that did the interrupting are the head of the next utterance;
+        * the mic queue is NOT drained, because what is queued is the rest of that same
+          sentence, and the recurrent VAD state is left alone for the same reason —
+          resetting it mid-word costs the next few probabilities for nothing.
+
+        That is exactly where V1b's headphone requirement is load-bearing: through
+        speakers, that undrained queue would also hold the tail of Marshall's own answer.
+        """
+        self.detector.reset()
+        self.guard.reset()
+        if interrupted:
+            self.detector.seed(self._interrupt_frames)
+        else:
+            try:
+                self.vad.reset()
+            except Exception:
+                logger.debug("VAD reset failed", exc_info=True)
+            dropped = self.mic.drain()
+            if dropped:
+                self.frames_discarded += dropped
+        self._interrupted = False
+        self._interrupt_frames = []
+        self._time_to_silence_ms = None
         if not self._stopping.is_set():
             self._set_state(State.LISTENING)
         #: last, and only after the state is back to LISTENING — the reader gates on

@@ -999,6 +999,41 @@ class AgentGraph:
         snapshot = self.graph.get_state({"configurable": {"thread_id": thread_id}})
         return snapshot.values.get("messages", []) if snapshot else []
 
+    def truncate_last_response(self, content: str, thread_id: str = "default") -> bool:
+        """Rewrite this thread's last answer in place. True when one was rewritten.
+
+        Voice barge-in (V1b): the user cut Marshall off, so what is STORED has to be the
+        part they actually heard. Everything downstream compresses from this list — H2's
+        running summary and `UserMemory` — and a history holding sentences that were
+        never spoken teaches both of them a conversation that did not happen.
+
+        Two details carry the whole method. The rewrite reuses the message's own `.id`,
+        because `add_messages` matches on id: the same id REPLACES the stored message
+        where a fresh one would append a second answer behind the first. And it goes
+        through `model_copy` rather than a new `AIMessage`, so nothing else the message
+        carries is dropped on the way through.
+
+        This is a plain content edit, not a reconciliation. `invoke` is synchronous, so
+        the answer was complete before its first word was spoken and the message holds no
+        pending `tool_calls` — nothing can be orphaned. `find_safe_cut_point` is for the
+        streaming case, where an interrupt really can land between a call and its result.
+        """
+        target = next(
+            (m for m in reversed(self.get_history(thread_id))
+             if isinstance(m, AIMessage) and not getattr(m, "tool_calls", None)),
+            None,
+        )
+        if target is None or not target.id:
+            # nothing stored to rewrite — or a message with no id, which add_messages
+            # would APPEND rather than replace. Leaving history untouched is the correct
+            # failure here: a duplicated answer is worse than an untruncated one.
+            return False
+        self.graph.update_state(
+            {"configurable": {"thread_id": thread_id}},
+            {"messages": [target.model_copy(update={"content": content})]},
+        )
+        return True
+
     def get_turn_count(self, thread_id: str = "default") -> int:
         snapshot = self.graph.get_state({"configurable": {"thread_id": thread_id}})
         return snapshot.values.get("turn_count", 0) if snapshot else 0

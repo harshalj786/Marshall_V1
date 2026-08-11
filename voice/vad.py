@@ -2,13 +2,15 @@
 
 Split deliberately in two:
 
-* `UtteranceDetector` is the STATE MACHINE. It consumes (frame, speech_probability)
-  pairs and returns a complete utterance when one ends. It never loads a model, never
-  touches an audio device, and never imports torch — so the pre-roll, the start
-  trigger and the endpoint can all be tested against hand-written probability
-  sequences, deterministically and in milliseconds.
+* `UtteranceDetector` and `BargeInGuard` are the STATE MACHINES. They consume
+  (frame, speech_probability) pairs — one deciding when an utterance has ended, the
+  other whether the user is talking over Marshall — and neither loads a model, touches
+  an audio device, or imports torch. So the pre-roll, the start trigger, the endpoint
+  and the interrupt guard can all be tested against hand-written probability sequences,
+  deterministically and in milliseconds.
 * `SileroVad` is the MODEL. It turns a frame into one probability and holds the
-  recurrent state that makes streaming work.
+  recurrent state that makes streaming work. One instance feeds both state machines,
+  including through SPEAKING, so its recurrent state never sees a gap.
 
 That is the same split `memory/reconciliation.py` uses for `find_safe_cut_point` — the
 decision is a pure function over data, and it is the half that is worth testing.
@@ -62,6 +64,26 @@ class UtteranceDetector:
         self._speaking = False
         self._silence_run = 0
 
+    def seed(self, frames) -> None:
+        """Start an utterance already in progress, from frames captured elsewhere.
+
+        This is how a barge-in hands the interruption over (V1b). The frames that fired
+        `BargeInGuard` are the user's actual first words — they were spoken over the top
+        of Marshall, before the orchestrator was back in LISTENING — so the detector
+        resumes mid-utterance with them in the buffer rather than starting empty. Without
+        it, everything said up to the moment playback stopped is lost and the user has to
+        repeat their own interruption, which is a worse experience than not interrupting.
+
+        Endpointing from here is completely ordinary: `silence_frames` of quiet ends the
+        utterance exactly as it would have if it had started in LISTENING.
+        """
+        self.reset()
+        frames = list(frames)
+        if not frames:
+            return
+        self._frames = frames
+        self._speaking = True
+
     # --- the state machine -----------------------------------------------------
 
     def process(self, frame: np.ndarray, speech_prob: float) -> Optional[np.ndarray]:
@@ -103,6 +125,79 @@ class UtteranceDetector:
         utterance = np.concatenate(self._frames) if self._frames else np.zeros(0, np.float32)
         self.reset()
         return utterance
+
+
+class BargeInGuard:
+    """Decides when speech ARRIVING WHILE MARSHALL TALKS should cut him off (V1b).
+
+    Deliberately not `UtteranceDetector` with different numbers. The two answer opposite
+    questions: the detector asks "has this utterance finished?" and is tuned to be
+    generous at the start (one frame over the threshold begins one), while this asks
+    "is someone really talking over me?" and must be hard to convince — the cost of a
+    mistake is Marshall silenced mid-sentence by a cough, a door, or a keyboard.
+
+    Hence two guards rather than one, both from config:
+
+        `barge_in_vad_threshold`     how loud/speech-like a frame has to be, ABOVE the
+                                     listening threshold
+        `barge_in_sustained_frames`  how many of those in an unbroken run
+
+    A single sub-threshold frame resets the run to zero. That is the strict reading on
+    purpose: a transient is short, and speech that survives ~300 ms of continuous
+    detection is not a transient.
+
+    On firing it returns the captured audio — the ring buffer holds `pre_roll_frames`
+    from BEFORE the run plus the run itself, so the words that triggered the interrupt
+    become the head of the user's next utterance instead of being thrown away. Both
+    numbers are unmeasured starting guesses; `voice/config.py` says so, and the telemetry
+    exists to correct them.
+    """
+
+    def __init__(self, config: VoiceConfig):
+        self.config = config
+        #: pre-roll + the guard window, so a fired guard hands back everything from
+        #: shortly before the user started talking through to the frame that fired it
+        self._window: deque = deque(
+            maxlen=config.pre_roll_frames + config.barge_in_sustained_frames)
+        self._run = 0
+
+    @property
+    def enabled(self) -> bool:
+        return self.config.barge_in_enabled
+
+    @property
+    def speech_run(self) -> int:
+        """Consecutive frames currently over the threshold. For tests and logging."""
+        return self._run
+
+    def reset(self) -> None:
+        self._window.clear()
+        self._run = 0
+
+    def process(self, frame: np.ndarray, speech_prob: float) -> Optional[list]:
+        """Feed one frame captured during SPEAKING.
+
+        Returns the captured frames when the interrupt fires, otherwise None. Returns
+        None immediately and keeps no state at all when `barge_in_mode` is "off" — that
+        mode is V1a, and V1a does not look at these frames.
+        """
+        if not self.enabled:
+            return None
+
+        self._window.append(frame)
+        if speech_prob < self.config.barge_in_vad_threshold:
+            self._run = 0
+            return None
+
+        self._run += 1
+        if self._run < self.config.barge_in_sustained_frames:
+            return None
+        captured = list(self._window)
+        #: fires once. The orchestrator owns everything after this frame — it keeps
+        #: collecting into the same utterance while playback drains — so leaving the run
+        #: armed would only let a second fire race the first one's cut.
+        self.reset()
+        return captured
 
 
 class SileroVad:

@@ -954,7 +954,7 @@ That said, the *graph topology* is not the obstacle. The obstacle is the layer d
 
 ### Latency baseline — and the cold-start correction
 
-**Correct the first number this project recorded.** V1a's commit cited `agent_ms = 10102` from `voice_logs/turns.jsonl` as the agent-side baseline. That row is turn 1 of a fresh process, and it is **a cold-start artifact, not a steady-state cost**. `boot()` loads embeddings, the document index, silero, faster-whisper and Kokoro, and then hands the agent to the loop *without ever calling the LLM* — so the first `invoke` is where Ollama pays to pull llama3.1 (4.9 GB) into VRAM. That load is charged, once, to whichever turn happens to be first.
+**Correct the first number this project recorded.** V1a's commit cited `agent_ms = 10102` from `voice_logs/turns.jsonl` as the agent-side baseline. That row is turn 1 of a fresh process, and it is **a cold-start artifact, not a steady-state cost**. V1a's `boot()` loaded embeddings, the document index, silero, faster-whisper and Kokoro, and then handed the agent to the loop *without ever calling the LLM* — so the first `invoke` was where Ollama paid to pull llama3.1 (4.9 GB) into VRAM. That load was charged, once, to whichever turn happened to be first. `[FIXED in V1b]` `voice_main.warm_llm` now spends one throwaway turn at boot on a separate thread id, so the model is resident before the first real utterance; the load time is reported as its own boot line. Turn-1 rows in `turns.jsonl` from V1a remain cold-start artifacts and must still not be read as a baseline.
 
 **The warm baseline, measured by the committed routing matrix** (`scripts/check_routing.py`, same model, same document, same `keep_alive="30m"`, one turn per thread):
 
@@ -971,7 +971,7 @@ So a warm agent turn is **1.3–8.4 s across the five R4 routes**, and the sprea
 
 Two consequences for the voice work:
 
-1. **The first turn of a session is always the slowest, by several seconds, for a reason that has nothing to do with the pipeline.** Either warm the model at boot with a throwaway generation — the same argument `warmup.warm_embeddings()` already makes for MiniLM, and boot time is where nobody is waiting — or accept it and never read a turn-1 row as a baseline. Nothing in the telemetry marks a row cold, which is exactly how the 10.1 s number got quoted; a `cold: true` flag on the first row of a process would close that.
+1. ~~**The first turn of a session is always the slowest, by several seconds, for a reason that has nothing to do with the pipeline.**~~ `[FIXED in V1b]` The first of the two options is the one taken: the model is warmed at boot with a throwaway generation, the same argument `warmup.warm_embeddings()` already makes for MiniLM, and boot time is where nobody is waiting. The second half of this finding stands — nothing in the telemetry marks a row cold, which is exactly how the 10.1 s number got quoted, and a `cold: true` flag on the first row of a process would close it.
 2. **Comparisons must hold the route fixed.** `agent_ms` mixes a local Chroma lookup and a 10 s-capped network call into one field, so an aggregate over mixed turns measures which tools were chosen, not how fast the agent is. `turns.jsonl` records no tool name (§10's instrumentation is per-stage, not per-route), so the routing matrix is currently the only per-route timing that exists.
 
 ### Recommended sequencing for voice (not implemented)

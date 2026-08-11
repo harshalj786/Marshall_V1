@@ -11,6 +11,10 @@ the user stopping speaking and hearing anything back. It is the only one the use
 experiences directly; `stt_ms`, `agent_ms` and `tts_first_sentence_ms` are there to
 say which stage owns it.
 
+V1b adds four barge-in columns for one specific reason: the two parameters that decide
+when Marshall gets cut off (`barge_in_sustained_ms`, `barge_in_vad_threshold`) were
+guessed rather than measured, and these are what the guesses get corrected from.
+
 JSONL rather than a log line so a later session can just read it:
 
     import json
@@ -36,6 +40,16 @@ TURN_FIELDS = (
     "transcript_chars",
     "response_chars",
     "tts_engine",
+    #: V1b, appended rather than interleaved so a V1a row is still this row's prefix.
+    #: These four exist for one job: `barge_in_sustained_ms` and `barge_in_vad_threshold`
+    #: were guessed, and this is what they get corrected from. A run full of
+    #: `was_interrupted` turns with a one-word transcript means the guard is too eager;
+    #: `sentences_played` says how much of the answer survived, and `time_to_silence_ms`
+    #: says whether stopping is fast enough to feel like an interruption at all.
+    "was_interrupted",
+    "sentences_played",
+    "sentences_total",
+    "time_to_silence_ms",
 )
 
 
@@ -56,6 +70,15 @@ class TurnTelemetry:
     speech_end_to_first_audio_ms: Optional[float] = None
     transcript_chars: Optional[int] = None
     response_chars: Optional[int] = None
+    #: False rather than None: "this turn was not interrupted" is a fact about every
+    #: turn that reaches a row, including the ones that died before SPEAKING.
+    was_interrupted: bool = False
+    #: None until SPEAKING is actually entered — a turn that never got there played no
+    #: sentences, and 0 would read as "it spoke nothing" rather than "it never spoke".
+    sentences_played: Optional[int] = None
+    sentences_total: Optional[int] = None
+    #: guard fire -> playback silent. Only ever set on an interrupted turn.
+    time_to_silence_ms: Optional[float] = None
 
     def as_row(self) -> dict:
         data = asdict(self)

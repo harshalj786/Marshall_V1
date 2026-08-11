@@ -157,11 +157,11 @@ def list_devices() -> str:
 class MicrophoneStream:
     """Continuous 16 kHz mono capture. Frames land on `.queue` as float32 arrays.
 
-    Deliberately NOT stopped while Marshall is speaking. V1a has no barge-in, so those
-    frames are discarded by the orchestrator rather than never captured — but keeping
-    the stream open means the device is not reopened on every turn, which on Windows
-    costs hundreds of milliseconds and occasionally fails outright when another
-    process grabbed it in between.
+    Deliberately NOT stopped while Marshall is speaking. V1a discarded those frames in
+    the orchestrator rather than never capturing them, because reopening the device every
+    turn costs hundreds of milliseconds on Windows and occasionally fails outright when
+    another process grabbed it in between. V1b is what that decision bought: barge-in
+    needs those exact frames, and they were already arriving.
     """
 
     def __init__(self, config, on_overflow=None):
@@ -240,18 +240,25 @@ class MicrophoneStream:
 
 
 class Speaker:
-    """Blocking playback of float32 mono audio at the TTS rate.
+    """Blocking playback of float32 mono audio at the TTS rate, abortable from a thread.
 
-    Blocking is correct for V1a: SPEAKING is a state the orchestrator waits out, and
-    the call is made in an executor so the event loop stays responsive. V1b's barge-in
-    is what needs this to become interruptible, and it will need a callback-driven
-    output stream to do it — not this.
+    Blocking stays correct through V1b, and the callback-driven output stream V1a
+    expected barge-in to need turned out not to be needed: `sd.stop()` aborts the stream
+    from any thread and releases the `sd.wait()` blocking `play`, so ONE sentence is the
+    unit of interruption. That is granular enough — the whole cut measures ~197 ms of
+    drain plus the guard's ~300 ms, inside human interruption norms — and it avoids
+    holding playback position in a real-time callback for the sake of stopping a fraction
+    of a second sooner. Sub-sentence position is V1c's problem, with streaming.
+
+    The one contract this places on the caller: `play` runs in an executor and `stop` is
+    called from the event loop, so the two really do run concurrently.
     """
 
     def __init__(self, config):
         self.config = config
 
     def play(self, audio: np.ndarray) -> None:
+        """Play to completion — or until `stop()` cuts it short."""
         import sounddevice as sd
         if audio is None or len(audio) == 0:
             return
@@ -261,6 +268,9 @@ class Speaker:
         sd.wait()
 
     def stop(self) -> None:
+        """Abort playback now. Safe to call while `play` is blocked in another thread —
+        which is the whole barge-in mechanism — and safe to call when nothing is playing.
+        """
         import sounddevice as sd
         try:
             sd.stop()

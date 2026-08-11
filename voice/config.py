@@ -52,6 +52,26 @@ class VoiceConfig:
     #: grow the buffer without bound and then hand Whisper a 20-minute clip.
     max_utterance_s: float = 30.0
 
+    # --- barge-in (V1b) --------------------------------------------------------
+    #: "vad"  sustained speech while Marshall is SPEAKING stops him mid-answer.
+    #: "off"  V1a behaviour — nothing interrupts him.
+    #: There is no echo cancellation anywhere in this stack, so "vad" assumes
+    #: HEADPHONES: played through speakers, Marshall's own voice reaches the mic and
+    #: interrupts him. The flag exists so that user can switch it off rather than fight
+    #: it. (A wake-word-gated third mode is the obvious later option; not built.)
+    barge_in_mode: str = "vad"
+    #: speech probability a frame must reach to count toward an interrupt. Higher than
+    #: `vad_threshold` on purpose: a false endpoint in LISTENING costs one bad
+    #: transcript, a false interrupt cuts Marshall off mid-sentence, so this side of the
+    #: turn is deliberately harder to trigger.
+    #: UNMEASURED STARTING GUESS — correct it from `was_interrupted` in the turn log.
+    barge_in_vad_threshold: float = 0.7
+    #: how long that speech must be SUSTAINED before playback is cut. This is the whole
+    #: defence against a cough, a door, or a keyboard ending an answer: one loud frame
+    #: is not an interruption, ~300 ms of continuous speech is.
+    #: UNMEASURED STARTING GUESS — correct it from `was_interrupted` in the turn log.
+    barge_in_sustained_ms: int = 300
+
     # --- speech to text --------------------------------------------------------
     stt_model: str = "large-v3-turbo"
     stt_device: str = "cuda"
@@ -108,6 +128,17 @@ class VoiceConfig:
             raise ValueError(
                 f"max_utterance_s ({self.max_utterance_s}) must exceed "
                 f"min_utterance_s ({self.min_utterance_s})")
+        if self.barge_in_mode not in ("vad", "off"):
+            raise ValueError(
+                f"barge_in_mode must be 'vad' or 'off', got {self.barge_in_mode!r}")
+        if not 0.0 < self.barge_in_vad_threshold < 1.0:
+            raise ValueError("barge_in_vad_threshold must be in (0, 1), got "
+                             f"{self.barge_in_vad_threshold}")
+        if self.barge_in_sustained_ms <= 0:
+            #: zero would fire on a single frame, which is the transient this exists to
+            #: reject. "Never interrupt" is spelled `barge_in_mode="off"`.
+            raise ValueError("barge_in_sustained_ms must be > 0, got "
+                             f"{self.barge_in_sustained_ms}")
 
     # --- derived ---------------------------------------------------------------
     # frames, not milliseconds, because that is the unit the VAD loop counts in.
@@ -127,3 +158,11 @@ class VoiceConfig:
     @property
     def max_utterance_frames(self) -> int:
         return max(1, round(self.max_utterance_s / self.frame_duration_s))
+
+    @property
+    def barge_in_enabled(self) -> bool:
+        return self.barge_in_mode == "vad"
+
+    @property
+    def barge_in_sustained_frames(self) -> int:
+        return max(1, round(self.barge_in_sustained_ms / 1000 / self.frame_duration_s))
