@@ -33,6 +33,61 @@ def _timeout_message(tool_name: str) -> str:
     return f"{tool_name} error: timed out after {TOOL_TIMEOUT_SECONDS:g}s"
 
 
+#: hard character ceiling on what one tool hands back to the model. `k` bounds the NUMBER
+#: of results, never their size: `wikipedia_lookup` at its own default k=3 measured 12,004
+#: chars — LangChain's `doc_content_chars_max=4000` times three documents plus separators —
+#: and `search_current_doc` scales linearly past it (k=50 measured 17,976).
+#:
+#: Why a ceiling and why now: the control plane's detector runs on every agent generation,
+#: which is four times on a turn with three sequential tool calls, so an uncapped Wikipedia
+#: join is embedded four times over rather than once. 8,000 keeps roughly two full
+#: Wikipedia documents — enough for the system prompt's "if multiple sources exist, combine
+#: them logically" to still mean something — and never fires for `search_current_doc` at
+#: its default k=4, which measured 999-1,813 chars.
+#:
+#: Characters, not tokens, deliberately: this is a safety bound rather than an accounting
+#: budget, and `tools/` stays a leaf module with no tokenizer import. It bounds the
+#: CONTENT; the truncation notice is appended on top of that.
+TOOL_OUTPUT_MAX_CHARS = 8000
+
+#: paragraph, line, word — the boundaries `_cap_output` will back a cut off to, best first.
+_CUT_BOUNDARIES = ("\n\n", "\n", " ")
+
+
+def _truncation_notice(tool_name: str, kept: int, total: int) -> str:
+    #: same "<tool> <what happened>: <detail>" shape as `_timeout_message`, so a truncated
+    #: result reads to the model like the other machine-generated strings this file makes.
+    #: It has to be VISIBLE: a model that cannot tell it was cut off assumes it saw the
+    #: whole article and answers confidently from a prefix instead of narrowing its query.
+    return (f"\n\n{tool_name} truncated: {kept:,} of {total:,} characters shown. "
+            f"Narrow the query to see different material.")
+
+
+def _cap_output(tool_name: str, text: str) -> str:
+    """Bound `text` to `TOOL_OUTPUT_MAX_CHARS`, cut it on a boundary, and mark it if cut.
+
+    Backs the cut off to the last blank line inside the budget. Both callers join their
+    results with a blank line, and Wikipedia page content separates its own sections the
+    same way, so this one rule lands on a document, chunk or section boundary without
+    either caller having to describe its own structure. Falls back to a line break, then a
+    space, then a hard cut — and only accepts a boundary past the halfway mark, so one
+    unbroken wall of text cannot collapse the result to almost nothing.
+
+    Under budget the text is returned unchanged, so the common path is untouched:
+    `search_current_doc` at its default k never reaches the ceiling at all.
+    """
+    if len(text) <= TOOL_OUTPUT_MAX_CHARS:
+        return text
+    window = text[:TOOL_OUTPUT_MAX_CHARS]
+    for boundary in _CUT_BOUNDARIES:
+        idx = window.rfind(boundary)
+        if idx > TOOL_OUTPUT_MAX_CHARS // 2:
+            window = window[:idx]
+            break
+    window = window.rstrip()
+    return window + _truncation_notice(tool_name, len(window), len(text))
+
+
 def _run_with_timeout(tool_name: str, func, *args, **kwargs) -> str:
     """Run `func` under `TOOL_TIMEOUT_SECONDS`, returning a tool-style error string on expiry.
 
@@ -122,7 +177,8 @@ def _wikipedia_lookup_body(query: str, k: int) -> str:
             retriever = WikipediaRetriever(top_k_results=k, lang="en")
             docs = retriever.invoke(query)
             if docs:
-                return "\n\n".join(d.page_content for d in docs)
+                return _cap_output(
+                    "wikipedia_lookup", "\n\n".join(d.page_content for d in docs))
         except Exception as e:
             last_err = e
     if last_err is not None:
@@ -187,7 +243,8 @@ def make_search_current_doc(retrival) -> BaseTool:
             docs = result.get("context", [])
             if not docs:
                 return f"no chunks matched: {query}"
-            return "\n\n".join(d.page_content for d in docs)
+            return _cap_output(
+                "search_current_doc", "\n\n".join(d.page_content for d in docs))
         except Exception as e:
             return f"search_current_doc error: {e}"
 

@@ -1,0 +1,71 @@
+# Runs everything that does not need a local model server.
+#
+# Ollama is deliberately NOT provisioned here. The 21 model-gated tests — 17 of
+# which are the tool-routing gate — are deselected by `-m "not needs_ollama"` and
+# must still be run locally against a real llama3.1 before trusting a routing
+# change. This workflow protects the other 220; it does not replace that run.
+#
+# Marker selection is derived from the skipif conditions already in the tests
+# (see conftest.py). If that derivation ever breaks, these tests are deselected
+# no longer but still skip on their own skipif — CI reports a skip, never an
+# attempt to reach a model server that is not there.
+
+name: tests
+
+on:
+  push:
+  pull_request:
+
+concurrency:
+  group: tests-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  test:
+    runs-on: ubuntu-latest
+    timeout-minutes: 45
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          # requirements.txt records CPython 3.12.9 (Windows) as the tested interpreter
+          python-version: "3.12"
+          cache: pip
+          cache-dependency-path: requirements.txt
+
+      # sounddevice binds PortAudio at import time. Without the system library the
+      # four voice modules raise on import and pytest reports collection ERRORS,
+      # not skips — a red build for a missing .so rather than a real failure.
+      - name: Install PortAudio
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends libportaudio2
+
+      # requirements.txt only, WITHOUT -c constraints.txt, and that is deliberate.
+      # The constraint guards an existing cu124 torch install; a runner has no torch
+      # at all, so here the CPU wheel is the correct and only sensible outcome.
+      # Applying the guard on a machine it was never meant for is exactly the misuse
+      # its own header warns about.
+      #
+      # pytest is installed separately: it is a test-time tool, not a runtime import,
+      # so it is correctly absent from the pinned runtime manifest.
+      - name: Install dependencies
+        run: |
+          python -m pip install --upgrade pip
+          pip install -r requirements.txt
+          pip install pytest
+
+      # sentence-transformers and Kokoro fetch model weights on first use. Caching
+      # keeps a green build from depending on a third-party download every push.
+      - name: Cache model weights
+        uses: actions/cache@v4
+        with:
+          path: |
+            ~/.cache/huggingface
+            ~/.cache/torch
+          key: models-${{ runner.os }}-${{ hashFiles('requirements.txt') }}
+
+      - name: Run the non-Ollama tests
+        run: pytest -m "not needs_ollama"

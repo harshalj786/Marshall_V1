@@ -25,6 +25,9 @@ wheels/
 .installed.cfg
 *.egg
 
+# Test tooling (created by the pytest config added in pyproject.toml)
+.pytest_cache/
+
 # Virtual environments
 venv/
 ENV/

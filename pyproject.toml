@@ -1,0 +1,31 @@
+# pytest configuration, and deliberately nothing else.
+#
+# This file exists for one reason: `pytest` must mean the same thing on every
+# machine and in CI. tests/test_routing_matrix.py is the only thing standing
+# between a routing regression and nobody noticing, and until now there was no
+# ini file at all — so rootdir, testpaths and marker validity were all inferred
+# from whatever arguments happened to be typed.
+#
+# There is no [project] table and no [build-system] on purpose. Marshall is not
+# a package: it installs from requirements.txt and runs from the repo root.
+# Adding packaging metadata here would invite `pip install .` to start working
+# by accident and resolve dependencies differently from the pinned manifest.
+
+[tool.pytest.ini_options]
+minversion = "8.0"
+testpaths = ["tests"]
+
+# --strict-markers turns a typo'd marker into an error rather than a silent
+#   no-op, which matters because a mistyped -m expression selects nothing and
+#   an empty run still exits 0.
+# --strict-config does the same for this file.
+# -ra prints the skip reasons in the summary. Skipped means "not verifiable on
+#   this machine" and never "passing", so the reasons are the point, not noise.
+addopts = "-ra --strict-markers --strict-config"
+
+# Applied automatically by conftest.py from the skipif reasons already on the
+# tests — see the long comment there. Nothing in tests/ was edited to add them.
+markers = [
+    "needs_ollama: needs a reachable Ollama on :11434 (test_ingestion_retrieval_split, test_memory_gate_resilience, and every needs_llama31 test)",
+    "needs_llama31: needs Ollama on :11434 with llama3.1 pulled — the tool-routing gate in test_routing_matrix. Implies needs_ollama.",
+]

@@ -1,0 +1,41 @@
+# Marshall V1 — pip constraints.
+#
+#     pip install -r requirements.txt -c constraints.txt
+#
+# THIS FILE IS A GUARD FOR AN EXISTING GPU ENVIRONMENT, NOT A BOOTSTRAP SPEC.
+#
+# --- what it is for ----------------------------------------------------------
+# Stopping a NEW dependency from silently replacing a working GPU torch install.
+# The next phase adds an NLI cross-encoder and text-metric libraries, and every
+# one of them declares a `torch` requirement. Resolved against a plain PyPI index
+# with nothing holding the line, pip satisfies those requirements by downloading
+# the newest CPU wheel and installing it over the top of the cu124 build. Nothing
+# fails; the machine simply stops using the GPU, and the first symptom is a
+# latency regression nobody can attribute.
+#
+# --- why the pin carries no local version identifier -------------------------
+# The working machine runs torch==2.6.0+cu124. Under PEP 440 a specifier with no
+# local segment matches a version that has one, so `==2.6.0` is ALREADY SATISFIED
+# by 2.6.0+cu124: pip leaves the install alone. What the constraint changes is
+# everything else — any incoming dependency that wants a different torch is now
+# unsatisfiable and fails loudly at resolve time, instead of quietly winning.
+#
+# `torch==2.6.0+cu124` would be the wrong pin here. That exact string is not on
+# PyPI, so pip cannot verify it against a normal index — which is the same reason
+# torch is absent from requirements.txt altogether.
+#
+# --- read this before using it on a new machine ------------------------------
+# On a machine with NO torch installed, this file protects nothing. `==2.6.0` is
+# perfectly satisfiable from PyPI by the CPU wheel, and the CPU wheel is exactly
+# what you will get. This guards an environment that is already correct; it does
+# not create one. To build the GPU environment first, see NOTE 1 in
+# requirements.txt, which owns the reasoning for why torch is not pinned there.
+# Do not duplicate that reasoning here — it has one home.
+#
+# --- scope -------------------------------------------------------------------
+# torch only. torchaudio==2.6.0+cu124 and torchvision==0.21.0+cu124 are installed
+# and carry the identical local-version footgun, but nothing in the current or
+# planned dependency set pulls them, and a constraint on a door nobody walks
+# through is just a line to maintain. Add them the day something reaches for them.
+
+torch==2.6.0

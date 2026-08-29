@@ -73,14 +73,32 @@ python -m venv venv
 venv\Scripts\activate  # Windows
 # source venv/bin/activate  # Linux/Mac
 
-# Install dependencies
-pip install langchain langchain-community langchain-huggingface langchain-experimental
-pip install langgraph langgraph-checkpoint langgraph-prebuilt langchain-ollama
-pip install chromadb sentence-transformers
-pip install pypdf pdfplumber youtube-transcript-api
-pip install ollama
-# Agent tool-calling extras:
-pip install duckduckgo-search ddgs wikipedia
+# Install dependencies (exact pins; see the header of requirements.txt)
+pip install -r requirements.txt -c constraints.txt
+```
+
+`constraints.txt` is a **guard, not a bootstrap spec.** It holds `torch==2.6.0`
+without the `+cu124` local version identifier, so that PEP 440 treats an already
+installed `2.6.0+cu124` as satisfying it — pip leaves the GPU build alone, while any
+new dependency that wants a different torch fails loudly instead of quietly pulling
+the CPU wheel over it.
+
+On a machine with **no torch installed yet**, that constraint protects nothing: pip
+will happily satisfy `==2.6.0` with the CPU wheel from PyPI. Build the GPU
+environment first — see NOTE 1 at the bottom of `requirements.txt` for why torch is
+deliberately not pinned there and how to install it:
+
+```bash
+pip install torch==2.6.0 --index-url https://download.pytorch.org/whl/cu124
+```
+
+Running the test suite additionally needs `pytest`, which is not a runtime dependency
+and so is not in `requirements.txt`:
+
+```bash
+pip install pytest
+pytest                      # the whole suite
+pytest -m "not needs_ollama"  # only what runs without a local model server
 ```
 
 ---

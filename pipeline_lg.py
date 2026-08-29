@@ -1,10 +1,12 @@
 import json
 from datetime import datetime, timezone
 from pathlib import Path
-from typing import TypedDict, Annotated, Optional, Literal, Sequence
+from typing import (TypedDict, Annotated, Optional, Literal, Sequence,
+                    Callable, NamedTuple)
 from langgraph.graph import StateGraph, START, END
 from langgraph.graph.message import add_messages, REMOVE_ALL_MESSAGES
 from langgraph.checkpoint.memory import MemorySaver
+from langgraph.checkpoint.base import BaseCheckpointSaver
 from langgraph.prebuilt import ToolNode, tools_condition
 from langchain_core.messages import (
     BaseMessage,
@@ -545,6 +547,74 @@ def render_transcript(messages: Sequence[BaseMessage]) -> str:
     return "\n".join(lines)
 
 
+def _last_write_wins(current: dict, incoming: dict) -> dict:
+    """Reducer for `AgentState.risk_state`: the newest value replaces the old one.
+
+    Spelled out rather than left to the default so the intent is on the page. A node
+    returning a fresh dict REPLACES what was there; it does not merge into it, so a
+    caller cannot accumulate state by accident and then wonder why old keys survive.
+    """
+    return incoming
+
+
+class AgentHook(NamedTuple):
+    """One caller-supplied node on the agent's outgoing edge, plus the router after it.
+
+    `node` is an ordinary LangGraph node: it takes the state and returns a state update.
+    `router` takes the state and returns one of `AGENT_HOOK_VERDICTS` — a plain string
+    saying what should happen next, never the name of a node.
+
+    That split is the whole point of the seam. The caller says what it wants in its own
+    vocabulary; this module alone decides which node each word reaches. Marshall can
+    rename, split or reorder its nodes without touching anything the caller ships.
+
+    A plain `(node, router)` tuple is accepted anywhere this is, so a caller needs no
+    import from this module at all.
+    """
+    node: Callable
+    router: Callable
+
+
+#: proceed  — carry on exactly as an unhooked graph would: call the tools the generation
+#:            asked for, or end the turn if it asked for none. Delegates to
+#:            `tools_condition`, so this path is bit-identical to having no hook.
+#: revise   — send the turn back for another generation instead of acting on this one.
+#: stop     — end the turn here, without running any tool the generation asked for.
+#:
+#: Three words, because three is what it takes to cover "continue", "go round again" and
+#: "finish": anything else a caller wants is composed from these, not a fourth edge.
+AGENT_HOOK_PROCEED = "proceed"
+AGENT_HOOK_REVISE = "revise"
+AGENT_HOOK_STOP = "stop"
+AGENT_HOOK_VERDICTS = (AGENT_HOOK_PROCEED, AGENT_HOOK_REVISE, AGENT_HOOK_STOP)
+
+def _normalize_agent_hook(agent_hook) -> "Optional[AgentHook]":
+    """Validate a caller's `(node, router)` pair. `None` means no hook, and stays None.
+
+    Raises at CONSTRUCTION rather than on the first turn. Whether a callable is callable
+    is knowable the moment it is handed over, and a wiring mistake that waits until the
+    middle of a conversation to surface has cost a real turn to find.
+    """
+    if agent_hook is None:
+        return None
+    try:
+        node, router = agent_hook
+    except (TypeError, ValueError):
+        raise TypeError(
+            "agent_hook must be a (node, router) pair, got "
+            f"{type(agent_hook).__name__}") from None
+    for role, fn in (("node", node), ("router", router)):
+        if not callable(fn):
+            raise TypeError(
+                f"agent_hook {role} must be callable, got {type(fn).__name__}")
+    return AgentHook(node, router)
+
+
+#: Marshall's own name for the hook node. Deliberately not a parameter: a caller that
+#: could name it could depend on the name, and then it would not be Marshall's to change.
+_AGENT_HOOK_NODE = "agent_hook"
+
+
 class AgentState(TypedDict):
     messages: Annotated[list[BaseMessage], add_messages]
     turn_count: int
@@ -554,6 +624,11 @@ class AgentState(TypedDict):
     #: turns since the last SUCCESSFUL compression — not since the last attempt, so a
     #: failed cycle stays above the threshold and the next turn retries
     summary_turns_since: int
+    #: caller-owned scratch space, empty until something puts a value in it. Nothing in
+    #: this module reads it or writes it. It lives in the state, rather than on the object
+    #: that supplied the hook, so that it goes through the checkpointer with everything
+    #: else: it survives a restart and is recoverable from an earlier checkpoint.
+    risk_state: Annotated[dict, _last_write_wins]
 
 
 class AgentGraph:
@@ -578,6 +653,21 @@ class AgentGraph:
     compresses everything before a tool-safe cut point into a running summary and replaces
     the list with that summary plus the recent tail. This is what stops time-to-first-token
     from climbing with conversation length (H2). Set `summarize_every_n_turns=0` to disable.
+
+    `checkpointer` defaults to a per-instance `MemorySaver()`. It is a parameter so a
+    durable saver can be injected without touching a call site — rolling back to an
+    earlier checkpoint is meaningless against an in-process store that dies with the
+    process. UNSOLVED: `SqliteSaver` is a context manager whose `__exit__` closes the
+    connection, so `AgentGraph(checkpointer=SqliteSaver.from_conn_string(...))` cannot
+    work — this constructor owns everything it builds and there is no scope for the
+    caller's `with` block to span. Injecting one today means the caller keeps the
+    context open around the whole agent lifetime. The seam is here; the lifecycle is not.
+
+    `agent_hook` optionally inserts ONE caller-supplied node on the agent's outgoing edge,
+    as a `(node, router)` pair — see `AgentHook`. The router returns a verdict string from
+    `AGENT_HOOK_VERDICTS` and this class maps it onto its own nodes, so no node name ever
+    reaches the caller. With no hook supplied the graph is wired exactly as it was before
+    the parameter existed.
     """
 
     def __init__(self,
@@ -597,7 +687,9 @@ class AgentGraph:
                  summary_keep_recent: int = SUMMARY_KEEP_RECENT,
                  summary_persist_path: Optional[str] = None,
                  memory_model: str = DEFAULT_MEMORY_MODEL,
-                 keep_alive: Optional[str | int] = None):
+                 keep_alive: Optional[str | int] = None,
+                 checkpointer: Optional[BaseCheckpointSaver] = None,
+                 agent_hook: Optional[tuple] = None):
         from langchain_ollama import ChatOllama
 
         # startup cost is the first thing §10 names as fatal to a voice session: this used
@@ -670,7 +762,11 @@ class AgentGraph:
         # tool calls while holding tools itself, llama3.1 answers with a tool_call instead
         # of prose, and the cycle silently produces no summary
         self.summary_llm = base_llm
-        self.checkpointer = MemorySaver()
+        # constructed here rather than defaulted in the signature: a `= MemorySaver()`
+        # default is evaluated once at import, so every AgentGraph in the process would
+        # share one store and thread_ids would collide across agents. None means "own one".
+        self.checkpointer = checkpointer or MemorySaver()
+        self._agent_hook = _normalize_agent_hook(agent_hook)
         self.graph = self._build_graph()
 
     def _build_user_memory(self, messages: list[BaseMessage],
@@ -920,6 +1016,23 @@ class AgentGraph:
         response = self.llm.invoke(messages)
         return {"messages": [response]}
 
+    def _agent_hook_router(self, state: AgentState):
+        """Turn the caller's verdict into one of this graph's own node names."""
+        verdict = self._agent_hook.router(state)
+        if verdict == AGENT_HOOK_PROCEED:
+            # delegate rather than reimplement: whatever an unhooked graph would decide
+            # here is what still happens, including any later change to that decision
+            return tools_condition(state)
+        if verdict == AGENT_HOOK_REVISE:
+            return "agent"
+        if verdict == AGENT_HOOK_STOP:
+            return END
+        raise ValueError(
+            f"agent hook router returned an unknown verdict {verdict!r}; expected one of "
+            f"{list(AGENT_HOOK_VERDICTS)}. Refusing to guess: an unrecognised verdict "
+            f"allowed to fall through to the end of the turn would be indistinguishable "
+            f"from a normal finish, which is the one failure this seam must not have.")
+
     def _build_graph(self):
         g = StateGraph(AgentState)
         g.add_node("count_turn", self._count_turn_node)
@@ -945,9 +1058,23 @@ class AgentGraph:
             {"summarize": "summarize_user_history", "agent": "agent"},
         )
         g.add_edge("summarize_user_history", "agent")
-        # explicit path map: without it every node is declared a possible target, which
-        # discards graph-shape validation and draws phantom edges in get_graph()
-        g.add_conditional_edges("agent", tools_condition, {"tools": "tools", END: END})
+        if self._agent_hook is None:
+            # explicit path map: without it every node is declared a possible target, which
+            # discards graph-shape validation and draws phantom edges in get_graph()
+            g.add_conditional_edges("agent", tools_condition, {"tools": "tools", END: END})
+        else:
+            # the hook sits between the generation and the routing decision, on the only
+            # edge leaving `agent` — so it sees every generation, the intermediate
+            # tool-calling ones as well as the final answer, and nothing can bypass it.
+            g.add_node(_AGENT_HOOK_NODE, self._agent_hook.node)
+            g.add_edge("agent", _AGENT_HOOK_NODE)
+            # the same explicit path map discipline, one target wider: `agent` is a target
+            # again because a verdict of "revise" sends the turn back for another go.
+            g.add_conditional_edges(
+                _AGENT_HOOK_NODE,
+                self._agent_hook_router,
+                {"tools": "tools", "agent": "agent", END: END},
+            )
         g.add_edge("tools", "agent")
         return g.compile(checkpointer=self.checkpointer)
 
@@ -955,8 +1082,14 @@ class AgentGraph:
         if config is None:
             config = {"configurable": {"thread_id": "default"}}
         # cap the ReAct loop: langgraph's default is 10000, so an oscillating tool loop
-        # would otherwise grind through ~10000 Ollama calls before erroring
-        config = {**config, "recursion_limit": config.get("recursion_limit", 25)}
+        # would otherwise grind through ~10000 Ollama calls before erroring.
+        #
+        # 43, not 25, because a node on the agent's outgoing edge costs a superstep per
+        # generation and 25 would silently cut the tool-call ceiling from 11 to 7. The
+        # arithmetic is worst case 3N + 2R + 5 supersteps for N tool rounds and R
+        # regenerations, plus one because the limit must exceed the count rather than
+        # equal it: 3(11) + 2(2) + 5 + 1 = 43. A caller may still pass its own.
+        config = {**config, "recursion_limit": config.get("recursion_limit", 43)}
         thread_id = config["configurable"]["thread_id"]
         existing = self.get_history(thread_id)
         incoming: list[BaseMessage] = []
