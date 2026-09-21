@@ -548,7 +548,7 @@ def render_transcript(messages: Sequence[BaseMessage]) -> str:
 
 
 def _last_write_wins(current: dict, incoming: dict) -> dict:
-    """Reducer for `AgentState.risk_state`: the newest value replaces the old one.
+    """Reducer for `AgentState.hook_state`: the newest value replaces the old one.
 
     Spelled out rather than left to the default so the intent is on the page. A node
     returning a fresh dict REPLACES what was there; it does not merge into it, so a
@@ -651,7 +651,7 @@ class AgentState(TypedDict):
     #: this module reads it or writes it. It lives in the state, rather than on the object
     #: that supplied the hook, so that it goes through the checkpointer with everything
     #: else: it survives a restart and is recoverable from an earlier checkpoint.
-    risk_state: Annotated[dict, _last_write_wins]
+    hook_state: Annotated[dict, _last_write_wins]
 
 
 class AgentGraph:

@@ -133,7 +133,7 @@ def test_proceed_routes_identically_to_no_hook(tmp_root, monkeypatch):
     assert hook.router_calls == 2
 
 
-def test_risk_state_defaults_to_empty_and_marshall_leaves_it_alone(tmp_root, monkeypatch):
+def test_hook_state_defaults_to_empty_and_marshall_leaves_it_alone(tmp_root, monkeypatch):
     hook = RecordingHook("proceed")
     agent = build_agent(tmp_root, agent_hook=hook.as_pair())
     monkeypatch.setattr(agent, "llm", ToolCallingChat())
@@ -141,7 +141,7 @@ def test_risk_state_defaults_to_empty_and_marshall_leaves_it_alone(tmp_root, mon
     agent.invoke("what is 6*7?", config=config)
 
     state = agent.graph.get_state(config).values
-    assert state["risk_state"] == {}
+    assert state["hook_state"] == {}
 
 
 # --------------------------------------------------------------------------
