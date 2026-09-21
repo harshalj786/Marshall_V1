@@ -610,6 +610,29 @@ def _normalize_agent_hook(agent_hook) -> "Optional[AgentHook]":
     return AgentHook(node, router)
 
 
+#: The most tool rounds one turn is allowed before the ReAct loop is cut off. Eleven is
+#: the ceiling the original recursion_limit of 25 implied on a plain turn (2N + 2 <= 25),
+#: kept as the deliberate number it always effectively was.
+MAX_TOOL_ROUNDS = 11
+
+#: Supersteps for the worst realistic turn of this graph, with N tool rounds:
+#:
+#:     1              count_turn
+#:   + 1              summarize_and_trim, on a turn where the trim is due
+#:   + 1              summarize_user_history, on a turn where the memory gate is also due
+#:   + (N + 1)        agent: one generation per tool round, plus the final answer
+#:   + N              tools
+#:   = 2N + 4
+#:
+#: LangGraph raises GraphRecursionError when the count REACHES the limit, so the limit
+#: must exceed the count: 2N + 5. At N = MAX_TOOL_ROUNDS that is 2(11) + 5 = 27, which
+#: the old default of 25 did not cover — a turn on which both gates fired was capped at
+#: ten tool rounds, not eleven. Rounded up to 30 for headroom: three spare supersteps,
+#: enough for a twelfth tool round on a gate turn or a thirteenth on a plain one.
+#: tests/test_recursion_budget.py pins both the arithmetic and the measurement.
+DEFAULT_RECURSION_LIMIT = 30
+
+
 #: Marshall's own name for the hook node. Deliberately not a parameter: a caller that
 #: could name it could depend on the name, and then it would not be Marshall's to change.
 _AGENT_HOOK_NODE = "agent_hook"
@@ -1082,14 +1105,11 @@ class AgentGraph:
         if config is None:
             config = {"configurable": {"thread_id": "default"}}
         # cap the ReAct loop: langgraph's default is 10000, so an oscillating tool loop
-        # would otherwise grind through ~10000 Ollama calls before erroring.
-        #
-        # 43, not 25, because a node on the agent's outgoing edge costs a superstep per
-        # generation and 25 would silently cut the tool-call ceiling from 11 to 7. The
-        # arithmetic is worst case 3N + 2R + 5 supersteps for N tool rounds and R
-        # regenerations, plus one because the limit must exceed the count rather than
-        # equal it: 3(11) + 2(2) + 5 + 1 = 43. A caller may still pass its own.
-        config = {**config, "recursion_limit": config.get("recursion_limit", 43)}
+        # would otherwise grind through ~10000 Ollama calls before erroring. The default
+        # is sized from this graph's own worst-case turn — see DEFAULT_RECURSION_LIMIT.
+        # A caller may still pass its own.
+        config = {**config,
+                  "recursion_limit": config.get("recursion_limit", DEFAULT_RECURSION_LIMIT)}
         thread_id = config["configurable"]["thread_id"]
         existing = self.get_history(thread_id)
         incoming: list[BaseMessage] = []
