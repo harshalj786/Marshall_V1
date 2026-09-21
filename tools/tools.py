@@ -38,12 +38,15 @@ def _timeout_message(tool_name: str) -> str:
 #: chars — LangChain's `doc_content_chars_max=4000` times three documents plus separators —
 #: and `search_current_doc` scales linearly past it (k=50 measured 17,976).
 #:
-#: Why a ceiling and why now: the control plane's detector runs on every agent generation,
-#: which is four times on a turn with three sequential tool calls, so an uncapped Wikipedia
-#: join is embedded four times over rather than once. 8,000 keeps roughly two full
-#: Wikipedia documents — enough for the system prompt's "if multiple sources exist, combine
-#: them logically" to still mean something — and never fires for `search_current_doc` at
-#: its default k=4, which measured 999-1,813 chars.
+#: Why a ceiling: a tool result becomes a ToolMessage that stays on the list for the rest
+#: of the turn, so the model re-reads it on every later generation — four times on a turn
+#: with three sequential tool calls — and anything else that walks the message list per
+#: generation (summarisation, an installed agent_hook) pays for it again. On an 8B model
+#: with an 8k-token window, one uncapped Wikipedia join is a third of the context by
+#: itself. 8,000 keeps roughly two full Wikipedia documents — enough for the system
+#: prompt's "if multiple sources exist, combine them logically" to still mean something —
+#: and never fires for `search_current_doc` at its default k=4, which measured 999-1,813
+#: chars.
 #:
 #: Characters, not tokens, deliberately: this is a safety bound rather than an accounting
 #: budget, and `tools/` stays a leaf module with no tokenizer import. It bounds the
