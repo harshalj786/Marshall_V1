@@ -228,6 +228,25 @@ print(agent.invoke("what are the top news stories today?", config=cfg))
 | `web_search` | DuckDuckGo web search for time-sensitive queries |
 | `recall_user_memory` | Semantic search over what the *user* said in earlier conversations |
 
+**Extension hook.** `AgentGraph(agent_hook=(node, router))` inserts one caller-supplied
+node on the agent's outgoing edge, so it sees every generation — the intermediate
+tool-calling ones as well as the final answer. `node(state, config)` is an ordinary
+LangGraph node and may return `{}`; `router(state)` returns one of three strings:
+
+| Verdict | Effect |
+|---------|--------|
+| `"proceed"` | Carry on exactly as an unhooked graph would (run the requested tools, or finish) |
+| `"revise"` | Send the turn back for another generation instead of acting on this one |
+| `"stop"` | End the turn here, without running any tool the generation asked for |
+
+Anything else raises rather than silently ending the turn. `state["hook_state"]` is
+scratch space for the hook — checkpointed with everything else, never read or written
+by Marshall itself. With `agent_hook` unset (the default) nothing is added to the
+graph and it is wired exactly as before. Note that a hook costs one extra superstep
+per generation, so a hooked caller should raise `recursion_limit` above
+`DEFAULT_RECURSION_LIMIT` in its `config` — see `tests/test_agent_hook.py` for a
+minimal hook and `tests/test_recursion_budget.py` for the arithmetic.
+
 ### Agent Memory Gate
 
 `AgentGraph` remembers the user in two directions at once:
