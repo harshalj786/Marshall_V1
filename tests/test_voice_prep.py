@@ -22,9 +22,7 @@ No LLM and no network. A few tests load MiniLM (the singleton they are asserting
 costs a few seconds the first time and nothing afterwards.
 """
 import inspect
-import shutil
 import sys
-import tempfile
 import threading
 from pathlib import Path
 
@@ -253,10 +251,9 @@ class _RecordingOllama(Runnable):
 
 
 @pytest.fixture
-def memory_dir():
-    tmp = Path(tempfile.mkdtemp(prefix="marshall_voiceprep_"))
-    yield str(tmp)
-    shutil.rmtree(tmp, ignore_errors=True)
+def memory_dir(tmp_path):
+    #: pytest owns the lifetime -- see the note in tests/test_agent_hook.py
+    return str(tmp_path)
 
 
 def test_user_memory_model_defaults_to_mistral():

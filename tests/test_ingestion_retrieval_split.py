@@ -19,10 +19,8 @@ Runs under pytest, or standalone:
 No LLM is needed: every assertion is about the index and the constructors. The two
 generation tests are skipped automatically when Ollama is not reachable.
 """
-import shutil
 import subprocess
 import sys
-import tempfile
 import textwrap
 from pathlib import Path
 
@@ -61,12 +59,15 @@ needs_ollama = pytest.mark.skipif(not _ollama_up(), reason="Ollama not reachable
 
 
 @pytest.fixture(scope="module")
-def workspace():
-    tmp = Path(tempfile.mkdtemp(prefix="marshall_r1_"))
+def workspace(tmp_path_factory):
+    #: pytest owns the lifetime. A manual rmtree here could not succeed: Chroma keeps the
+    #: system for a directory registered for the life of the process (there is no public
+    #: per-directory release in chromadb 1.5.5), so on Windows the delete raises
+    #: WinError 32 -- and ignore_errors=True silently left half a tree behind every run.
+    tmp = tmp_path_factory.mktemp("marshall_r1")
     doc = tmp / "doc.txt"
     doc.write_text(DOC, encoding="utf-8")
-    yield {"tmp": tmp, "doc": doc, "db": tmp / "vdb"}
-    shutil.rmtree(tmp, ignore_errors=True)
+    return {"tmp": tmp, "doc": doc, "db": tmp / "vdb"}
 
 
 def _count(collection_name: str, db_path: Path) -> int:
@@ -144,23 +145,21 @@ def test_retrieval_opens_existing_collection_without_documents(workspace):
     assert "memory" in joined, f"retrieved chunks are not relevant: {joined!r}"
 
 
-def test_retrieval_works_after_the_source_document_is_gone():
+def test_retrieval_works_after_the_source_document_is_gone(tmp_path):
     """Independence, stated as sharply as it can be: ingestion consumed the source, and
     retrieval never needs it again. The old constructor could not survive this at all."""
-    tmp = Path(tempfile.mkdtemp(prefix="marshall_r1_gone_"))
-    try:
-        doc = tmp / "doc.txt"
-        doc.write_text(DOC, encoding="utf-8")
-        db = tmp / "vdb"
-        name = ingest(file_path=str(doc), mode_docs="txt", persist_directory_path=str(db))
-        doc.unlink()
+    doc = tmp_path / "doc.txt"
+    doc.write_text(DOC, encoding="utf-8")
+    db = tmp_path / "vdb"
+    name = ingest(file_path=str(doc), mode_docs="txt", persist_directory_path=str(db))
+    #: the point of the test -- the SOURCE goes, not the index. Deleting it must succeed,
+    #: so no ignore_errors here: nothing has this file open.
+    doc.unlink()
 
-        r = Retrival(mode="simple", collection_name=name, path=str(db))
-        joined = " ".join(d.page_content
-                          for d in r.invoke({"query": "what is Marshall?", "k": 2})["context"])
-        assert "Marshall" in joined
-    finally:
-        shutil.rmtree(tmp, ignore_errors=True)
+    r = Retrival(mode="simple", collection_name=name, path=str(db))
+    joined = " ".join(d.page_content
+                      for d in r.invoke({"query": "what is Marshall?", "k": 2})["context"])
+    assert "Marshall" in joined
 
 
 def test_opening_does_not_load_or_chunk_anything(workspace, monkeypatch):
@@ -186,20 +185,16 @@ def test_opening_does_not_load_or_chunk_anything(workspace, monkeypatch):
 # C1 stays fixed through the new entry point
 # --------------------------------------------------------------------------
 
-def test_ingesting_twice_does_not_duplicate(workspace):
-    tmp = Path(tempfile.mkdtemp(prefix="marshall_r1_dup_"))
-    try:
-        doc = tmp / "doc.txt"
-        doc.write_text(DOC, encoding="utf-8")
-        db = tmp / "vdb"
-        name = ingest(file_path=str(doc), mode_docs="txt", persist_directory_path=str(db))
-        first = _count(name, db)
-        ingest(file_path=str(doc), mode_docs="txt", persist_directory_path=str(db))
-        ingest(file_path=str(doc), mode_docs="txt", persist_directory_path=str(db))
-        assert first > 0
-        assert _count(name, db) == first, "re-ingestion appended a second copy of the corpus"
-    finally:
-        shutil.rmtree(tmp, ignore_errors=True)
+def test_ingesting_twice_does_not_duplicate(tmp_path):
+    doc = tmp_path / "doc.txt"
+    doc.write_text(DOC, encoding="utf-8")
+    db = tmp_path / "vdb"
+    name = ingest(file_path=str(doc), mode_docs="txt", persist_directory_path=str(db))
+    first = _count(name, db)
+    ingest(file_path=str(doc), mode_docs="txt", persist_directory_path=str(db))
+    ingest(file_path=str(doc), mode_docs="txt", persist_directory_path=str(db))
+    assert first > 0
+    assert _count(name, db) == first, "re-ingestion appended a second copy of the corpus"
 
 
 # --------------------------------------------------------------------------
@@ -265,21 +260,17 @@ def test_graph_constructors_still_work(workspace):
         assert obj.retrival.invoke({"query": "what is Marshall?", "k": 2})["context"], cls.__name__
 
 
-def test_pipelines_ingest_on_a_cold_index(workspace):
+def test_pipelines_ingest_on_a_cold_index(tmp_path):
     """The constructors must still work end to end when nothing has been ingested yet."""
-    tmp = Path(tempfile.mkdtemp(prefix="marshall_r1_cold_"))
-    try:
-        doc = tmp / "doc.txt"
-        doc.write_text(DOC, encoding="utf-8")
-        db = tmp / "vdb"
-        from pipeline_lg import ChatRagGraph
+    doc = tmp_path / "doc.txt"
+    doc.write_text(DOC, encoding="utf-8")
+    db = tmp_path / "vdb"
+    from pipeline_lg import ChatRagGraph
 
-        graph = ChatRagGraph(file_path=str(doc), mode_docs="txt", mode_retreiver="simple",
-                             persist_directory_path=str(db))
-        assert collection_exists(collection_name_for(str(doc)), str(db))
-        assert graph.retrival.invoke({"query": "what is Marshall?", "k": 2})["context"]
-    finally:
-        shutil.rmtree(tmp, ignore_errors=True)
+    graph = ChatRagGraph(file_path=str(doc), mode_docs="txt", mode_retreiver="simple",
+                         persist_directory_path=str(db))
+    assert collection_exists(collection_name_for(str(doc)), str(db))
+    assert graph.retrival.invoke({"query": "what is Marshall?", "k": 2})["context"]
 
 
 def test_structure_pipeline_still_builds_from_docs(workspace):

@@ -17,9 +17,7 @@ That is deliberate for routing SHAPE — a real model would make the comparison 
 measurement of llama3.1 rather than of the wiring. What the live model routes to is
 tests/test_routing_matrix.py's job, and it stays that way.
 """
-import shutil
 import sys
-import tempfile
 from pathlib import Path
 
 import pytest
@@ -71,11 +69,13 @@ class RecordingHook:
 
 
 @pytest.fixture(scope="module")
-def tmp_root():
-    tmp = Path(tempfile.mkdtemp(prefix="marshall_hook_"))
+def tmp_root(tmp_path_factory):
+    #: pytest owns the lifetime. A manual rmtree here could not succeed: Chroma keeps the
+    #: system for a directory registered for the life of the process, so on Windows the
+    #: delete raises WinError 32 and ignore_errors=True silently left the tree behind.
+    tmp = tmp_path_factory.mktemp("marshall_hook")
     (tmp / "doc.txt").write_text(DOC, encoding="utf-8")
-    yield tmp
-    shutil.rmtree(tmp, ignore_errors=True)
+    return tmp
 
 
 def build_agent(tmp_root: Path, **kwargs) -> AgentGraph:

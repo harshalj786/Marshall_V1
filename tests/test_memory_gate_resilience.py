@@ -14,9 +14,7 @@ The unit tests need no LLM. The two end-to-end tests generate through Ollama
 (mistral) and are skipped automatically when it is not reachable.
 """
 import inspect
-import shutil
 import sys
-import tempfile
 from pathlib import Path
 
 import pytest
@@ -71,8 +69,9 @@ class _Works:
 
 
 @pytest.fixture(scope="module")
-def graph():
-    tmp = Path(tempfile.mkdtemp(prefix="marshall_h4_"))
+def graph(tmp_path_factory):
+    #: pytest owns the lifetime -- see the note in tests/test_agent_hook.py
+    tmp = tmp_path_factory.mktemp("marshall_h4")
     (tmp / "doc.txt").write_text(DOC, encoding="utf-8")
     g = ChatRagWithMemoryGraph(
         file_path=str(tmp / "doc.txt"),
@@ -82,8 +81,7 @@ def graph():
         user_history_directory_path=str(tmp / "mem"),
     )
     g._test_tmp = tmp
-    yield g
-    shutil.rmtree(tmp, ignore_errors=True)
+    return g
 
 
 # --------------------------------------------------------------------------

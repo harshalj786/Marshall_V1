@@ -727,16 +727,14 @@ async def test_an_interrupted_turn_records_what_was_cut_and_how_fast(tmp_path):
 # ==========================================================================
 
 @pytest.fixture(scope="module")
-def truncation_agent():
+def truncation_agent(tmp_path_factory):
     """One real AgentGraph over a one-line document. ~8s of embeddings + Chroma."""
-    import shutil
-    import tempfile
-
     from langchain_core.messages import AIMessage
 
     from pipeline_lg import AgentGraph
 
-    root = Path(tempfile.mkdtemp(prefix="marshall_v1b_"))
+    #: pytest owns the lifetime -- see the note in tests/test_agent_hook.py
+    root = tmp_path_factory.mktemp("marshall_v1b")
     (root / "doc.txt").write_text("Marshall answers questions about a document.\n",
                                   encoding="utf-8")
     agent = AgentGraph(
@@ -756,8 +754,7 @@ def truncation_agent():
             return AIMessage(content="First one. Second one. Third one.")
 
     agent.llm = PlainChat()
-    yield agent
-    shutil.rmtree(root, ignore_errors=True)
+    return agent
 
 
 def last_ai(agent, thread_id):

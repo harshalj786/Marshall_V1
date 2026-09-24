@@ -14,9 +14,7 @@ graph behaviour, so faking the model is what makes the behaviour observable.
 """
 import inspect
 import json
-import shutil
 import sys
-import tempfile
 from pathlib import Path
 
 import pytest
@@ -95,11 +93,11 @@ class BlankSummarizer:
 # --------------------------------------------------------------------------
 
 @pytest.fixture(scope="module")
-def tmp_root():
-    tmp = Path(tempfile.mkdtemp(prefix="marshall_h2_"))
+def tmp_root(tmp_path_factory):
+    #: pytest owns the lifetime -- see the note in tests/test_agent_hook.py
+    tmp = tmp_path_factory.mktemp("marshall_h2")
     (tmp / "doc.txt").write_text(DOC, encoding="utf-8")
-    yield tmp
-    shutil.rmtree(tmp, ignore_errors=True)
+    return tmp
 
 
 def build_agent(tmp_root: Path, name: str, **kwargs) -> AgentGraph:

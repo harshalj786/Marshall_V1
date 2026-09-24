@@ -24,9 +24,7 @@ No LLM and no Ollama: every assertion here is about Chroma and the message list.
 Compression (`UserMemory.invoke`) is the only part that needs a model, and it is not
 under test — H4 already covers it.
 """
-import shutil
 import sys
-import tempfile
 import warnings
 from pathlib import Path
 
@@ -46,11 +44,11 @@ QUERY = "what is my name?"
 
 
 @pytest.fixture(scope="module")
-def workspace():
-    tmp = Path(tempfile.mkdtemp(prefix="marshall_h6_"))
+def workspace(tmp_path_factory):
+    #: pytest owns the lifetime -- see the note in tests/test_agent_hook.py
+    tmp = tmp_path_factory.mktemp("marshall_h6")
     (tmp / "doc.txt").write_text(DOC, encoding="utf-8")
-    yield tmp
-    shutil.rmtree(tmp, ignore_errors=True)
+    return tmp
 
 
 def _memory(path, name, messages=None, **kwargs):

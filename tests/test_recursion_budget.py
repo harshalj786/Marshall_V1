@@ -13,9 +13,7 @@ due and N tool rounds is MEASURED to fail at 2N + 4 and pass at 2N + 5, so the f
 cannot go stale without this file noticing. No Ollama: the graph is built for real and
 only the model handles are replaced, as in tests/test_summarization_cycle.py.
 """
-import shutil
 import sys
-import tempfile
 from pathlib import Path
 
 import pytest
@@ -63,11 +61,11 @@ class FixedMemory:
 
 
 @pytest.fixture(scope="module")
-def tmp_root():
-    tmp = Path(tempfile.mkdtemp(prefix="marshall_budget_"))
+def tmp_root(tmp_path_factory):
+    #: pytest owns the lifetime -- see the note in tests/test_agent_hook.py
+    tmp = tmp_path_factory.mktemp("marshall_budget")
     (tmp / "doc.txt").write_text(DOC, encoding="utf-8")
-    yield tmp
-    shutil.rmtree(tmp, ignore_errors=True)
+    return tmp
 
 
 def build_agent(tmp_root: Path, tool_rounds: int) -> AgentGraph:
