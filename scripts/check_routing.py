@@ -245,28 +245,39 @@ def _final_narration(history, tool_names) -> list:
 # the agent under test
 # ==========================================================================
 
-def build_check_agent(file_path: Optional[str] = None, fresh: bool = False):
+def build_check_agent(file_path: Optional[str] = None,
+                      fresh: bool = False,
+                      vector_db_path: Optional[str] = None,
+                      user_history_path: Optional[str] = None,
+                      summary_path: Optional[str] = None):
     """The voice path's agent, with long-term memory pointed at a dedicated store.
 
     Every other argument is `voice_main`'s own constant, imported rather than copied: same
-    llama3.1 for generation AND the memory gate, same keep_alive, same document, same
-    already-ingested index. What this measures is therefore the agent the voice loop talks
-    to, not a lookalike built for the test.
+    llama3.1 for generation AND the memory gate, same keep_alive, same document. What this
+    measures is therefore the agent the voice loop talks to, not a lookalike built for it.
+
+    The three directories are parameters, defaulting to the constants above, for ONE reason:
+    run by hand this script should use its own stores as it always has, but the pytest gate
+    in tests/test_routing_matrix.py must not write anywhere the live voice pipeline or a
+    hand-run of this script reads. `db/voice_vdb` in particular is the live document index —
+    with it as the default, a suite running while a voice session is live put two processes
+    on one Chroma directory. The gate passes its own tmp paths; nothing else changes.
     """
     from pipeline_lg import AgentGraph
 
+    user_history = user_history_path or CHECK_USER_HISTORY_PATH
     if fresh:
-        shutil.rmtree(CHECK_USER_HISTORY_PATH, ignore_errors=True)
+        shutil.rmtree(user_history, ignore_errors=True)
     document = file_path or voice_main.DEFAULT_DOCUMENT
     return AgentGraph(
         file_path=document,
         mode_docs="pdf" if str(document).lower().endswith(".pdf") else "txt",
-        persist_directory_path=voice_main.VECTOR_DB_PATH,
+        persist_directory_path=vector_db_path or voice_main.VECTOR_DB_PATH,
         model=voice_main.VOICE_MODEL,
         memory_model=voice_main.VOICE_MODEL,
         keep_alive=voice_main.KEEP_ALIVE,
-        user_history_directory_path=CHECK_USER_HISTORY_PATH,
-        summary_persist_path=CHECK_SUMMARY_PATH,
+        user_history_directory_path=user_history,
+        summary_persist_path=summary_path or CHECK_SUMMARY_PATH,
     )
 
 

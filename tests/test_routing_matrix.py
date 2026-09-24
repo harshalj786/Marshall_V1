@@ -75,19 +75,31 @@ BOUNDARY_ROUTE = next(route for route in ROUTES if not route.must_pass)
 
 
 @pytest.fixture(scope="module")
-def results():
+def results(tmp_path_factory):
     """Build the agent once, seed memory once, run all six routes once.
 
     Module-scoped because the cost is the model, not the assertions: a per-test agent would
     re-open the index and re-seed six times over. Each route still gets its own thread, so
     sharing the agent shares no conversation.
 
-    `fresh=True` rebuilds the check's memory store from the seed every run. Determinism is
-    worth the second it costs: a store carrying rows from an earlier run — including, from
-    before H6 was fixed, the routes' own questions — would make the recall assertions pass
-    or fail on history rather than on this commit.
+    Every directory is this run's own tmp, and that is the point: the script's defaults are
+    `db/voice_vdb` (the LIVE voice document index) and `db/routing_check_*`, which a hand-run
+    of scripts/check_routing.py also uses. A suite that wrote there raced the live pipeline
+    for one Chroma directory and mutated data a manual run depends on. The index is rebuilt
+    from the same `voice_main.DEFAULT_DOCUMENT` with the same loader and chunking, so what is
+    measured is unchanged — it costs one ingest of that document per module (~6s), which is
+    small beside the model time these routes already spend.
+
+    A tmp store is also fresh by construction, so the determinism `fresh=True` used to buy —
+    no rows from an earlier run, in particular the routes' own questions from before H6 —
+    now comes from the directory itself.
     """
-    agent = build_check_agent(fresh=True)
+    root = tmp_path_factory.mktemp("routing_check")
+    agent = build_check_agent(
+        vector_db_path=str(root / "vdb"),
+        user_history_path=str(root / "user_history"),
+        summary_path=str(root / "summaries"),
+    )
     seed_memory(agent)
     return {route.name: run_route(agent, route) for route in ROUTES}
 
