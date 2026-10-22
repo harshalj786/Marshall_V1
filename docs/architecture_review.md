@@ -1,5 +1,18 @@
 # Marshall V1 — Architecture Review
 
+## Current Status — 2026-10-22
+
+*Synced against `49c4231`. A pointer into the detail below, not a summary of it.*
+
+- **Voice, V1a (`62f9176`) — the pipe cleaner.** Open mic → silero VAD endpoint → faster-whisper → the unchanged synchronous `AgentGraph.invoke` → Kokoro → playback, one utterance at a time, one telemetry row per turn. `python voice_main.py`.
+- **Voice, V1b (`c041d30`) — barge-in.** Sustained speech while Marshall is SPEAKING stops playback at sentence granularity; the stored answer is truncated to what was actually played plus `[interrupted by user]`; the interrupting words become the next utterance. THINKING stays uninterruptible by design. `--barge-in off` for speakers (no echo cancellation). Boot now warms llama3.1 with a throwaway turn. See §10.
+- **Tests:** 252 collected across 13 files in `tests/` (`pytest --collect-only`, this sync). **Not executed this sync — pass/fail unverified.** The last recorded run is `c041d30`'s *240 passed, 1 xfailed*; the 11 tests added since (`test_agent_hook`, `test_recursion_budget`, `test_no_control_plane_imports`) have no recorded run in a commit message. The one xfail is by design — the no-tool routing row (R4's `KNOWN-BOUNDARY`). Model- and GPU-dependent tests skip where Ollama, llama3.1 or CUDA are absent, and CI deselects `needs_ollama`.
+- **Warm agent latency:** **1.3–8.4 s** across the five must-pass routes (`recall_user_memory` 1.3 s → `wikipedia_lookup` 8.4 s; the no-tool row 10.5 s), from the routing matrix. `voice_logs/turns.jsonl` holds exactly **one** row — V1a's turn 1, `agent_ms = 10102` — and that is a cold-start artifact that includes Ollama loading the model, not a baseline. No warm voice row has been logged yet. See §10's latency baseline.
+- **Highest-severity open finding:** **R8 — the checkpointer.** `AgentGraph` now *accepts* an injected checkpointer (`d879bab`), but the default is still the in-RAM `MemorySaver` and the `SqliteSaver` lifecycle is unsolved.
+- **What gates the next increment:** the **live acoustic tuning run**. V1b's two guard parameters — `barge_in_vad_threshold = 0.7` and `barge_in_sustained_ms = 300` (`voice/config.py`) — are labelled unmeasured guesses, and `turns.jsonl` has **no V1b rows at all**, so barge-in telemetry (`was_interrupted`, `sentences_played`, `time_to_silence_ms`) is **not yet measured**. The run is what corrects them.
+
+---
+
 **Scope of this review:** every Python file in the repository read in full (`pipeline.py` 377 L, `pipeline_lg.py` 617 L, `ingestion/doc_loader.py` 78 L, `ingestion/chunking.py` 42 L, `ingestion/vector_db.py` 21 L, `retreival/retrieval.py` 89 L, `memory/long_term_memory.py` 64 L, `tools/tools.py` 178 L, `tools/__init__.py` 15 L, three empty package `__init__.py` files), plus `README.md`, `WHAT_I_BUILT.md`, all ten `docs/*.md`, `labbb.ipynb`, `.gitignore`, `.claude/settings.local.json`, and the uncommitted diff on `pipeline.py`.
 
 **Status:** living document. Findings are kept after they are resolved, marked `[FIXED]` with the change that closed them, so the history of *why* the code looks the way it does stays readable.
@@ -14,19 +27,23 @@
 | **H4** — divergent error handling between the memory gates | `[FIXED]` — `pipeline_lg.py` |
 | **H2** — unbounded agent context | `[FIXED]` — `pipeline_lg.py`, `memory/reconciliation.py` |
 | **R1** — retrieval welded to index construction | `[FIXED]` — `ingestion/ingest.py`, `ingestion/vector_db.py`, `retreival/retrieval.py` |
-| **K / M10** — network tools with no timeout | `[PARTIALLY FIXED]` — `tools/tools.py` (10 s budget; no output-size cap) |
+| **K** — network tools with no timeout, backoff, or rate-limit handling | `[PARTIALLY FIXED]` — `tools/tools.py` (10 s budget; no backoff, no rate-limit detection) |
+| **M10** — no output-size cap or timeout on any tool | `[FIXED]` — `tools/tools.py` (10 s budget; 8,000-char cap on `wikipedia_lookup` and `search_current_doc`, `d879bab`) |
 | **R4 routing caveat** — tool selection verified once, by hand | `[FIXED]` — `scripts/check_routing.py`, `tests/test_routing_matrix.py` |
 | **H6** — memory written from the constructor, so reads wrote too | `[FIXED]` — `memory/long_term_memory.py`, `pipeline_lg.py` |
-| **R8** — checkpointer still `MemorySaver` (H2's remaining half) | open |
-| **H3, H5, M1–M9, L1–L14** | open |
+| **§10 startup cost** — ingestion and MiniLM load ahead of the first word | `[FIXED]` — R1 for ingestion; `warmup.py` + `voice_main.boot` for the model loads |
+| **R8** — checkpointer still `MemorySaver` (H2's remaining half) | open — `AgentGraph(checkpointer=...)` seam landed (`d879bab`); default still `MemorySaver`, `SqliteSaver` lifecycle unsolved |
+| **R9** — decide the fate of `pipeline.py` | open — undecided; `pipeline.py` untouched since `5b2c04f` |
+| **M1, M2** — seven-way ingestion block; no `BuildKnowledge` singleton | `[PARTIALLY FIXED — see R1]` — six of seven sites and the singleton; `Structure_pipeline` and the two embeddings import paths remain |
+| **H3, H5, M3–M9, L1–L14** | open |
 
-All three criticals plus H1, H2 and H4 are closed. **H2's second half is not, and it is the half that loses data.** The agent's context no longer grows without bound — `summarize_and_trim` sees to that — but `MemorySaver` is still in-RAM and still per-object, so every checkpoint of every thread dies with the process. The only thing that survives a restart today is `{summary_persist_path}/conversation_summary.json`, reloaded by `invoke` when a thread has no in-RAM history; the message list itself, the turn count and the compressed profile do not. `SqliteSaver` (R8, `docs/roadmap.md` Phase 1, already specified by `docs/tech_stack.md` §2) is what remains of H2. ~~**H6** (`UserMemory` writes from its constructor) is now the highest-severity fully-open finding.~~ `[FIXED]` H6 is closed — construction opens, `.index()` writes, and the recall tool holds a read-only handle. It was closed *because* it stopped being theoretical: the routing gate caught the read path retrieving the query it had just written. **R8 is now the highest-severity open finding**, and the two remaining HIGHs (H3, H5) are both in `pipeline.py`.
+All three criticals plus H1, H2 and H4 are closed. **H2's second half is not, and it is the half that loses data.** The agent's context no longer grows without bound — `summarize_and_trim` sees to that — but `MemorySaver` is still in-RAM and still per-object, so every checkpoint of every thread dies with the process. The only thing that survives a restart today is `{summary_persist_path}/conversation_summary.json`, reloaded by `invoke` when a thread has no in-RAM history; the message list itself, the turn count and the compressed profile do not. `SqliteSaver` (R8, `docs/roadmap.md` Phase 1, already specified by `docs/tech_stack.md` §2) is what remains of H2. ~~**H6** (`UserMemory` writes from its constructor) is now the highest-severity fully-open finding.~~ `[FIXED]` H6 is closed — construction opens, `.index()` writes, and the recall tool holds a read-only handle. It was closed *because* it stopped being theoretical: the routing gate caught the read path retrieving the query it had just written. **R8 is now the highest-severity open finding**, and the two remaining HIGHs (H3, H5) are both in `pipeline.py`. *(As of `d879bab` `AgentGraph` takes a `checkpointer` argument, so a durable saver can be injected without touching a call site — but the default is unchanged and the lifecycle problem R8's trade-off predicted is now written into the class docstring as `UNSOLVED`. The two chat graphs still construct their own `MemorySaver`. R8 stays open; see its entry in §9.)*
 
 R1 is listed in the table because its structural half is now closed too: ingestion is an explicit step (`ingestion/ingest.py`) and `Retrival` can open a collection it did not build. That was the first item in the §10 voice sequencing, and it is what M1 and the startup-cost finding both rested on.
 
 The repository also now has its first tests, in `tests/` — see the H4, H2 and R1 resolutions. One of them is a different kind: `tests/test_routing_matrix.py` and `scripts/check_routing.py` run the **real** llama3.1 and assert which tool it chose, which is what closes the standing R4 worry that routing was verified once and would rot unwatched.
 
-**Note on line references:** the H1 fix restructured the prompt constants at the top of `pipeline_lg.py`, so line numbers cited in §1–§7 for anything above `ChatRagGraph` have shifted. Symbol names are still accurate.
+**Note on line references:** the H1 fix restructured the prompt constants at the top of `pipeline_lg.py`, so line numbers cited in §1–§7 for anything above `ChatRagGraph` have shifted. Symbol names are still accurate. *(Since then `pipeline_lg.py` has grown from the 617 lines this review read to 1,214 — H2's trim cycle, H6's read funnel, V1b's `truncate_last_response`, the `agent_hook` seam and the recursion budget — and `tools/tools.py` from 178 to 303. Treat every line number cited for those two files as approximate; search by symbol.)*
 
 **Note on `WHAT_I_BUILT.md`:** it is stale. It claims "`tools/tools.py` is empty — a stub I haven't filled in yet" (line 154, 161) and describes `UserMemory`'s collection as `"user's_history"` (line 101). Both are false as of the current tree — `tools/tools.py` holds five working tools, and the collection default is `"user_history"`. `README.md` is the accurate document.
 
@@ -39,6 +56,8 @@ The repository also now has its first tests, in `tests/` — see the H4, H2 and 
 Marshall is a **layered, locally-hosted RAG system with two generations of orchestration living side by side**. The bottom three layers (ingestion, vector storage, retrieval) are shared and generation-agnostic. The top layer exists twice: a legacy LangChain `Runnable` chain implementation in `pipeline.py`, and a LangGraph state-machine implementation in `pipeline_lg.py`. Both drive the same Ollama-hosted local models and the same ChromaDB stores.
 
 There is no server, no CLI entry point, no `main.py`, and no dependency manifest. Every consumer is a Python import — from `labbb.ipynb` or from an interactive interpreter. The `while True: input(...)` REPLs inside the pipeline classes *are* the application shell.
+
+> **No longer true.** The manifest landed under C3. There are now two CLI entry points: `voice_main.py` (V1a/V1b — the voice session, `--check`, `--list-devices`) and `scripts/check_routing.py` (R4's routing gate). Still no server and no `main.py`; the text REPLs are unchanged.
 
 ### Design philosophy
 
@@ -87,7 +106,7 @@ Three compiled graphs, all with `MemorySaver` checkpointers, detailed in §5.
 
 - `ChatRagGraph`: `START → retrieve → generate → END`.
 - `ChatRagWithMemoryGraph`: `START → retrieve → (gate) → {summarize_user_history → generate | generate} → trim_history → END`.
-- `AgentGraph`: `START → count_turn → (gate) → {summarize_user_history → agent | agent}`, then the ReAct cycle `agent → (tools_condition) → {tools → agent | END}`.
+- `AgentGraph`: `START → count_turn → (gate) → {summarize_user_history → agent | agent}`, then the ReAct cycle `agent → (tools_condition) → {tools → agent | END}`. *[CHANGED — see H2 and §5]* `count_turn` now routes to `summarize_and_trim | summarize_user_history | agent` through one router, and an optional caller-supplied `agent_hook` node can sit on `agent`'s outgoing edge.
 
 ### RAG pipeline
 
@@ -114,7 +133,7 @@ Every branch returns `{"query", "context", "mode"}` where `context` is a `list[D
 6. `ChatOllama(model=..., temperature=0).bind_tools(self.tools)` — **must come after step 4** (459-460).
 7. Compile the graph with `ToolNode(self.tools)` (546-563).
 
-`AgentGraph.invoke` (565-582) reads the checkpointer to see whether the thread exists; if not, it prepends a `SystemMessage`; appends the `HumanMessage`; caps `recursion_limit` at 25 (default is 10 000, so an oscillating tool loop would otherwise burn ~10 000 Ollama calls); and finally extracts the last `AIMessage` **that has no `tool_calls`** (577-580) so a tool-call stub is never returned as the answer.
+`AgentGraph.invoke` (565-582) reads the checkpointer to see whether the thread exists; if not, it prepends a `SystemMessage`; appends the `HumanMessage`; caps `recursion_limit` at 25 (default is 10 000, so an oscillating tool loop would otherwise burn ~10 000 Ollama calls) — *[CHANGED, `15478f6`] now `DEFAULT_RECURSION_LIMIT = 30`, derived as 2N + 5 supersteps at `MAX_TOOL_ROUNDS = 11`, because 25 did not cover eleven tool rounds on a turn where both gates fired; pinned by `tests/test_recursion_budget.py`*; and finally extracts the last `AIMessage` **that has no `tool_calls`** (577-580) so a tool-call stub is never returned as the answer.
 
 ### Memory workflow
 
@@ -162,6 +181,8 @@ tools/__init__.py          → tools.tools (re-export)
 ```
 
 **No circular dependencies exist.** The import graph is a clean DAG. `ingestion/`, `memory/`, and `tools/` are all leaves; only `retreival/` reaches sideways into `ingestion/`.
+
+> **Since this was written, three edges were added and the DAG still holds.** `ingestion/ingest.py` composes `doc_loader`, `chunking` and `vector_db` and imports nothing above `ingestion/` (R1). `voice/` modules import only each other and third-party audio/model packages; `voice_main.py` is the only file that joins them to `pipeline_lg`, `memory.long_term_memory` and `warmup`, and nothing imports `voice/` or `voice_main.py`. `warmup.py` imports both embedding singletons and is imported only by `voice_main.py`. Separately, `tests/test_no_control_plane_imports.py` scans every `.py` file to keep the dependency on the external control-plane repo one-way: the wiring that briefly lived here (`d879bab`) was moved out in `d9ef30e`, and only the `agent_hook` seam remains.
 
 ### Implicit couplings (not visible in the import graph)
 
@@ -321,7 +342,7 @@ There is no `trim_history` node in `_build_graph` (546-563) — a deliberate cho
 >
 > **Name, docstring and signature are byte-identical to the pre-timeout versions,** and `tests/test_voice_prep.py` pins them against hard-coded literals captured from the old code. That is not tidiness: R4 measured tool routing against exactly these strings, and §7 is explicit that the docstrings are prompt engineering rather than documentation. The timeout wraps execution only.
 >
-> *Still open:* no backoff, no rate-limit detection, and no output-size cap (M10). A DDG rate-limit still surfaces as a string the model may narrate, and `wikipedia_lookup(k=3)` can still return tens of thousands of characters — now merely within 10 s.
+> *Still open:* no backoff, no rate-limit detection, ~~and no output-size cap (M10)~~. A DDG rate-limit still surfaces as a string the model may narrate~~, and `wikipedia_lookup(k=3)` can still return tens of thousands of characters — now merely within 10 s~~. `[FIXED — size cap, see M10]`
 
 **L. Chat graphs retrieve unconditionally.**
 `pipeline_lg.py:99-106` and `208-218` run a vector search for every turn including `"hi"`. Under `mqr` that is 6 model/store calls to answer a greeting.
@@ -336,7 +357,7 @@ There is no `trim_history` node in `_build_graph` (546-563) — a deliberate cho
 | `retreival/retrieval.py:26-27` | Chroma / embedding / disk failures propagate out of `Retrival.__init__`, i.e. out of every pipeline and graph constructor, leaving a half-built object. |
 | `pipeline.py:66, 128, 215, 226` | No try/except around any Ollama call. A dropped connection terminates the REPL loop and discards `chat_history`. |
 | `pipeline_lg.py:226-232` | `[FIXED — see H4]` `ChatRagWithMemoryGraph._summarize_user_history_node` had **no** try/except, while the structurally identical `AgentGraph._summarize_user_history_node` (519-523) wraps `memory.invoke` and comments *"a memory failure must never destroy the user's turn"*. The right lesson was learned in one class and not backported to the other. |
-| `tools/tools.py:70` | `import wikipedia` sits **outside** the `try` at 74. If the package is missing, `ImportError` escapes the tool's own error handling and propagates through `ToolNode`. |
+| `tools/tools.py:70` | `import wikipedia` sits **outside** the `try` at 74. If the package is missing, `ImportError` escapes the tool's own error handling and propagates through `ToolNode`. *(Still true: it moved into `_wikipedia_lookup_body`, still ahead of the `try`, and `_run_with_timeout` re-raises it deliberately — its docstring says so. M9 stays open.)* |
 | `pipeline_lg.py:141, 292, 582` | All three `invoke` methods return `""` when no matching `AIMessage` is found. A silent empty string is indistinguishable from a legitimately empty answer. |
 | `memory/long_term_memory.py:58` | With an empty history, `"\n".join([])` is `""` — the model is asked to compress nothing and will invent a profile. |
 
@@ -348,7 +369,7 @@ There is no `trim_history` node in `_build_graph` (546-563) — a deliberate cho
 - Model `"mistral"`, `temperature=0` — `pipeline.py:64, 112, 196, 342`; `pipeline_lg.py:89, 193`; `retreival/retrieval.py:22`; `memory/long_term_memory.py:50`. Seven sites.
 - Embedding model name `"sentence-transformers/all-MiniLM-L6-v2"` — `ingestion/vector_db.py:11`, `ingestion/chunking.py:15`, `memory/long_term_memory.py:20`.
 - Memory cadence and trim threshold — `pipeline.py:214, 219, 220, 229`; `pipeline_lg.py:222, 257`. `AgentGraph` correctly parameterizes this as `memory_every_n_turns` (414); the other four call sites do not.
-- `recursion_limit=25` — `pipeline_lg.py:570`.
+- `recursion_limit=25` — `pipeline_lg.py:570`. *[CHANGED]* Now the named module constant `DEFAULT_RECURSION_LIMIT = 30`, derived from the graph's worst-case turn and overridable per call via `config["recursion_limit"]`.
 - `k=4`, `lambda_mult=0.5` defaults — roughly eight sites across `pipeline.py`, `pipeline_lg.py`, `tools/tools.py:115`.
 - Collection name `f"VDB for {file_path}"` — `pipeline.py:33, 90, 158, 269`; `pipeline_lg.py:86, 189, 426`.
 - `thread_id` fallback `"default"` — ten sites.
@@ -438,6 +459,8 @@ These are the three that pay for themselves; the rest of the codebase does *not*
 - The explicit path map on `tools_condition` (561). Without it LangGraph treats every node as a possible target, discarding graph-shape validation and drawing phantom edges in `get_graph()` (comment 559-560).
 - `_memory_gate` (504-510) guards `if not n or n <= 0` **before** the modulo, so `memory_every_n_turns=0` disables the gate rather than raising `ZeroDivisionError`.
 
+> **Current topology (as of `49c4231`).** The table above predates two additions. **H2** added a `summarize_and_trim` node: `count_turn` now leaves through a single router, `_should_summarize`, to `summarize_and_trim | summarize_user_history | agent` — one router rather than two conditional edges, because two would fan out and run both gates in parallel on the same list — and `summarize_and_trim` then routes on through `_memory_gate`. **`d879bab`** added `agent_hook=(node, router)`: when supplied, `agent → agent_hook → {tools | agent | END}`, with the router returning one of three verdicts (`proceed`, `revise`, `stop`) that `AgentGraph` maps onto its own node names, so no node name reaches the caller; `proceed` delegates to `tools_condition`, and an unknown verdict raises rather than ending the turn. **With no hook the edges are exactly as listed above**, and the explicit-path-map discipline carries over to the hooked edge. `tests/test_agent_hook.py` pins both claims.
+
 ### State schema
 
 **`ChatState`** (`pipeline_lg.py:26-33`)
@@ -453,6 +476,8 @@ These are the three that pay for themselves; the rest of the codebase does *not*
 
 **`AgentState`** (`pipeline_lg.py:381-385`) carries only `messages`, `turn_count`, `user_history_summary`. **It has no `context` field** — the agent reaches the document exclusively through `search_current_doc`. This is the cleaner of the two schemas: nothing per-turn is persisted, so there is no stale scratch data to invalidate.
 
+> *[CHANGED]* It now also carries `running_summary` and `summary_turns_since` (H2 — durable conversation state, not scratch) and `hook_state` (`d879bab`, renamed from `risk_state` in `64356a9`) — caller-owned space with a last-write-wins reducer that nothing in this module reads or writes, kept in state so it goes through the checkpointer. Still no `context`, and none of Marshall's own fields is per-turn scratch, so the property above holds.
+
 `ChatState` mixes three categories that should be separated: durable conversation (`messages`, `turn_count`, `user_history_summary`), per-turn scratch (`query`, `context`), and configuration (`k`, `lambda_mult`). Only the first belongs in a checkpointed state; the third belongs in `config["configurable"]`.
 
 ### Checkpoint behavior
@@ -463,6 +488,8 @@ These are the three that pay for themselves; the rest of the codebase does *not*
 - **No `interrupt()` anywhere in the repository** — confirmed by grep. `docs/roadmap.md` Phase 2 and `docs/vision.md` both make native Human-in-the-Loop a headline V2 feature; none of the scaffolding exists yet.
 - `docs/tech_stack.md` §2 specifies `SqliteSaver`; the code uses `MemorySaver`. A known, documented gap.
 
+> *[PARTIALLY CHANGED, `d879bab`]* `AgentGraph` takes `checkpointer: Optional[BaseCheckpointSaver] = None` and constructs its own `MemorySaver()` only when none is passed — deliberately not a `= MemorySaver()` default, which would be evaluated once at import and shared by every instance. Consequences (a)–(c) above therefore still describe the **default** `AgentGraph` and both chat graphs, which still hard-code `MemorySaver()`. The durable case is not solved, only made possible: the class docstring records as `UNSOLVED` that `SqliteSaver` is a context manager and this constructor offers no scope for the caller's `with` to span. See R8.
+
 ### How tool execution integrates with the graph
 
 The integration is textbook-correct and the ordering constraints are real:
@@ -470,7 +497,7 @@ The integration is textbook-correct and the ordering constraints are real:
 1. `self.tools` must be complete before `bind_tools` (`pipeline_lg.py:446-450` then `460`) — the comment at 459 says so explicitly.
 2. `ToolNode(self.tools)` (551) reads the same list, so the executor and the model's schema can never drift.
 3. `tools_condition` (561) is LangGraph's prebuilt predicate over the last `AIMessage.tool_calls`.
-4. `tools → agent` (562) closes the ReAct loop; `recursion_limit=25` (570) bounds it.
+4. `tools → agent` (562) closes the ReAct loop; `recursion_limit=25` (570) bounds it. *(Now `DEFAULT_RECURSION_LIMIT = 30` — see §1.)*
 5. `recall_user_memory` uses `Annotated[dict, InjectedState]` and `RunnableConfig` (`tools/tools.py:144-145`) so `ToolNode` populates `state` and `config` while hiding both from the model's tool schema — the LLM only ever sees `query` and `k`.
 6. `AgentGraph.invoke` (577-580) filters for an `AIMessage` **without** `tool_calls`, so a tool-call stub is never returned as the user-visible answer.
 7. The system prompt is generated from the same conditional as the tool list (454-457), enforcing the invariant that the prompt describes exactly the bound tools.
@@ -624,7 +651,7 @@ Tool *results* are always `ToolMessage`s carrying a string. Errors are strings t
 2. **Optional tools require a bespoke splice pattern.** The `_RECALL_TOOL_ENTRY`/`_RECALL_GUIDELINES`/`{recall_tool_entry}`/`{recall_guidelines}` mechanism is four coordinated pieces per optional tool. It does not generalize — a second optional tool means a second quadruple.
 3. **`AGENT_SYSTEM_PROMPT` (367-370) is a module constant computed at import time with recall enabled.** It is exported "for callers/tests" but is *not* what a `enable_recall_tool=False` agent uses (which computes its own at 454-457). A test asserting against the constant tests the wrong prompt.
 4. **Factory tools cannot be registered statically** — they need agent state, so they can only be constructed inside `AgentGraph.__init__`, which is why the tool list can't move to `tools/`.
-5. **No shared tool infrastructure.** Each tool reimplements its own try/except-to-string, its own retry (`wikipedia_lookup` retries twice; `web_search` doesn't), its own result formatting. No output-size cap — `wikipedia_lookup` with `k=3` can return tens of thousands of characters straight into the context. Timeouts are now the one piece that *is* shared: `_run_with_timeout` (§4-K) is a single helper both network tools call, and it is the obvious seed for the rest of this if a `@timed_tool` decorator or the R7 registry ever lands.
+5. **No shared tool infrastructure.** Each tool reimplements its own try/except-to-string, its own retry (`wikipedia_lookup` retries twice; `web_search` doesn't), its own result formatting. ~~No output-size cap — `wikipedia_lookup` with `k=3` can return tens of thousands of characters straight into the context.~~ `[FIXED — see M10]` Timeouts are now the one piece that *is* shared: `_run_with_timeout` (§4-K) is a single helper both network tools call, and it is the obvious seed for the rest of this if a `@timed_tool` decorator or the R7 registry ever lands. *(No longer the only one: `_cap_output` is a second shared helper, called by `wikipedia_lookup` and `search_current_doc`.)*
 6. **`recall_user_memory` is not unit-testable in isolation** — `InjectedState` means it only works inside a `ToolNode`.
 7. **Only `AgentGraph` has tools.** The two chat graphs and all four `pipeline.py` classes cannot use them.
 8. **The tool count itself has a measured cost.** `README.md:261-265` records that adding the fifth tool costs roughly one spurious call per four conversational turns on llama3.1. Tool-set growth is not free on an 8B model, and the codebase is the rare one that has actually measured it.
@@ -667,7 +694,7 @@ No `requirements.txt`, `pyproject.toml`, `setup.py`, `Pipfile`, or lock file any
 >
 > Verified by a live injection attempt, not by inspection alone: a document instructing the model to reply only `ZZPWNEDZZ` was ingested and queried, and the model returned the document's actual content instead. Structural assertions confirm the context appears in the human turn and never in the system message, and that the fenced block does not accumulate into stored history — `_generate_node` still records the bare query.
 >
-> **Still open in `pipeline.py`.** All four legacy classes retain the original pattern. Left untouched deliberately: that file holds uncommitted work in progress and `Structure_pipeline` is a known placeholder. Fix it there if the LangChain generation is kept — see R9 on deciding its fate first.
+> **Still open in `pipeline.py`.** All four legacy classes retain the original pattern. Left untouched deliberately: that file holds uncommitted work in progress and `Structure_pipeline` is a known placeholder. Fix it there if the LangChain generation is kept — see R9 on deciding its fate first. *(At `49c4231` the working tree is clean, so `pipeline.py` currently holds no uncommitted work; its last change is `5b2c04f`. What keeps it untouched now is that R9 is undecided and `Structure_pipeline` is still a placeholder.)*
 
 **H2. Unbounded context growth in `AgentGraph` plus an unbounded in-RAM checkpointer.** `[FIXED — context growth; MemorySaver still in RAM]`
 No trim node in `_build_graph` (546-563), by design (`README.md:267-269`); `MemorySaver` at 461.
@@ -685,7 +712,7 @@ No trim node in `_build_graph` (546-563), by design (`README.md:267-269`); `Memo
 >
 > **Verified.** `tests/test_reconciliation.py` (11 tests, pure) and `tests/test_summarization_cycle.py` (23 tests, real graph and real `ToolNode` with faked model handles) — cadence, list replacement, the tool-pair walk-back, the failure/retry contract, disk persistence and reload across a fresh graph. The two tool-boundary tests were re-run against a naive `min(target, len)` cut and both fail there, so they are load-bearing. The compressor prompt was also exercised against a live model end to end.
 >
-> *Still open:* the checkpointer. `MemorySaver` still holds every checkpoint of every thread in RAM and still loses everything at exit — the summary file is currently the only thing that survives a restart. `SqliteSaver` (`docs/roadmap.md` Phase 1) is the fix and is untouched here.
+> *Still open:* the checkpointer. `MemorySaver` still holds every checkpoint of every thread in RAM and still loses everything at exit — the summary file is currently the only thing that survives a restart. `SqliteSaver` (`docs/roadmap.md` Phase 1) is the fix and is untouched here. *(Still true by default at `49c4231`; `AgentGraph` can now be handed a checkpointer — see R8.)*
 >
 > *Known cost:* the first cycle of a conversation drops only one message (at 16 messages, keeping 14), so it pays a compression call for very little. Every later cycle drops a full interval. Raising `summary_keep_recent` or lowering `summarize_every_n_turns` shifts where that lands; the warm-up call itself is not worth a special case.
 
@@ -727,9 +754,9 @@ No trim node in `_build_graph` (546-563), by design (`README.md:267-269`); `Memo
 
 ### MEDIUM
 
-**M1. The ingestion block is duplicated seven times.** `pipeline.py:25-33, 82-90, 150-158, 261-269`; `pipeline_lg.py:79-88, 182-191, 419-428`. Any ingestion change is a seven-site edit.
+**M1. The ingestion block is duplicated seven times.** `[PARTIALLY FIXED — see R1]` `pipeline.py:25-33, 82-90, 150-158, 261-269`; `pipeline_lg.py:79-88, 182-191, 419-428`. Any ingestion change is a seven-site edit. *Six of the seven now call `ensure_ingested(...)`; `Structure_pipeline` is the seventh, left on the old path on purpose.*
 
-**M2. Two `HuggingFaceEmbeddings` classes and no singleton in `BuildKnowledge`.** `ingestion/vector_db.py:1` vs `ingestion/chunking.py:3` / `memory/long_term_memory.py:6`; construction at `ingestion/vector_db.py:10-12`. Duplicate model loads; one import path is deprecated.
+**M2. Two `HuggingFaceEmbeddings` classes and no singleton in `BuildKnowledge`.** `[PARTIALLY FIXED — see R1]` `ingestion/vector_db.py:1` vs `ingestion/chunking.py:3` / `memory/long_term_memory.py:6`; construction at `ingestion/vector_db.py:10-12`. Duplicate model loads; one import path is deprecated. *`BuildKnowledge` has its singleton now (§4-B). The two import paths, and therefore two separate singletons over the same model, remain — R10.*
 
 **M3. Deprecated `langchain_community.llms.Ollama` in four files.** `pipeline.py`, `pipeline_lg.py:11`, `retreival/retrieval.py:6`, `memory/long_term_memory.py:7`. The deprecation warning is already visible in `labbb.ipynb`, and the notice says removal in LangChain 1.0.0 — which the project has effectively already moved to (`langchain-core>=1.2.13` per the settings allowlist).
 
@@ -745,7 +772,11 @@ No trim node in `_build_graph` (546-563), by design (`README.md:267-269`); `Memo
 
 **M9. `import wikipedia` sits outside its try block.** `tools/tools.py:70` vs the try at 74. `ImportError` escapes the tool's error contract.
 
-**M10. No output-size cap or timeout on any tool.** `[PARTIALLY FIXED]` `tools/tools.py` throughout. `wikipedia_lookup(k=3)` can inject tens of thousands of characters into the context in one `ToolMessage`. The **timeout** half is closed — both network tools now run under a 10 s budget (§4-K) — and it is the half that mattered for voice. The **size cap** is untouched: a tool result is still unbounded, which is a context-window and latency cost rather than a dead-air one.
+**M10. No output-size cap or timeout on any tool.** ~~`[PARTIALLY FIXED]`~~ `[FIXED]` `tools/tools.py` throughout. `wikipedia_lookup(k=3)` can inject tens of thousands of characters into the context in one `ToolMessage`. The **timeout** half is closed — both network tools now run under a 10 s budget (§4-K) — and it is the half that mattered for voice. ~~The **size cap** is untouched: a tool result is still unbounded, which is a context-window and latency cost rather than a dead-air one.~~
+
+> **Resolution (the size cap, `d879bab`; comment reworded in `6473dbd`).** `TOOL_OUTPUT_MAX_CHARS = 8000`, applied by `_cap_output` to `wikipedia_lookup` and `search_current_doc` — the two whose size `k` does not bound. The comment records the measurements: `wikipedia_lookup` at its default `k=3` returned 12,004 chars, `search_current_doc` at `k=50` 17,976, and at its default `k=4` only 999–1,813, so the cap never fires on the common document path. The cut backs off to a paragraph, line or word boundary past the halfway mark, and a truncation notice is appended — visible on purpose, so the model knows it saw a prefix. Characters rather than tokens, so `tools/` stays a leaf with no tokenizer import. Tool names, docstrings and signatures did not change, so R4's routing measurement still applies.
+>
+> *Not capped:* `web_search` (its `k` snippets are short by construction) and `recall_user_memory`. *Not tested:* no file in `tests/` references `_cap_output` or `TOOL_OUTPUT_MAX_CHARS`, so the cap is pinned by nothing.
 
 **M11. `mode_docs="scanned_pdf"` is broken in the working environment.** `[FIXED]` `ingestion/doc_loader.py:33-38`. `pdfplumber` was not installed, so `PDFPlumberLoader` imported fine (langchain defers the underlying import) and then raised `ImportError: pdfplumber package not found` at `.load()`. Verified by running it, not inferred from the import list. `README.md:280` and `WHAT_I_BUILT.md:63` both advertise the mode as working. *Discovered while pinning dependencies.*
 
@@ -887,11 +918,15 @@ All preserve current behavior. **Not implemented — recommendations only.** Ord
 *Change:* make the checkpointer a constructor parameter defaulting to `MemorySaver`, so `SqliteSaver` (or `AsyncSqliteSaver`) can be injected.
 *Trade-off:* `SqliteSaver` requires context-manager lifecycle management, which the current constructor-owns-everything pattern doesn't accommodate. Every `get_state` call (four sites in `AgentGraph`) becomes real I/O; `AgentGraph.invoke:571` does one per turn.
 
+> **The change half landed in `d879bab`; the trade-off is what is left, so R8 stays open.** `AgentGraph.__init__` takes `checkpointer` and falls back to a per-instance `MemorySaver()` — exactly the change above, for `AgentGraph` only; `ChatRagGraph` and `ChatRagWithMemoryGraph` still construct their own. The trade-off was predicted correctly: the class docstring now says `UNSOLVED`, because `AgentGraph(checkpointer=SqliteSaver.from_conn_string(...))` cannot work when `__exit__` closes the connection and nothing gives the caller's `with` a scope spanning the agent's lifetime. Nothing in the repository injects a durable saver — `voice_main.build_agent` passes none, so a voice session still loses its message list at exit and survives only through H2's `conversation_summary.json`. The `get_state` count also grew by one: V1b's `truncate_last_response` reads history before it writes. **Still the highest-severity open finding.**
+
 ### R9. Delete or fix `Structure_pipeline`; deduplicate `pipeline.py`
 
 *Problem:* H5 — broken and 95% duplicated.
 *Change:* the four pipeline classes differ only in prompts and a memory flag. One class parameterized by a prompt pair plus `enable_memory` would replace all four.
 *Trade-off:* `pipeline.py` is the legacy generation and `Structure_pipeline` is explicitly a placeholder. Investment here may be wasted if the LangChain generation is retired outright — which is the more likely trajectory given `pipeline_lg.py` already covers every non-`Structure_pipeline` case. **Recommend deciding the fate of `pipeline.py` before spending effort on it.**
+
+> *Status at `49c4231`: still undecided.* `pipeline.py` has not changed since `5b2c04f`, H5's variable mismatch is still there (`MessagesPlaceholder("Chat_history")` and `{transcript}` in the template, `chat_history_placeholder` at the invoke), and its three `UserMemory(...)` sites still lack the `.index()` call H6 made necessary, so legacy sessions still write no memory.
 
 ### R10. Standardize on `langchain_ollama` and one embeddings import
 
@@ -905,16 +940,27 @@ All preserve current behavior. **Not implemented — recommendations only.** Ord
 
 The blunt finding: **there is not a single `async`, `await`, `ainvoke`, `astream`, or `interrupt(` token anywhere in the repository** (verified by grep across all `.py` files). Marshall is entirely synchronous, request-response, and terminal-bound.
 
+> *[CHANGED — V1a/V1b]* The repository-wide claim is no longer true; the claim about the agent is. `voice/orchestrator.py` and `voice_main.py` run an `asyncio` loop, but only *above* the graph: `agent.invoke` is called through `run_in_executor`, and a re-grep at `49c4231` finds no `async`, `await`, `ainvoke`, `astream` or `interrupt(` in `pipeline_lg.py`, `tools/`, `memory/`, `retreival/` or `ingestion/`. The agent is still entirely synchronous and request-response. It is no longer only terminal-bound.
+
 That said, the *graph topology* is not the obstacle. The obstacle is the layer directly above and below it.
+
+### What is built (as of `49c4231`)
+
+The assessment below was written before any voice code existed and is kept as written, with in-place markers where the code has since moved. What actually exists:
+
+- **V1a, the pipe cleaner (`62f9176`).** `voice/` + `voice_main.py`: open mic → silero VAD endpointing (`UtteranceDetector`, a pure state machine split from the model) → faster-whisper `large-v3-turbo` on CUDA `int8_float16` with a CPU `int8` fallback → the unchanged synchronous `AgentGraph.invoke` in an executor → Kokoro `af_heart` at 24 kHz, sentence by sentence → back to LISTENING. Frames outside LISTENING are read and discarded rather than queued. One telemetry row per turn. The dependency arrow points one way: nothing imports `voice/`. Boot warms both MiniLM singletons (`warmup.py`), builds the agent with llama3.1 for both generation and the memory gate (`keep_alive="30m"`, so no model swap on gate turns), and fails if C2's in-memory warning fires (`_ensure_durable_memory`).
+- **V1b, barge-in (`c041d30`).** SPEAKING only. `BargeInGuard` (`voice/vad.py`) needs *sustained* speech over a higher threshold than the endpointer — its expensive failure is Marshall silenced by a cough, not a clipped first word. On a fire, `speaker.stop()` cuts playback at sentence granularity, `AgentGraph.truncate_last_response` rewrites the stored answer to the sentences actually played plus `[interrupted by user]` (same `.id`, so `add_messages` replaces rather than appends), and the guard's frames seed the next utterance without draining the mic. No resume path. `--barge-in off` restores V1a for speaker users, since there is no echo cancellation. Boot spends one throwaway turn on thread `voice-warmup` to load llama3.1. Telemetry gained `was_interrupted`, `sentences_played`, `sentences_total`, `time_to_silence_ms`.
+- **Why THINKING is not interruptible, and why `find_safe_cut_point` is not called.** Because `invoke` is synchronous, the answer is a complete `AIMessage` with no pending `tool_calls` before its first word is spoken, so truncating it is a plain content edit and nothing can be orphaned. The orphaned-pair risk below lives entirely in THINKING, which V1b leaves alone. The reconciliation primitive is reserved for streaming (V1c).
+- **Not measured yet.** The guard's `barge_in_vad_threshold = 0.7` and `barge_in_sustained_ms = 300` are labelled `UNMEASURED STARTING GUESS` in `voice/config.py`. `voice_logs/turns.jsonl` currently holds one row, from V1a, with none of the V1b columns. The live acoustic run that writes interrupted turns is what corrects the two guesses. Until then barge-in timing is unmeasured: the commit's "~500 ms to silence" is an estimate (~197 ms drain plus ~300 ms of guard), not a telemetry reading.
 
 ### What supports voice today
 
 1. **The compiled graphs already expose async and streaming APIs for free.** `CompiledStateGraph` provides `.ainvoke()`, `.astream()`, `.astream_events()`, and `.stream(stream_mode="messages")` regardless of whether the node functions are sync. The graph shape needs no change to stream.
 2. **Thread-scoped checkpointing already exists.** `MemorySaver` keyed on `thread_id` (`pipeline_lg.py:96, 205, 461`) means resumable, addressable sessions are already a solved primitive — the durability swap (R8) is the only gap.
-3. **`AgentState` has no per-turn scratch state.** `pipeline_lg.py:381-385` carries only `messages`, `turn_count`, `user_history_summary`. On a barge-in or cancel there is no half-computed `context` to invalidate — a genuinely important property that `ChatState` (which stores `query` and `context`, `pipeline_lg.py:26-33`) does not have.
+3. **`AgentState` has no per-turn scratch state.** `pipeline_lg.py:381-385` carries only `messages`, `turn_count`, `user_history_summary` *(plus H2's two summary fields and the caller-owned `hook_state` now — none of them per-turn scratch; see §5)*. On a barge-in or cancel there is no half-computed `context` to invalidate — a genuinely important property that `ChatState` (which stores `query` and `context`, `pipeline_lg.py:26-33`) does not have.
 4. **Turn counting already lives in a dedicated node.** `_count_turn_node` (499-502) is exactly the hook an event-driven scheduler needs to fire per-utterance side effects.
 5. **Tools are proper `BaseTool`s.** Adding async support means giving each an `async def` coroutine; `ToolNode` will prefer it automatically. No dispatch changes needed.
-6. **The ReAct loop is bounded.** `recursion_limit=25` (570) means a runaway tool loop terminates in seconds rather than minutes — important when the user is waiting in real time.
+6. **The ReAct loop is bounded.** `recursion_limit=25` (570) *(now `DEFAULT_RECURSION_LIMIT = 30`, sized from the graph's worst case)* means a runaway tool loop terminates in seconds rather than minutes — important when the user is waiting in real time.
 7. **The system prompt already forbids process narration.** Lines 361-363 instruct Marshall to answer as though it had simply known — exactly right for speech, where "let me search for that" is dead air.
 8. **`docs/tech_stack.md` §3 already commits to async infrastructure** (`Crawl4AI`'s `AsyncWebCrawler`, Playwright), so the async direction is already the project's stated intent.
 
@@ -923,8 +969,8 @@ That said, the *graph topology* is not the obstacle. The obstacle is the layer d
 **Real-time streaming input/output — blocked.**
 - Every node calls a blocking client: `self.llm.invoke` (`pipeline_lg.py:543`), `chain.invoke` (110, 237, 245), `Ollama`/`ChatOllama` sync constructors (89, 193, 460).
 - The public API discards streaming by construction: `AgentGraph.invoke` (565-582) runs the graph to completion and returns a `str`. `ChatRagGraph.invoke` (128-141) and `ChatRagWithMemoryGraph.invoke` (279-292) do the same. Every caller is request-response by contract.
-- There is no input side at all. `run_chat` (143-159, 294-309, 584-596) uses blocking `input()`; `pipeline.py:117, 203, 349` likewise. A voice loop needs a push-based utterance source, not a pull-based prompt.
-- `print()` is the output channel (`pipeline_lg.py:323, 616`; `ingestion/chunking.py:31, 40`). There is no sink to redirect to a TTS stream.
+- There is no input side at all. `run_chat` (143-159, 294-309, 584-596) uses blocking `input()`; `pipeline.py:117, 203, 349` likewise. A voice loop needs a push-based utterance source, not a pull-based prompt. *[FIXED for voice — V1a]* `voice/` is that source: a mic callback that only enqueues, a reader task, and the VAD endpointer emitting whole utterances. The text REPLs are unchanged.
+- `print()` is the output channel (`pipeline_lg.py:323, 616`; `ingestion/chunking.py:31, 40`). There is no sink to redirect to a TTS stream. *[PARTIALLY FIXED — V1a]* The orchestrator speaks the `str` that `invoke` returns, sentence by sentence. That is a sink for a *finished* answer, not a stream: streaming output is still blocked by the two bullets above.
 - Tool results are complete strings only (`tools/tools.py` throughout) — no partial or progressive output, so a slow `web_search` produces silence then a wall of text.
 
 **Async execution — blocked, but shallowly.**
@@ -937,18 +983,18 @@ That said, the *graph topology* is not the obstacle. The obstacle is the layer d
 - The graph *is* a state machine, and conditional edges (`pipeline_lg.py:553-557, 561`) already route on state. That is the right substrate.
 - But every transition is driven by a completed function return. There is no way to inject an external event (VAD silence detected, user started speaking, timeout elapsed) into a running graph.
 - `ChatState` stores per-turn inputs (`query`, `k`, `lambda_mult`) in durable state — in an event-driven model these become racy: a second utterance overwrites `query` mid-flight.
-- Turn boundaries are implicit (one `invoke` = one turn). Voice needs explicit utterance boundaries with barge-in semantics.
+- Turn boundaries are implicit (one `invoke` = one turn). Voice needs explicit utterance boundaries with barge-in semantics. *[PARTIALLY FIXED — V1a/V1b]* Utterance boundaries and SPEAKING-phase barge-in now exist, but in the orchestrator's own state machine *outside* the graph. One utterance is still one `invoke`, and no external event can reach a running graph.
 
-**Interrupt / cancel mid-generation — blocked entirely.**
+**Interrupt / cancel mid-generation — blocked entirely.** *[PARTIALLY UNBLOCKED — V1b]* Interrupting *playback* now works. Interrupting *generation*, which is what this heading is about, is still blocked for every reason below. V1b avoided these reasons rather than solving them, by allowing barge-in only after `invoke` has returned.
 - No `interrupt()` anywhere, despite `docs/roadmap.md` Phase 2 and `docs/vision.md` both naming native HITL as a headline feature.
 - Blocking sync calls can't be cancelled; killing the thread leaves Chroma and Ollama clients in an unknown state.
 - Cancelling mid-ReAct-loop leaves `messages` with an `AIMessage` carrying `tool_calls` and no matching `ToolMessage` — the exact orphaned-pair state that `README.md:267-269` records Ollama rejecting. **Cancellation therefore corrupts the thread**, and this is the single hardest voice problem in the current design. Any cancel path must either complete or synthesize the pending `ToolMessage`s.
 - `MemorySaver` writes a checkpoint per super-step, so a mid-turn kill leaves a checkpoint in exactly that broken state, and it persists into the next turn.
 
-**Continuous conversation loops — blocked.**
-- The only loops that exist are `while True: input(...)` (six sites).
-- ~~**Startup latency is fatal to a voice session:** the constructor synchronously loads, chunks, embeds, and writes the entire document (`pipeline_lg.py:419-428`) plus a MiniLM model (`ingestion/vector_db.py:10-12`) before returning.~~ `[FIXED — see R1]` Ingestion is now an explicit step and the constructors run it only on a cold index; a warm start opens the existing collection without reading the source at all. Measured 12.5 s → 7.9 s on the 48-chunk test PDF, and the saving grows with corpus size — and with `mode_docs="youtube"`/`"web_url"`, where the old path re-fetched over the network on every construction. **What is left of this is not ingestion:** ~4.8 s of the remaining 7.9 s is the MiniLM load, needed to embed queries, and it is still synchronous and still ahead of the first word. Loading it eagerly at process start, or accepting a pre-built embedding handle, is the next cut.
-- **The memory gate injects a multi-second stall into turns 5, 10, 15…** `_summarize_user_history_node` (512-523) runs a full LLM compression synchronously in the request path, and `UserMemory.invoke` (`memory/long_term_memory.py:47-59`) sends the entire history in one prompt so the stall grows with conversation length. In text this is a pause; in voice it is dead air at a fixed, predictable cadence.
+**Continuous conversation loops — blocked.** *[PARTIALLY FIXED — V1a: the loop exists; the gate stall below does not depend on it and is still open]*
+- The only loops that exist are `while True: input(...)` (six sites). *(No longer the only ones: `VoiceOrchestrator.run` is a continuous LISTENING → THINKING → SPEAKING loop with cancellable shutdown.)*
+- ~~**Startup latency is fatal to a voice session:** the constructor synchronously loads, chunks, embeds, and writes the entire document (`pipeline_lg.py:419-428`) plus a MiniLM model (`ingestion/vector_db.py:10-12`) before returning.~~ `[FIXED — see R1]` Ingestion is now an explicit step and the constructors run it only on a cold index; a warm start opens the existing collection without reading the source at all. Measured 12.5 s → 7.9 s on the 48-chunk test PDF, and the saving grows with corpus size — and with `mode_docs="youtube"`/`"web_url"`, where the old path re-fetched over the network on every construction. **What is left of this is not ingestion:** ~4.8 s of the remaining 7.9 s is the MiniLM load, needed to embed queries, and it is still synchronous and still ahead of the first word. Loading it eagerly at process start, or accepting a pre-built embedding handle, is the next cut. `[DONE — V1a]` The first option was taken: `warmup.warm_embeddings()` loads both MiniLM singletons first thing in `voice_main.boot`, so the cost moves to boot time, where nobody is waiting. It is still paid on every process start.
+- **The memory gate injects a multi-second stall into turns 5, 10, 15…** `_summarize_user_history_node` (512-523) runs a full LLM compression synchronously in the request path, and `UserMemory.invoke` (`memory/long_term_memory.py:47-59`) sends the entire history in one prompt so the stall grows with conversation length. In text this is a pause; in voice it is dead air at a fixed, predictable cadence. *(Still open. V1a removed the model **swap** that would have stacked on top: the voice path runs the gate on the resident llama3.1 via `memory_model`. The compression call itself is still synchronous and in the request path.)*
 - **`AgentGraph`'s unbounded history** (§4-F) means time-to-first-token grows monotonically through a long conversation — the exact opposite of what voice needs. `[FIXED — see H2]` The `summarize_and_trim` cadence bounds the list, so this no longer climbs; the checkpointer half of H2 is unaffected either way.
 - ~~Nothing measures latency. There is no instrumentation for time-to-first-token, per-node duration, or tool latency, so there is no baseline to regress against.~~ `[FIXED]` `voice/telemetry.py` appends one JSON row per turn to `voice_logs/turns.jsonl` — `stt_ms`, `agent_ms`, `tts_first_sentence_ms` and the headline `speech_end_to_first_audio_ms`, which is the only number the user experiences directly. The writer never raises: the same contract as H4 and H2, instrumentation may lose data and may never lose the turn. The baseline it was built to establish is below.
 
@@ -972,17 +1018,20 @@ So a warm agent turn is **1.3–8.4 s across the five R4 routes**, and the sprea
 Two consequences for the voice work:
 
 1. ~~**The first turn of a session is always the slowest, by several seconds, for a reason that has nothing to do with the pipeline.**~~ `[FIXED in V1b]` The first of the two options is the one taken: the model is warmed at boot with a throwaway generation, the same argument `warmup.warm_embeddings()` already makes for MiniLM, and boot time is where nobody is waiting. The second half of this finding stands — nothing in the telemetry marks a row cold, which is exactly how the 10.1 s number got quoted, and a `cold: true` flag on the first row of a process would close it.
+   *Still open at `49c4231`:* `voice/telemetry.py` has no cold flag, and `voice_logs/turns.jsonl` holds a single row, V1a's cold turn 1. There is no warm voice row and no post-warm-up row yet, so the warm figures above come only from the routing matrix. They have not yet been confirmed end to end through the voice path.
 2. **Comparisons must hold the route fixed.** `agent_ms` mixes a local Chroma lookup and a 10 s-capped network call into one field, so an aggregate over mixed turns measures which tools were chosen, not how fast the agent is. `turns.jsonl` records no tool name (§10's instrumentation is per-stage, not per-route), so the routing matrix is currently the only per-route timing that exists.
 
 ### Recommended sequencing for voice (not implemented)
 
-1. ~~Fix startup cost first (R1) — nothing else matters if the session can't begin.~~ `[DONE]` The ingestion half is closed; the MiniLM load is what is left of it, and it is a fixed cost rather than one that scales with the corpus.
-2. Make the memory gate non-blocking (background task or incremental summarization) — the fixed-cadence stall is the most audible defect.
-3. Add async node variants and async tool coroutines, then switch the public API to `astream`.
-4. Add a durable checkpointer (R8) before adding cancellation, so a corrupted mid-turn state is recoverable.
-5. Solve the orphaned-`ToolMessage` problem explicitly — a cancel path that reconciles pending tool calls — before exposing barge-in.
-6. Make `AgentGraph` per-session, or make `_memory_cache` thread-safe, before serving concurrent sessions.
-7. Only then add `interrupt()`/HITL per `docs/roadmap.md` Phase 2.
+*Written as a plan before V1a. Item status as of `49c4231`. Only item 1 is done. Item 5 was sidestepped rather than solved, and everything else is still future.*
+
+1. ~~Fix startup cost first (R1) — nothing else matters if the session can't begin.~~ `[DONE]` The ingestion half is closed; the MiniLM load is what is left of it, and it is a fixed cost rather than one that scales with the corpus. *(V1a then moved that MiniLM load, and V1b the LLM load, into boot — see "What is built".)*
+2. Make the memory gate non-blocking (background task or incremental summarization) — the fixed-cadence stall is the most audible defect. *— future. V1a removed the model swap only; the stall itself remains.*
+3. Add async node variants and async tool coroutines, then switch the public API to `astream`. *— future. The orchestrator's `asyncio` loop is not this: the graph is still sync and is called from a thread.*
+4. Add a durable checkpointer (R8) before adding cancellation, so a corrupted mid-turn state is recoverable. *— future. The injection seam exists (`d879bab`); no durable saver is wired in.*
+5. Solve the orphaned-`ToolMessage` problem explicitly — a cancel path that reconciles pending tool calls — before exposing barge-in. *— sidestepped, not solved. V1b exposed barge-in only in SPEAKING, after `invoke` returns, where no tool pair can be pending. The cancel path is still owed before generation can be interrupted, which is the streaming increment (V1c).*
+6. Make `AgentGraph` per-session, or make `_memory_cache` thread-safe, before serving concurrent sessions. *— future. Voice is one session per process, so nothing has needed it yet.*
+7. Only then add `interrupt()`/HITL per `docs/roadmap.md` Phase 2. *— future. Still no `interrupt(` anywhere.*
 
 ---
 
@@ -1008,7 +1057,7 @@ The three problems identified as blocking further work:
 
 ~~The highest-severity fully-open finding is now **H6** — `UserMemory` writes to Chroma from its constructor, so every read path also writes.~~ `[FIXED]` **H6 is closed, and how it closed is the point.** The review had called it "safe today only because of the `_memory_cache` fingerprint and content-hash ids". It was not safe: the fingerprint makes *repeat* construction a no-op and says nothing about the first build of a turn, which is exactly the one `recall_user_memory` triggers. Asked *"what is my name?"*, the tool wrote that question into the collection and then retrieved it back at `k=1` — and the reply still read as correct, because the system prompt names Harshal. It took `scripts/check_routing.py` printing raw tool output to see it. A finding that had been reasoned about twice and marked safe both times was settled in one line of a test harness's output.
 
-**The highest-severity open finding is now R8** — the checkpointer. The two remaining HIGHs, H3 and H5, are both in `pipeline.py`, which is legacy and deliberately untouched.
+**The highest-severity open finding is now R8** — the checkpointer. The two remaining HIGHs, H3 and H5, are both in `pipeline.py`, which is legacy and deliberately untouched. *(Unchanged at `49c4231`. `AgentGraph` can now be handed a checkpointer, but nothing hands it a durable one and the `SqliteSaver` lifecycle is unsolved — see R8.)*
 
 ~~**One caveat carried forward from the H1 fix:** `AgentGraph`'s tool routing has not been re-verified against `llama3.1`, which is not pulled locally. See R4.~~ `[DISCHARGED, AND NOW GATED]` `llama3.1` was pulled and routing measured against both the current and the pre-H1 prompt: identical on every route, so the H1/H2 prompt edits did not shift tool selection. That measurement is no longer a one-off — `scripts/check_routing.py` and `tests/test_routing_matrix.py` run all six rows against the real model and fail on a routing miss or a prose-narrated call. Full results under R4.
 
@@ -1018,6 +1067,10 @@ The three problems identified as blocking further work:
 
 For voice specifically: the graph topology is sound and needs no redesign. The work is entirely in the layer above (async, streaming, an event-driven input source, cancellation semantics) and the layer below (startup cost, blocking clients, per-session isolation). The single hardest problem is not async — it is that cancelling mid-ReAct-loop orphans a `tool_calls`/`ToolMessage` pair in a way Ollama rejects. Half of that is now in place: `memory/reconciliation.py:find_safe_cut_point` decides where an interrupted history can be cut, and was written for both callers deliberately. What barge-in still owes is everything around it — cancelling the in-flight generation, deciding what to do with a tool that already started, and getting the cut applied to checkpointed state mid-turn.
 
+> *[UPDATED — V1b]* Barge-in shipped (`c041d30`) **without** needing any of that, by narrowing it to SPEAKING. Once `invoke` has returned there is no in-flight generation, no started tool and no pending pair, so the interrupted answer is rewritten in place with `truncate_last_response` and `find_safe_cut_point` is not called. The three debts above have not been paid. They have been deferred to the point where an interrupt can land *during* generation: streaming, V1c. The voice layer itself now exists, and what V1b most needs next is the live acoustic run that replaces its two guessed guard parameters with measured ones.
+
 ---
 
 *Original review conducted read-only against commit `c100c2e`. Updated in place as findings were closed — C1, C2, C3, H1, H4, H2 (context growth), M11, R1, then finding K's timeout half and R4's routing caveat, which is now a committed gate rather than a one-off measurement, and then H6/R5 once that gate caught the read path writing. §10's latency baseline was corrected at the same time: the first agent turn of a process pays Ollama's model load and is not a steady-state number. Findings not named in that list are as first written and unverified against later changes.*
+
+*Synced again on 2026-10-22 against `49c4231`, docs-only: the Current Status snapshot added at the top; M10 closed by the output cap (`d879bab`); R8's injectable-checkpointer seam recorded, with R8 still open; the recursion limit (now 30, `15478f6`), the `agent_hook` seam and `AgentState`'s new fields recorded in §1/§5; M1/M2 marked partially fixed per R1; R9 shown open; §10 given a "What is built" account of V1a and V1b, with every stale blocker marked in place and the sequencing list annotated item by item. The test count (252) is from `pytest --collect-only`; the suite was not run for this sync.*
