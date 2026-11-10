@@ -100,6 +100,8 @@ class VoiceConfig:
 
     # --- agent -----------------------------------------------------------------
     thread_id: str = "voice-main"
+    #: how long `run_code`'s spoken "Is that okay?" waits for an answer. Silence is a no.
+    confirm_timeout_s: float = 10.0
 
     def validate(self) -> None:
         """Fail loudly at boot rather than subtly at the first utterance.

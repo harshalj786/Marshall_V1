@@ -28,14 +28,24 @@ loop above it is honest about that.
 
 Every collaborator is injected. The orchestrator never imports sounddevice, torch,
 faster-whisper or kokoro, so the whole cycle is testable with fakes and no hardware.
+
+**CONFIRMING is the one place a turn listens while it is still THINKING.** `run_code`
+must not run anything until the user says yes, and the model must not be the one saying
+it. So from inside `agent.invoke` — on the executor thread — `confirm_by_voice` speaks the
+question, flips the state to CONFIRMING, and waits; the reader routes frames to a second
+endpointer while in that state; the answer is transcribed and judged by
+`voice/confirm.py:parse_yes_no`, plain string matching, never the model. Silence, a
+shutdown or anything unclear is a no.
 """
 import asyncio
 import logging
+import queue
 import time
 from enum import Enum
 from typing import Optional
 
 from voice.config import VoiceConfig
+from voice.confirm import CONFIRM_SPOKEN, parse_yes_no
 from voice.telemetry import TelemetryWriter, TurnTelemetry, Stopwatch
 from voice.vad import BargeInGuard, UtteranceDetector
 
@@ -67,6 +77,8 @@ def truncate_to_spoken(sentences, sentences_played: int) -> str:
 class State(str, Enum):
     LISTENING = "listening"
     THINKING = "thinking"
+    #: inside THINKING: `run_code` asked "is that okay?" and the mic is listening for it
+    CONFIRMING = "confirming"
     SPEAKING = "speaking"
     STOPPED = "stopped"
 
@@ -79,6 +91,7 @@ class VoiceOrchestrator:
         vad       .speech_prob(frame) -> float ; .reset()
         stt       .transcribe(audio) -> str
         tts       .engine_name ; .stream_sentences(text) -> (i, sentence, audio)
+                  .synthesize(text) -> audio                     (confirmation only)
         speaker   .play(audio) ; .stop()          .stop() must abort a blocked .play()
         agent     .invoke(query, config=...) -> str
                   .truncate_last_response(content, thread_id) -> bool   (barge-in only)
@@ -121,6 +134,11 @@ class VoiceOrchestrator:
         #: as the head of their next utterance so nobody has to repeat themselves.
         self._interrupt_frames: list = []
         self._time_to_silence_ms: Optional[float] = None
+        #: CONFIRMING's own endpointer and hand-off. A separate detector so the answer can
+        #: never be mistaken for, or merged into, the next turn's utterance; a thread-safe
+        #: queue because the waiter is the agent's executor thread, not the event loop.
+        self._confirm_detector = UtteranceDetector(self.config)
+        self._confirm_queue: queue.Queue = queue.Queue()
 
     # --- reporting -------------------------------------------------------------
 
@@ -190,6 +208,12 @@ class VoiceOrchestrator:
             if self.state is State.SPEAKING and self.config.barge_in_enabled:
                 await self._watch_for_barge_in(frame, loop)
                 continue
+            #: also before the `_turn_pending` check: CONFIRMING happens mid-turn
+            if self.state is State.CONFIRMING:
+                answer = await loop.run_in_executor(None, self._feed_confirm, frame)
+                if answer is not None:
+                    self._confirm_queue.put_nowait(answer)
+                continue
             if self.state is not State.LISTENING or self._turn_pending:
                 self.frames_discarded += 1
                 continue
@@ -206,6 +230,44 @@ class VoiceOrchestrator:
     def _feed_guard(self, frame):
         """The same inference, into the interrupt guard. Same executor, same reason."""
         return self.guard.process(frame, self.vad.speech_prob(frame))
+
+    def _feed_confirm(self, frame):
+        """The same inference, into CONFIRMING's endpointer."""
+        return self._confirm_detector.process(frame, self.vad.speech_prob(frame))
+
+    def confirm_by_voice(self, request) -> bool:
+        """Ask "is that okay?" out loud and return whether the user clearly said yes.
+
+        SYNC, and called on the agent's executor thread from inside `agent.invoke` — via
+        `voice.confirm.VoiceConfirmer`, which `run_code` closes over. Blocking here is the
+        point: the tool must not return until the user has answered. The event loop keeps
+        running meanwhile, so the reader is what hears the answer.
+        """
+        self.speaker.play(self.tts.synthesize(CONFIRM_SPOKEN))
+        #: Marshall's own question is in the queue; the answer must start after it
+        self.mic.drain()
+        self._confirm_detector.reset()
+        while not self._confirm_queue.empty():
+            self._confirm_queue.get_nowait()
+        self._set_state(State.CONFIRMING)
+        utterance = None
+        try:
+            deadline = time.perf_counter() + self.config.confirm_timeout_s
+            while utterance is None and not self._stopping.is_set():
+                remaining = deadline - time.perf_counter()
+                if remaining <= 0:
+                    break
+                try:
+                    utterance = self._confirm_queue.get(timeout=min(0.1, remaining))
+                except queue.Empty:
+                    continue
+        finally:
+            #: back to THINKING whatever happened: the tool call is still in flight
+            self._set_state(State.THINKING)
+        transcript = self.stt.transcribe(utterance) if utterance is not None else ""
+        accepted = parse_yes_no(transcript)
+        self._emit("confirm", turn_id=self.turn_id, transcript=transcript, accepted=accepted)
+        return accepted
 
     async def _watch_for_barge_in(self, frame, loop) -> None:
         """One frame captured while Marshall is talking.

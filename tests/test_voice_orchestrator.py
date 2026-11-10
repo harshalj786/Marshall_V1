@@ -29,6 +29,7 @@ import queue
 import sys
 import threading
 from pathlib import Path
+from types import SimpleNamespace
 
 import numpy as np
 import pytest
@@ -36,6 +37,7 @@ import pytest
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 
 from voice.config import VoiceConfig, VAD_FRAME_SAMPLES
+from voice.confirm import CONFIRM_SPOKEN
 from voice.orchestrator import (
     INTERRUPTION_MARKER,
     State,
@@ -178,6 +180,12 @@ class FakeTts:
 
     def __init__(self):
         self.calls = []
+        self.synthesized = []
+
+    def synthesize(self, text):
+        #: the one-shot path `confirm_by_voice` uses for its question
+        self.synthesized.append(text)
+        return np.full(240, 0.1, dtype=np.float32)
 
     def stream_sentences(self, text):
         #: the REAL splitter — the double exists to avoid Kokoro, not to avoid splitting,
@@ -870,6 +878,103 @@ async def test_close_is_idempotent_and_never_raises(tmp_path):
     orchestrator, _, _ = build(tmp_path, mic=Nasty(), speaker=Nasty())
     orchestrator.close()
     orchestrator.close()          # twice, on the way out, must still not raise
+
+
+# ==========================================================================
+# spoken confirmation (CONFIRMING) — run_code asks, the user answers, code decides
+# ==========================================================================
+
+class ConfirmingAgent(FakeAgent):
+    """invoke() asks for a spoken confirmation, as run_code does from inside the graph."""
+
+    def __init__(self):
+        super().__init__()
+        self.orchestrator = None
+        self.answers = []
+
+    def invoke(self, query, config=None):
+        self.calls.append((query, config))
+        accepted = self.orchestrator.confirm_by_voice(
+            SimpleNamespace(language="python", source="print(1)", origin="pasted"))
+        self.answers.append(accepted)
+        return "ran it" if accepted else "not running it"
+
+
+async def _start_confirming(tmp_path, stt, **config_kwargs):
+    agent = ConfirmingAgent()
+    orchestrator, parts, config = build(tmp_path, frames=utterance_frames(VoiceConfig()),
+                                        stt=stt, agent=agent, config_kwargs=config_kwargs)
+    agent.orchestrator = orchestrator
+    task = asyncio.ensure_future(orchestrator.run())
+    assert await wait_for(lambda: orchestrator.state is State.CONFIRMING)
+    return orchestrator, parts, config, agent, task
+
+
+@asyncio_test
+async def test_confirm_by_voice_hears_yes(tmp_path):
+    events = []
+    orchestrator, parts, config, agent, task = await _start_confirming(
+        tmp_path, ScriptedStt("run this code", "yes"))
+    orchestrator._on_event = lambda e, p: events.append((e, p))
+    for f in utterance_frames(config):
+        parts["mic"].push(f)
+    assert await wait_for(lambda: agent.answers == [True])
+    assert parts["tts"].synthesized == [CONFIRM_SPOKEN]
+    assert len(parts["speaker"].played) >= 1
+    assert await wait_for(lambda: orchestrator.state is State.LISTENING)
+    assert ("confirm", {"turn_id": 1, "transcript": "yes", "accepted": True}) in events
+    orchestrator.request_stop()
+    await task
+
+
+@asyncio_test
+async def test_confirm_by_voice_hears_no(tmp_path):
+    orchestrator, parts, config, agent, task = await _start_confirming(
+        tmp_path, ScriptedStt("run this code", "no thanks"))
+    for f in utterance_frames(config):
+        parts["mic"].push(f)
+    assert await wait_for(lambda: agent.answers == [False])
+    orchestrator.request_stop()
+    await task
+
+
+@asyncio_test
+async def test_confirm_by_voice_times_out_to_no(tmp_path):
+    orchestrator, parts, config, agent, task = await _start_confirming(
+        tmp_path, ScriptedStt("run this code", "yes"), confirm_timeout_s=0.3)
+    #: wall clock, not `wait_for`: that helper counts `asyncio.sleep(0.01)` iterations, and
+    #: on the Windows proactor loop those return early — its "3 s" measured ~0.3 s, the
+    #: same as the timeout under test, so the two raced
+    import time
+    deadline = time.perf_counter() + 5.0
+    while not agent.answers and time.perf_counter() < deadline:
+        await asyncio.sleep(0.01)
+    assert agent.answers == [False]
+    #: only the first utterance was transcribed: silence is never sent to STT
+    assert len(parts["stt"].calls) == 1
+    orchestrator.request_stop()
+    await task
+
+
+@asyncio_test
+async def test_confirming_state_does_not_leak_into_the_next_turn(tmp_path):
+    orchestrator, parts, config, agent, task = await _start_confirming(
+        tmp_path, ScriptedStt("run this code", "yes"))
+    for f in utterance_frames(config):
+        parts["mic"].push(f)
+    assert await wait_for(lambda: orchestrator.state is State.LISTENING)
+    assert orchestrator._confirm_queue.empty() and orchestrator.turn_id == 1
+    orchestrator.request_stop()
+    await task
+
+
+@asyncio_test
+async def test_a_stop_during_confirming_is_a_no_and_ends_cleanly(tmp_path):
+    orchestrator, parts, config, agent, task = await _start_confirming(
+        tmp_path, ScriptedStt("run this code", "yes"))
+    orchestrator.request_stop()
+    assert await wait_for(lambda: agent.answers == [False], timeout=3.0)
+    await task
 
 
 if __name__ == "__main__":
