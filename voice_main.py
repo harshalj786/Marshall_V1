@@ -18,6 +18,11 @@ stack, so through speakers his own voice interrupts him. `--barge-in off` is the
 one model for both generation and memory compression, pinned resident, so no turn
 pays a model swap. Then the audio models. Then one throwaway turn to pull the LLM into
 VRAM. Every second of it is boot time, where nobody is waiting on a reply.
+
+**Before any of that, the admin password** (hidden; Enter alone for a guest). An admin
+session can have Marshall run code: he asks "Is that okay?" out loud and only a clear
+spoken yes — matched in code, never by the model — runs it. A guest session can have code
+checked but not run, and keeps no memory. `--check` asks for no password.
 """
 import argparse
 import asyncio
@@ -26,6 +31,8 @@ import sys
 import time
 import warnings
 from pathlib import Path
+
+from admin_session import prompt_for_session
 
 #: default corpus — the same PDF R4's routing verification was measured against
 DEFAULT_DOCUMENT = "test_pdf's/Pipes_2025.pdf"
@@ -93,15 +100,19 @@ def _ensure_durable_memory(path: str) -> None:
             "long-term memory would not persist (C2): " + durability_warnings[0])
 
 
-def build_agent(file_path: str, quiet: bool = False):
+def build_agent(file_path: str, session=None, run_confirm=None, quiet: bool = False):
     """Construct the AgentGraph the voice loop talks to.
 
     Zero changes to `pipeline_lg` beyond Part A — every difference from a text session
-    is a constructor argument.
+    is a constructor argument. `session=None` is the agent `--check` and
+    scripts/check_routing.py measure, unchanged.
     """
     from pipeline_lg import AgentGraph
 
-    _ensure_durable_memory(USER_HISTORY_PATH)
+    #: a guest keeps nothing (AgentGraph drops the store), so proving the store durable
+    #: would prove something about a path the session never touches
+    if session is None or session.is_admin:
+        _ensure_durable_memory(USER_HISTORY_PATH)
     return AgentGraph(
         file_path=file_path,
         mode_docs="pdf" if str(file_path).lower().endswith(".pdf") else "txt",
@@ -115,6 +126,8 @@ def build_agent(file_path: str, quiet: bool = False):
         #: this thread's stored summary whenever the in-RAM history is empty, and the
         #: thread_id is fixed, so tomorrow's session opens knowing what today's covered.
         summary_persist_path=SUMMARY_PATH,
+        session=session,
+        run_confirm=run_confirm,
     )
 
 
@@ -147,7 +160,7 @@ def _timed(label: str, build, report) -> tuple:
     return result, elapsed
 
 
-def boot(config, file_path: str, report=print) -> dict:
+def boot(config, file_path: str, report=print, session=None, run_confirm=None) -> dict:
     """Load everything, in the order that keeps cost off the first turn."""
     from warmup import warm_embeddings
     from voice.audio_io import MicrophoneStream, Speaker
@@ -168,7 +181,9 @@ def boot(config, file_path: str, report=print) -> dict:
            f"   [models {embed_timings['ingestion']:.2f}s + {embed_timings['memory']:.2f}s, "
            f"rest is first-import]")
 
-    agent, _ = _timed("agent + document", lambda: build_agent(file_path), report)
+    agent, _ = _timed("agent + document",
+                      lambda: build_agent(file_path, session=session, run_confirm=run_confirm),
+                      report)
     vad, _ = _timed("silero-vad", lambda: SileroVad(config), report)
     stt, _ = _timed("faster-whisper", lambda: Transcriber(config), report)
     tts, _ = _timed("kokoro", lambda: build_engine(config), report)
@@ -346,7 +361,7 @@ def _make_reporter():
     """Terminal output for the running loop. The orchestrator stays UI-free."""
     def report(event: str, payload: dict) -> None:
         if event == "state":
-            symbol = {"listening": "[..]", "thinking": "[**]",
+            symbol = {"listening": "[..]", "thinking": "[**]", "confirming": "[?!]",
                       "speaking": "[<<]", "stopped": "[--]"}.get(payload["state"], "[??]")
             print(f"\r{symbol} {payload['state']:<10}", end="", flush=True)
         elif event == "ready":
@@ -367,19 +382,28 @@ def _make_reporter():
             print(f"\r  ...   discarded ({payload['reason']})")
         elif event == "error":
             print(f"\r  !     turn {payload['turn_id']} failed: {payload['error']}")
+        elif event == "confirm":
+            #: the run_code answer as Whisper heard it, so a wrong "no" is visible
+            verdict = "yes" if payload["accepted"] else "no"
+            print(f"\r  ?     run it? heard {payload['transcript']!r} -> {verdict}")
     return report
 
 
-async def run_voice(config, file_path: str) -> int:
-    from voice.orchestrator import VoiceOrchestrator, run_session
+async def run_voice(config, file_path: str, session=None) -> int:
+    import voice.orchestrator as orchestrator_module
+    from voice.confirm import VoiceConfirmer
 
-    parts = boot(config, file_path)
-    orchestrator = VoiceOrchestrator(
+    #: built empty and bound below: the agent (whose run_code closes over this) is built
+    #: inside boot(), before the orchestrator that owns the mic and speaker exists
+    confirmer = VoiceConfirmer()
+    parts = boot(config, file_path, session=session, run_confirm=confirmer)
+    orchestrator = orchestrator_module.VoiceOrchestrator(
         agent=parts["agent"], mic=parts["mic"].start(), vad=parts["vad"],
         stt=parts["stt"], tts=parts["tts"], speaker=parts["speaker"],
         config=config, on_event=_make_reporter(),
     )
-    await run_session(orchestrator)
+    confirmer.orchestrator = orchestrator
+    await orchestrator_module.run_session(orchestrator)
     print(f"\nstopped after {orchestrator.turn_id} turn(s). "
           f"timings in {config.telemetry_path}")
     return 0
@@ -459,10 +483,13 @@ def main(argv=None) -> int:
         return 2
 
     if args.check:
+        #: no password: --check builds today's session-less agent and never takes a turn
         return run_check(config, args.file)
 
+    #: before boot, so the password is typed while nothing is loading over it
+    session = prompt_for_session()
     try:
-        return asyncio.run(run_voice(config, args.file))
+        return asyncio.run(run_voice(config, args.file, session=session))
     except KeyboardInterrupt:
         #: Ctrl+C during BOOT, before the loop exists to catch it. Clean exit, no spray.
         print("\ninterrupted during startup.")
