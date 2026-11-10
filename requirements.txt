@@ -54,6 +54,7 @@ pdfplumber==0.11.10                    # mode="scanned_pdf"
 # --- Agent tools --------------------------------------------------------------
 wikipedia==1.4.0                       # tools/tools.py::wikipedia_lookup
 ddgs==9.14.4                           # tools/tools.py::web_search — SEE NOTE 3
+argon2-cffi==25.1.0                    # admin_session.py — admin password hash (security.md §2)
 
 # --- Shared -------------------------------------------------------------------
 pydantic==2.12.4                       # mqr output schema, tool arg schemas
