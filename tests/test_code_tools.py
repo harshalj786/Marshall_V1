@@ -136,3 +136,129 @@ def test_check_code_reports_a_compiler_timeout(monkeypatch):
     monkeypatch.setattr(code_tools.subprocess, "run", slow)
     out = make_check_code(False).invoke({"code": "int main(){}", "language": "c"})
     assert out == f"check_code error: compiler timed out after {COMPILE_TIMEOUT_SECONDS:g}s"
+
+
+# ==========================================================================
+# run_code
+# ==========================================================================
+
+import os
+import subprocess
+import time
+
+from tools.code_tools import RUN_CAPTURE_BYTES, RunRequest, make_run_code, run_program
+
+PY = sys.executable
+
+
+def _pid_alive(pid: int) -> bool:
+    if sys.platform == "win32":
+        out = subprocess.run(["tasklist", "/FI", f"PID eq {pid}"],
+                             capture_output=True, text=True).stdout
+        return str(pid) in out
+    try:
+        os.kill(pid, 0)
+        return True
+    except OSError:
+        return False
+
+
+def test_run_program_captures_output_and_exit_code(tmp_path):
+    r = run_program([PY, "-c", "import sys; print('hi'); sys.exit(3)"], tmp_path)
+    assert (r.exit_code, r.timed_out) == (3, False) and "hi" in r.stdout
+
+
+def test_run_program_gets_no_stdin(tmp_path):
+    r = run_program([PY, "-c", "input()"], tmp_path, timeout=5.0)
+    assert r.exit_code != 0 and "EOFError" in r.stderr and r.seconds < 5
+
+
+def test_run_program_kills_a_looping_program(tmp_path):
+    r = run_program([PY, "-c", "while True: pass"], tmp_path, timeout=1.0)
+    assert r.timed_out and r.exit_code is None and r.seconds < 4
+
+
+def test_run_program_kills_grandchildren_on_timeout(tmp_path):
+    pidfile = tmp_path / "child.pid"
+    parent = ("import subprocess, sys, time; "
+              "c = subprocess.Popen([sys.executable, '-c', 'import time; time.sleep(60)']); "
+              f"open({str(pidfile)!r}, 'w').write(str(c.pid)); time.sleep(60)")
+    r = run_program([PY, "-c", parent], tmp_path, timeout=3.0)
+    assert r.timed_out
+    child = int(pidfile.read_text())
+    time.sleep(0.5)
+    assert not _pid_alive(child)
+
+
+def test_run_program_caps_huge_output(tmp_path):
+    r = run_program([PY, "-c", "print('x' * 5_000_000)"], tmp_path)
+    assert r.exit_code == 0 and len(r.stdout) <= RUN_CAPTURE_BYTES
+
+
+def test_run_code_declined_executes_nothing(tmp_path):
+    marker = tmp_path / "ran"
+    out = make_run_code(lambda r: False).invoke(
+        {"code": f"open({str(marker)!r}, 'w').close()", "language": "python"})
+    assert out == "run_code: the user declined to run it; nothing was executed"
+    assert not marker.exists()
+
+
+def test_run_code_passes_the_request_to_confirm():
+    seen = []
+    make_run_code(lambda r: seen.append(r) or False).invoke(
+        {"code": "```python\nprint(1)\n```", "language": "python"})
+    assert seen == [RunRequest(language="python", source="print(1)", origin="pasted")]
+
+
+def test_run_code_runs_python_when_confirmed():
+    out = make_run_code(lambda r: True).invoke({"code": "print(2 + 2)", "language": "python"})
+    assert "run_code: exit code 0" in out and "\n4\n" in out
+
+
+def test_run_code_python_runs_isolated():
+    out = make_run_code(lambda r: True).invoke(
+        {"code": "import sys; print(sys.flags.isolated)", "language": "python"})
+    assert "\n1\n" in out
+
+
+def test_run_code_reports_a_timeout(monkeypatch):
+    monkeypatch.setattr(code_tools, "RUN_TIMEOUT_SECONDS", 1.0)
+    out = make_run_code(lambda r: True).invoke({"code": "while True: pass", "language": "python"})
+    assert out.startswith("run_code: killed after 1s time limit")
+
+
+def test_run_code_refuses_env_files_before_asking(tmp_path):
+    p = tmp_path / ".env"
+    p.write_text("SECRET=1\n")
+    asked = []
+    out = make_run_code(lambda r: asked.append(r) or True).invoke({"path": str(p)})
+    assert out.startswith("run_code refused:") and asked == []
+
+
+def test_run_code_runs_a_file_by_path(tmp_path):
+    p = tmp_path / "hello.py"
+    p.write_text("print('from file')\n")
+    seen = []
+    out = make_run_code(lambda r: seen.append(r) or True).invoke({"path": str(p)})
+    assert "from file" in out and seen[0].origin == str(p) and seen[0].language == "python"
+
+
+@needs_gcc
+def test_run_code_compiles_and_runs_c():
+    out = make_run_code(lambda r: True).invoke(
+        {"code": '#include <stdio.h>\nint main(void){printf("hello\\n");return 7;}',
+         "language": "c"})
+    assert "run_code: exit code 7" in out and "hello" in out
+
+
+@needs_gcc
+def test_run_code_reports_compile_failure_without_running():
+    out = make_run_code(lambda r: True).invoke(
+        {"code": "int main(void){ return 0 }", "language": "c"})
+    assert out.startswith("run_code: c compile FAILED") and "--- stdout ---" not in out
+
+
+def test_run_code_tool_is_named_and_documented():
+    tool = make_run_code(lambda r: False)
+    assert tool.name == "run_code"
+    assert "ONLY when the user explicitly asks" in tool.description

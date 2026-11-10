@@ -13,12 +13,16 @@ Neither tool goes through `_run_with_timeout`. That wrapper abandons a thread it
 kill, which is right for a hung socket and wrong here: these tools own real subprocesses
 with their own time limits, and `run_code` waits on a human answering a prompt.
 """
+import os
 import shutil
+import signal
 import subprocess
+import sys
 import tempfile
+import time
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Optional
+from typing import Callable, Optional
 
 from langchain_core.tools import tool, BaseTool
 
@@ -143,3 +147,176 @@ def _check_code_body(code: str, language: str, path: str, allow_paths: bool) -> 
         return _check(source, lang, "code").report
     except CodeGuardError as err:
         return f"check_code refused: {err}"
+
+
+# ==========================================================================
+# run_code
+# ==========================================================================
+
+#: wall-clock budget for one program run. Short on purpose: this is a voice assistant's
+#: "try it and tell me", not a job runner, and a program that loops forever has to give the
+#: turn back quickly.
+RUN_TIMEOUT_SECONDS = 10.0
+
+#: how much of each stream is read back. Output goes to files rather than pipes, so a
+#: program printing gigabytes costs disk until it is killed — never the parent's memory —
+#: and only this much is ever read. `_cap_output` then bounds what the model sees.
+RUN_CAPTURE_BYTES = 65_536
+
+
+@dataclass(frozen=True)
+class RunRequest:
+    """What the confirmer is shown before anything runs. `origin` is "pasted" or the path."""
+    language: str
+    source: str
+    origin: str
+
+
+@dataclass(frozen=True)
+class RunResult:
+    exit_code: Optional[int]
+    stdout: str
+    stderr: str
+    timed_out: bool
+    seconds: float
+
+
+def _kill_tree(proc: subprocess.Popen) -> None:
+    """Kill `proc` AND everything it started. Killing only the parent orphans the rest."""
+    try:
+        if sys.platform == "win32":
+            subprocess.run(["taskkill", "/F", "/T", "/PID", str(proc.pid)],
+                           capture_output=True)
+        else:
+            os.killpg(os.getpgid(proc.pid), signal.SIGKILL)
+    except Exception:
+        proc.kill()
+    try:
+        proc.wait(timeout=5)
+    except subprocess.TimeoutExpired:
+        pass
+
+
+def _read_capped(path: Path) -> str:
+    #: bytes, then newlines normalised: a Windows program writes "\r\n" in text mode, and
+    #: the model should read the same output whichever OS ran the program
+    with open(path, "rb") as handle:
+        text = handle.read(RUN_CAPTURE_BYTES).decode("utf-8", errors="replace")
+    return text.replace("\r\n", "\n")
+
+
+def run_program(argv: list[str], cwd: Path, timeout: float = RUN_TIMEOUT_SECONDS) -> RunResult:
+    """Run `argv` in `cwd` with no stdin, kill the whole tree on timeout, read capped output."""
+    cwd = Path(cwd)
+    out_path, err_path = cwd / "stdout.txt", cwd / "stderr.txt"
+    started = time.perf_counter()
+    with open(out_path, "wb") as out, open(err_path, "wb") as err:
+        #: a new session on POSIX makes the program a process-group leader, which is what
+        #: lets `_kill_tree` take its children down with it; Windows uses taskkill /T
+        proc = subprocess.Popen(argv, cwd=str(cwd), stdin=subprocess.DEVNULL, stdout=out,
+                                stderr=err, start_new_session=(sys.platform != "win32"))
+        try:
+            exit_code: Optional[int] = proc.wait(timeout=timeout)
+            timed_out = False
+        except subprocess.TimeoutExpired:
+            _kill_tree(proc)
+            exit_code, timed_out = None, True
+    return RunResult(exit_code=exit_code, stdout=_read_capped(out_path),
+                     stderr=_read_capped(err_path), timed_out=timed_out,
+                     seconds=time.perf_counter() - started)
+
+
+def compile_c_family(source_path: Path, language: str, workdir: Path,
+                     display_name: str) -> tuple[CheckResult, Optional[Path]]:
+    """Build an executable into `workdir`. Returns (result, executable or None)."""
+    compiler = compiler_for(language)
+    name = _COMPILERS[language]
+    if compiler is None:
+        return CheckResult(False, f"run_code error: no {language} compiler found: "
+                                  f"{name} is not on PATH"), None
+    exe = Path(workdir) / ("program.exe" if sys.platform == "win32" else "program")
+    try:
+        completed = subprocess.run(
+            [compiler, "-Wall", "-o", str(exe), str(source_path)],
+            capture_output=True, text=True, errors="replace",
+            timeout=COMPILE_TIMEOUT_SECONDS, cwd=str(workdir), stdin=subprocess.DEVNULL)
+    except subprocess.TimeoutExpired:
+        return CheckResult(False, f"run_code error: compiler timed out after "
+                                  f"{COMPILE_TIMEOUT_SECONDS:g}s"), None
+    stderr = (completed.stderr or "").replace(str(source_path), display_name).strip()
+    if completed.returncode != 0 or not exe.exists():
+        return CheckResult(False, f"run_code: {language} compile FAILED\n{stderr}"), None
+    return CheckResult(True, stderr), exe
+
+
+def _format_run(result: RunResult) -> str:
+    if result.timed_out:
+        head = (f"run_code: killed after {RUN_TIMEOUT_SECONDS:g}s time limit; "
+                f"partial output follows")
+    else:
+        head = f"run_code: exit code {result.exit_code} in {result.seconds:.1f}s"
+    return (f"{head}\n--- stdout ---\n{result.stdout or '(empty)'}"
+            f"\n--- stderr ---\n{result.stderr or '(empty)'}")
+
+
+def make_run_code(confirm: Callable[[RunRequest], bool]) -> BaseTool:
+    """Build `run_code`. `confirm` asks the USER, outside the model; False means nothing runs.
+
+    Only ever built for an admin session, so paths are always allowed here — subject to the
+    same `.env`/extension policy as `check_code`.
+    """
+
+    @tool
+    def run_code(code: str = "", language: str = "", path: str = "") -> str:
+        """Compile (if C/C++) and RUN a piece of Python, C or C++ code, then return its exit
+        code and output. Use ONLY when the user explicitly asks you to run or execute code.
+
+        Before anything runs, the user is asked to confirm outside this conversation; if they
+        decline, nothing runs and the result says so. `language` is "python", "c" or "cpp".
+        Pass the code exactly as the user gave it in `code`, or a file location in `path`."""
+        return _cap_output("run_code", _run_code_body(code, language, path, confirm))
+
+    return run_code
+
+
+def _run_code_body(code: str, language: str, path: str,
+                   confirm: Callable[[RunRequest], bool]) -> str:
+    try:
+        resolved: Optional[Path] = None
+        if (path or "").strip():
+            resolved, lang = resolve_source_path(path, language)
+            source = resolved.read_text(encoding="utf-8", errors="replace")
+            origin = path.strip()
+        else:
+            source = strip_code_fences(code)
+            if not (language or "").strip():
+                return "run_code error: say which language the code is: python, c or cpp"
+            lang = normalize_language(language)
+            origin = "pasted"
+    except CodeGuardError as err:
+        return f"run_code refused: {err}"
+
+    #: the gate. Everything above only reads; nothing below happens without a yes.
+    if not confirm(RunRequest(language=lang, source=source, origin=origin)):
+        return "run_code: the user declined to run it; nothing was executed"
+
+    workdir = Path(tempfile.mkdtemp(prefix="marshall-run-"))
+    try:
+        if resolved is None:
+            src = workdir / f"pasted{_PASTED_SUFFIX[lang]}"
+            src.write_text(source, encoding="utf-8")
+            display = "code"
+        else:
+            src, display = resolved, origin
+        if lang == "python":
+            #: -I: isolated — no PYTHON* env vars, no user site, no script dir on sys.path
+            argv = [sys.executable, "-I", str(src)]
+        else:
+            built, exe = compile_c_family(src, lang, workdir, display)
+            if exe is None:
+                return built.report
+            argv = [str(exe)]
+        #: read at call time so the limit can be changed (and tested) in one place
+        return _format_run(run_program(argv, workdir, timeout=RUN_TIMEOUT_SECONDS))
+    finally:
+        shutil.rmtree(workdir, ignore_errors=True)
