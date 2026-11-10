@@ -49,6 +49,12 @@ This document outlines the practical security controls, data privacy standards, 
     *   Explicitly forbid absolute file paths (`/etc`, `C:\Windows`) and directory traversal sequences (`../`).
 *   **Command Execution Restrictions:**
     *   Strictly prohibit native sub-shell calls (`subprocess`, `os.system()`, `eval()`, `exec()`) within tool routines.
+*   **Exception — the code tools** (`check_code` and `run_code` in `tools/code_tools.py`): these two tools, and only these, may start a subprocess (gcc/g++, or the program itself) and read a file given by path. The guards that stand in for the rules above:
+    *   `run_code` is bound only in an **admin session** — unlocked at startup by the Argon2id-hashed admin password (§2) — and every run is confirmed by the user *outside the model*: a terminal `[y/N]`, or a spoken yes matched in code. The model can request a run; it can never supply the yes.
+    *   **Guest sessions** get `check_code` with pasted code only. File paths are refused, and C/C++ may only `#include <...>` system headers: quoted, absolute and `..` includes (and `#embed`) are refused before the compiler sees the code, because compiler diagnostics quote source lines.
+    *   The **admin** may pass paths, but only to `.py` `.c` `.h` `.cpp` `.cc` `.cxx` `.hpp` files — never `.env*` or the password hash — and the language argument cannot override the extension.
+    *   Programs run in a fresh temporary directory with no stdin, a hard time limit, the whole process tree killed on timeout, and output capped before it reaches the model.
+    *   Design: `docs/superpowers/specs/2026-11-10-code-check-and-run-design.md`.
 
 ---
 
