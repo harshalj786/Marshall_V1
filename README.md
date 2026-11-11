@@ -1,6 +1,6 @@
 # Marshall - Advanced RAG Pipeline Framework
 
-**Marshall** is a modular Retrieval-Augmented Generation (RAG) framework built on **LangChain + LangGraph**. It loads documents from many formats, chunks them, stores embeddings in a vector database, and answers questions through either classic RAG pipelines, LangGraph state-machine graphs, or a **ReAct-style agent** with five tools (calculator, doc-search, Wikipedia, web search, and long-term user-memory recall).
+**Marshall** is a modular Retrieval-Augmented Generation (RAG) framework built on **LangChain + LangGraph**. It loads documents from many formats, chunks them, stores embeddings in a vector database, and answers questions through either classic RAG pipelines, LangGraph state-machine graphs, or a **ReAct-style agent** with five tools (calculator, doc-search, Wikipedia, web search, and long-term user-memory recall). You can **type** to the agent (`chat_main.py`) or **talk** to it (`voice_main.py`), and in a password-unlocked session it can **check and run Python, C and C++ code** — each run confirmed by you, outside the model.
 
 > *"I am Marshall, the AI son of Harshal."*
 
@@ -25,9 +25,19 @@
   - `ChatRagWithMemoryGraph` - LangGraph version with a 5-turn memory-gate
   - `AgentGraph` - **ReAct-style agent** with tool-calling *and* a long-term memory gate
 - **Tool-Calling Layer** (`tools/`): `calculator`, `wikipedia_lookup`, `web_search`, `search_current_doc`, `recall_user_memory`
+- **Code Tools** (`tools/code_tools.py`): `check_code` compiles or syntax-checks Python, C and
+  C++ without running it; `run_code` runs it in a temp directory with a time limit — admin
+  sessions only, and only after you confirm with a terminal `[y/N]` or a spoken "yes"
+- **Admin and Guest Sessions** (`admin_session.py`): an Argon2id-hashed admin password asked
+  at startup. Guests can have pasted code checked but never run, and leave no memory behind;
+  the password never reaches the model
+- **Voice** (`voice/`, `voice_main.py`): open mic → silero VAD → faster-whisper → the agent →
+  Kokoro TTS, with barge-in (talk over Marshall and he stops) — headphones recommended
 - **Dual-Layer Memory on the Agent**: short-term LangGraph state alongside a persistent
   ChromaDB user profile — injected automatically every *N* turns, and searchable on demand
   by the agent itself. Recall works across conversations and across process restarts.
+- **Conversation Summarization**: long conversations are compressed into a running summary
+  so the context stays bounded
 
 ---
 
@@ -35,25 +45,48 @@
 
 ```
 Marshall_V1$/
+├── chat_main.py          # Type to Marshall: admin password prompt, then the agent's chat loop
+├── voice_main.py         # Talk to Marshall: password prompt, model boot, the voice loop, --check
+├── admin_session.py      # Admin/guest sessions: Argon2id password, guest counter, [y/N] confirmer
 ├── pipeline.py           # Legacy LangChain pipelines (NRagPipeline, ChatRagPipeline, ChatRagPipelineWithMemory)
 ├── pipeline_lg.py        # LangGraph graphs (ChatRagGraph, ChatRagWithMemoryGraph, AgentGraph)
+├── warmup.py             # Loads the embedding models ahead of the first turn
 ├── ingestion/
 │   ├── doc_loader.py     # Document loading (PDF, scanned PDF, web, YouTube, CSV, TXT, folder)
 │   ├── chunking.py       # Text chunking strategies (recursive, semantic)
 │   ├── vector_db.py      # ChromaDB vector store builder
+│   ├── ingest.py         # Ingest once, then reopen the existing index
 │   └── __init__.py
 ├── retreival/
 │   ├── retrieval.py      # Retrieval strategies (simple, MMR, MQR, wiki)
 │   └── __init__.py
 ├── memory/
 │   ├── long_term_memory.py  # UserMemory — persistent user profile (compress + semantic recall)
+│   ├── reconciliation.py    # Tool-safe cut points for trimming the message list
 │   └── __init__.py
 ├── tools/
 │   ├── tools.py          # Agent tools (calculator, wikipedia_lookup, web_search,
 │   │                     #   search_current_doc, recall_user_memory)
+│   ├── code_tools.py     # check_code and run_code
+│   ├── code_guards.py    # What the code tools may read: languages, paths, includes
 │   └── __init__.py
-├── db/                   # Vector database persistence (gitignored)
-├── labbb.ipynb          # Jupyter notebook for testing/experimentation
+├── voice/
+│   ├── orchestrator.py   # LISTENING → THINKING → (CONFIRMING) → SPEAKING loop, barge-in
+│   ├── audio_io.py       # Microphone and speaker
+│   ├── vad.py            # silero VAD: utterance endpointing and the barge-in guard
+│   ├── stt.py            # faster-whisper transcription
+│   ├── tts.py            # Kokoro speech synthesis
+│   ├── confirm.py        # The spoken yes/no for run_code, matched in code
+│   ├── config.py         # VoiceConfig
+│   ├── telemetry.py      # Per-turn latency rows (voice_logs/turns.jsonl)
+│   └── __init__.py
+├── scripts/
+│   ├── set_admin_password.py      # Set the admin password (once)
+│   ├── check_routing.py           # Does llama3.1 still pick the right tool? (R4's table)
+│   └── check_code_tool_routing.py # Do the code tools make ordinary chat worse? (A/B)
+├── tests/                # pytest suite; `pytest -m "not needs_ollama"` is what CI runs
+├── docs/                 # Architecture review, security policy, designs and plans
+├── db/                   # Vector stores, memory, summaries, admin password hash (gitignored)
 ├── .env                  # API keys (gitignored)
 ├── .gitignore           # Git ignore configuration
 └── README.md            # Project documentation
@@ -429,7 +462,9 @@ Configure retrieval parameters at query time:
 
 ## Requirements
 
-- Python 3.9+
+- Python 3.12 (`requirements.txt` is tested on CPython 3.12.9, Windows)
+- `gcc` and `g++` on PATH for checking and running C/C++ code (MinGW-w64 on Windows);
+  without them `check_code` still handles Python and reports that no compiler was found
 - Ollama running locally
   - `mistral` for the RAG pipelines (LangChain + LangGraph chat graphs), and for
     `UserMemory`'s profile compression — non-tool text generation, which it does well
@@ -451,8 +486,9 @@ Configure retrieval parameters at query time:
 - **AgentGraph**: ReAct loop plus a memory gate, using `ChatOllama.bind_tools` + `langgraph.prebuilt.ToolNode`:
 
   ```text
-  START → count_turn → {summarize_user_history → agent, agent}
-  agent → tools_condition → {tools → agent, END}
+  START → count_turn → {summarize_and_trim, summarize_user_history, agent}
+  summarize_and_trim → {summarize_user_history, agent}
+  agent → tools_condition → {tools → agent, END}      # or through agent_hook, if one is set
   ```
 
   The turn counter deliberately sits *before* `agent` rather than inside it: the ReAct loop
@@ -499,6 +535,11 @@ This project uses:
 - **HuggingFace Transformers** for embeddings
 - **Ollama** for local LLM inference
 - **Mistral** as the default RAG model; **llama3.1** for the tool-calling agent
+- **silero-vad**, **faster-whisper** and **Kokoro** for the voice loop
+- **gcc / g++** and **argon2-cffi** for the code tools and the admin password
+
+Run the tests with `pytest -m "not needs_ollama"` (what CI runs), or plain `pytest` with
+Ollama up and llama3.1 pulled to include the live tool-routing gates.
 
 ---
 
