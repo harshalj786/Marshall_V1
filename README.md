@@ -116,6 +116,15 @@ GEMINI_API_KEY="your-gemini-key"
 
 ## Usage
 
+### Quick start: talk to Marshall
+
+```bash
+python chat_main.py                  # type; asks for the admin password first (Enter = guest)
+python voice_main.py                 # talk; same password prompt, headphones recommended
+```
+
+See [Sessions, the admin password and running code](#sessions-the-admin-password-and-running-code).
+
 ### Single Query Mode
 
 ```python
@@ -227,6 +236,33 @@ print(agent.invoke("what are the top news stories today?", config=cfg))
 | `wikipedia_lookup` | Top-k Wikipedia articles with retry-on-empty |
 | `web_search` | DuckDuckGo web search for time-sensitive queries |
 | `recall_user_memory` | Semantic search over what the *user* said in earlier conversations |
+| `check_code` | Compile or syntax-check Python, C or C++ **without running it** — bound only with a `session` (below) |
+| `run_code` | Run Python, C or C++ after the user confirms **outside the model** — admin sessions only |
+
+### Sessions, the admin password and running code
+
+Set the admin password once (stored as an Argon2id hash in `db/admin/`, never in git):
+
+```bash
+python scripts/set_admin_password.py
+```
+
+Both entry points ask for it before anything loads — `python chat_main.py` for typing,
+`python voice_main.py` for talking. Press Enter instead for a guest session.
+
+| | Guest session | Admin session |
+|---|---|---|
+| `check_code` | pasted code only; file paths refused; C/C++ may only `#include <system headers>` | pasted code or a path to a `.py` `.c` `.h` `.cpp` `.cc` `.cxx` `.hpp` file |
+| `run_code` | not available | yes — `[y/N]` in the terminal, or a spoken "yes" matched in code |
+| Memory | nothing kept: no recall, no summary, no long-term store | as before |
+| Guest count | recorded (a timestamp per session, nothing said) | Marshall can tell you on request |
+
+The password never reaches the model: it is checked in `admin_session.py` before the agent
+is built, and all the agent receives is which session it is. Runs happen in a temporary
+directory with no stdin, a 10 s limit and the whole process tree killed on timeout.
+`AgentGraph(session=None)` — the default — is exactly the five-tool agent described above.
+Design: `docs/superpowers/specs/2026-11-10-code-check-and-run-design.md`;
+policy: `docs/security.md` §4.
 
 **Extension hook.** `AgentGraph(agent_hook=(node, router))` inserts one caller-supplied
 node on the agent's outgoing edge, so it sees every generation — the intermediate
