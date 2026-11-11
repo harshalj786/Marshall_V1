@@ -45,7 +45,7 @@ from enum import Enum
 from typing import Optional
 
 from voice.config import VoiceConfig
-from voice.confirm import CONFIRM_SPOKEN, parse_yes_no
+from voice.confirm import confirm_question, parse_yes_no
 from voice.telemetry import TelemetryWriter, TurnTelemetry, Stopwatch
 from voice.vad import BargeInGuard, UtteranceDetector
 
@@ -243,7 +243,10 @@ class VoiceOrchestrator:
         point: the tool must not return until the user has answered. The event loop keeps
         running meanwhile, so the reader is what hears the answer.
         """
-        self.speaker.play(self.tts.synthesize(CONFIRM_SPOKEN))
+        #: shown BEFORE asked: the terminal gets the full code, the speaker names it
+        self._emit("confirm_request", turn_id=self.turn_id, language=request.language,
+                   origin=request.origin, source=request.source)
+        self.speaker.play(self.tts.synthesize(confirm_question(request)))
         #: Marshall's own question is in the queue; the answer must start after it
         self.mic.drain()
         self._confirm_detector.reset()

@@ -10,13 +10,27 @@ closes over its confirmer) is built BEFORE the orchestrator that owns the mic an
 The confirmer is handed to the agent empty and bound to the orchestrator once it exists.
 """
 import re
+from pathlib import PurePath
 
 #: the first word must be one of these...
 YES_WORDS = frozenset({"yes", "yeah", "yep", "yup", "sure", "okay", "ok", "affirmative"})
 #: ...and none of these may appear anywhere. "yes, no wait" is a no.
 NO_WORDS = frozenset({"no", "nope", "not", "don't", "dont", "never", "stop", "cancel", "wait"})
 
-CONFIRM_SPOKEN = "I'm about to run this code. Is that okay?"
+#: how each language is SAID — "cpp" read aloud by Kokoro is not a word anyone uses
+_SPOKEN_LANGUAGE = {"python": "Python", "c": "C", "cpp": "C plus plus"}
+
+
+def confirm_question(request) -> str:
+    """The spoken question, naming what will run: the file, or the language of pasted code.
+
+    A voice yes must not be a blind yes. The full code is also put on the terminal by the
+    orchestrator; this is the part that reaches someone who is only listening.
+    """
+    if request.origin == "pasted":
+        language = _SPOKEN_LANGUAGE.get(request.language, request.language)
+        return f"I'm about to run the {language} code you gave me. Is that okay?"
+    return f"I'm about to run {PurePath(request.origin).name}. Is that okay?"
 
 
 def parse_yes_no(transcript: str) -> bool:

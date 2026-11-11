@@ -65,6 +65,15 @@ def test_reporter_prints_the_confirm_event(capsys):
     assert "[?!] confirming" in out
 
 
+def test_reporter_prints_the_code_to_be_run_escaped(capsys):
+    report = voice_main._make_reporter()
+    report("confirm_request", {"turn_id": 1, "language": "python", "origin": "pasted",
+                               "source": "print(1)\x1b[2K\nprint(2)"})
+    out = capsys.readouterr().out
+    assert "python (pasted)" in out and "print(1)" in out and "print(2)" in out
+    assert "\x1b[2K" not in out
+
+
 def test_run_voice_binds_the_confirmer_to_the_orchestrator(monkeypatch):
     """The agent is built before the orchestrator, so the confirmer must be bound after."""
     import asyncio

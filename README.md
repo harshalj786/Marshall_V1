@@ -252,8 +252,8 @@ Both entry points ask for it before anything loads — `python chat_main.py` for
 
 | | Guest session | Admin session |
 |---|---|---|
-| `check_code` | pasted code only; file paths refused; C/C++ may only `#include <system headers>` | pasted code or a path to a `.py` `.c` `.h` `.cpp` `.cc` `.cxx` `.hpp` file |
-| `run_code` | not available | yes — `[y/N]` in the terminal, or a spoken "yes" matched in code |
+| `check_code` | pasted code only; file paths refused; C/C++ may only pull in system headers (no `#embed`, `#line`, quoted or absolute includes) | pasted code or a path to a `.py` `.c` `.h` `.cpp` `.cc` `.cxx` `.hpp` file; `.env*` and the password hash are refused in every session |
+| `run_code` | not available | yes — all the code is shown first, then `[y/N]` in the terminal or a spoken "yes" matched in code |
 | Memory | nothing kept: no recall, no summary, no long-term store | as before |
 | Guest count | recorded (a timestamp per session, nothing said) | Marshall can tell you on request |
 

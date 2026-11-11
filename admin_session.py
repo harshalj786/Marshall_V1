@@ -29,9 +29,6 @@ ADMIN_HASH_PATH = "db/admin/password.hash"
 GUEST_LOG_PATH = "db/admin/guest_sessions.jsonl"
 PASSWORD_ATTEMPTS = 3
 
-#: how much code `terminal_confirm` prints before eliding the rest
-_CONFIRM_MAX_LINES = 60
-
 
 @dataclass(frozen=True)
 class Session:
@@ -118,15 +115,26 @@ def prompt_for_session(hash_path: str = ADMIN_HASH_PATH,
     return session
 
 
+def escape_for_terminal(text: str) -> str:
+    """Make every character visible: control and format characters become escapes.
+
+    The confirmation is only as good as what the user can SEE. A `\\r`, an ANSI erase-line
+    or a right-to-left override in the code would let part of it overwrite or reorder
+    another part on screen — and the model composes that code, possibly under injection.
+    """
+    return "".join(ch if ch == "\t" or ch.isprintable() else ascii(ch)[1:-1] for ch in text)
+
+
 def terminal_confirm(request: "RunRequest", input_fn=input, output=print) -> bool:
-    """Show the code about to run and ask `[y/N]`. Only "y" or "yes" runs it; EOF is no."""
-    lines = request.source.splitlines()
-    output(f"Marshall wants to run this {request.language} ({request.origin}):")
+    """Show ALL the code about to run and ask `[y/N]`. Only "y" or "yes" runs it; EOF is no.
+
+    Nothing is elided, because "y" runs everything: approving a program whose tail the user
+    never saw is not a confirmation. Split on "\\n" only, so a lone "\\r" is shown, not obeyed.
+    """
+    output(f"Marshall wants to run this {request.language} ({escape_for_terminal(request.origin)}):")
     output("-" * 60)
-    for line in lines[:_CONFIRM_MAX_LINES]:
-        output(line)
-    if len(lines) > _CONFIRM_MAX_LINES:
-        output(f"... ({len(lines) - _CONFIRM_MAX_LINES} more lines)")
+    for line in request.source.split("\n"):
+        output(escape_for_terminal(line))
     output("-" * 60)
     try:
         answer = input_fn("run it? [y/N] ")

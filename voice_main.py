@@ -382,6 +382,13 @@ def _make_reporter():
             print(f"\r  ...   discarded ({payload['reason']})")
         elif event == "error":
             print(f"\r  !     turn {payload['turn_id']} failed: {payload['error']}")
+        elif event == "confirm_request":
+            #: everything that would run, escaped — the same rule as terminal_confirm
+            from admin_session import escape_for_terminal
+            print(f"\r  ?     Marshall wants to run this {payload['language']} "
+                  f"({escape_for_terminal(payload['origin'])}):")
+            for line in payload["source"].split("\n"):
+                print(f"        {escape_for_terminal(line)}")
         elif event == "confirm":
             #: the run_code answer as Whisper heard it, so a wrong "no" is visible
             verdict = "yes" if payload["accepted"] else "no"

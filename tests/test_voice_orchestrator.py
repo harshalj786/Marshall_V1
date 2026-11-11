@@ -37,7 +37,7 @@ import pytest
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 
 from voice.config import VoiceConfig, VAD_FRAME_SAMPLES
-from voice.confirm import CONFIRM_SPOKEN
+from voice.confirm import confirm_question
 from voice.orchestrator import (
     INTERRUPTION_MARKER,
     State,
@@ -919,10 +919,31 @@ async def test_confirm_by_voice_hears_yes(tmp_path):
     for f in utterance_frames(config):
         parts["mic"].push(f)
     assert await wait_for(lambda: agent.answers == [True])
-    assert parts["tts"].synthesized == [CONFIRM_SPOKEN]
+    request = SimpleNamespace(language="python", source="print(1)", origin="pasted")
+    assert parts["tts"].synthesized == [confirm_question(request)]
     assert len(parts["speaker"].played) >= 1
     assert await wait_for(lambda: orchestrator.state is State.LISTENING)
     assert ("confirm", {"turn_id": 1, "transcript": "yes", "accepted": True}) in events
+    orchestrator.request_stop()
+    await task
+
+
+@asyncio_test
+async def test_confirm_by_voice_shows_the_code_before_asking(tmp_path):
+    # final review I2: a voice yes must not be a blind yes — the code is put on screen
+    events = []
+    agent = ConfirmingAgent()
+    orchestrator, parts, config = build(tmp_path, frames=utterance_frames(VoiceConfig()),
+                                        stt=ScriptedStt("run this code", "no"), agent=agent,
+                                        on_event=lambda e, p: events.append((e, p)))
+    agent.orchestrator = orchestrator
+    task = asyncio.ensure_future(orchestrator.run())
+    assert await wait_for(lambda: orchestrator.state is State.CONFIRMING)
+    shown = [p for e, p in events if e == "confirm_request"]
+    assert shown == [{"turn_id": 1, "language": "python", "origin": "pasted",
+                      "source": "print(1)"}]
+    names = [e for e, _ in events]
+    assert names.index("confirm_request") < names.index("state", names.index("confirm_request"))
     orchestrator.request_stop()
     await task
 

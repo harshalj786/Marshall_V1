@@ -139,13 +139,32 @@ def test_terminal_confirm_shows_the_code_and_language():
     assert "print(1)" in text and "python" in text and "pasted" in text
 
 
-def test_terminal_confirm_truncates_long_code():
+def test_terminal_confirm_shows_every_line_that_would_run():
+    # final review I3: "y" runs all of it, so all of it is shown — nothing elided
     shown = []
     source = "\n".join(f"x{i} = {i}" for i in range(100))
     terminal_confirm(RunRequest("python", source, "pasted"),
                      input_fn=lambda _: "n", output=shown.append)
     text = "\n".join(shown)
-    assert "x59 = 59" in text and "x60 = 60" not in text and "(40 more lines)" in text
+    assert "x0 = 0" in text and "x99 = 99" in text and "more lines" not in text
+
+
+@pytest.mark.parametrize("hidden", ["\x1b[2K", "\r", "\x1b[1A", "\x08", "\x00", "\u202e"])
+def test_terminal_confirm_escapes_control_characters(hidden):
+    # final review I3: a carriage return or an ANSI escape could overwrite a line on screen
+    shown = []
+    source = f"print('safe'){hidden}import os; os.remove('x')"
+    terminal_confirm(RunRequest("python", source, "pasted"),
+                     input_fn=lambda _: "n", output=shown.append)
+    text = "\n".join(shown)
+    assert hidden not in text
+    assert "import os; os.remove('x')" in text
+
+
+def test_escape_for_terminal_keeps_tabs_and_printable_text():
+    from admin_session import escape_for_terminal
+    assert escape_for_terminal("a\tb = 'ü'") == "a\tb = 'ü'"
+    assert escape_for_terminal("x\x1by") == "x\\x1by"
 
 
 def test_terminal_confirm_eof_is_no():
