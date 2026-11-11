@@ -262,3 +262,118 @@ def test_run_code_tool_is_named_and_documented():
     tool = make_run_code(lambda r: False)
     assert tool.name == "run_code"
     assert "ONLY when the user explicitly asks" in tool.description
+
+
+# ==========================================================================
+# final review C1/I1: no file contents through check_code, by any preprocessor route
+# ==========================================================================
+
+SECRET = "supersecret123"
+
+
+@pytest.fixture
+def secret_file(tmp_path):
+    p = tmp_path / "secret.env.txt"
+    p.write_text(f"API_KEY={SECRET}\n", encoding="utf-8")
+    return p.as_posix()
+
+
+def _guest_leaks(code: str, language: str = "c") -> str:
+    return make_check_code(False).invoke({"code": code, "language": language})
+
+
+#: each reproducer from the final review, verbatim in shape: every one leaked the secret
+LEAK_REPRODUCERS = {
+    "line-directive": '#line 1 "{f}"\nint x = ;\n',
+    "gnu-linemarker": '# 1 "{f}"\nint x = ;\n',
+    "comment-before-hash": '/**/#include "{f}"\n',
+    "multiline-comment-before": '/* a\nb */ #include "{f}"\n',
+    "comment-inside-directive": '# /**/ include "{f}"\n',
+    "digraph": '%:include "{f}"\n',
+    "line-splice": '#\\\ninclude "{f}"\n',
+}
+
+
+@needs_gcc
+@pytest.mark.parametrize("name", list(LEAK_REPRODUCERS))
+@pytest.mark.parametrize("language", ["c", "cpp"])
+def test_guest_check_code_never_leaks_a_file(secret_file, name, language):
+    out = _guest_leaks(LEAK_REPRODUCERS[name].format(f=secret_file), language)
+    assert SECRET not in out, out
+    assert out.startswith("check_code refused:"), out
+
+
+@needs_gcc
+def test_guest_cpp_embed_in_a_template_never_leaks(secret_file):
+    code = f'template<int...> struct S; S<\n/**/#embed "{secret_file}"\n> s;\n'
+    out = _guest_leaks(code, "cpp")
+    assert SECRET not in out and "65, 80, 73" not in out, out
+    assert out.startswith("check_code refused:"), out
+
+
+@needs_gcc
+def test_guest_system_headers_still_compile():
+    out = _guest_leaks("#include <stdio.h>\n#include <stdlib.h>\nint main(void){return 0;}\n")
+    assert "compiled cleanly" in out, out
+
+
+@needs_gcc
+def test_a_string_that_looks_like_a_comment_does_not_hide_a_directive(secret_file):
+    code = f'const char *s = "/*";\n#include "{secret_file}"\nconst char *t = "*/";\n'
+    out = _guest_leaks(code)
+    assert SECRET not in out and out.startswith("check_code refused:"), out
+
+
+@needs_gcc
+def test_diagnostics_never_quote_source_lines():
+    # the caret line is how #line read other files; it is off everywhere now
+    out = _guest_leaks("int main(void) { return 0 }\n")
+    assert "compile FAILED" in out and " | " not in out, out
+
+
+@needs_gcc
+@pytest.mark.parametrize("name", [".env", "password.hash"])
+def test_admin_pasted_code_cannot_include_env_or_the_hash(tmp_path, name):
+    target = tmp_path / name
+    target.write_text(f"API_KEY={SECRET}\n", encoding="utf-8")
+    for directive in ("#include", "#embed"):
+        code = f'const char d[] = {{\n{directive} "{target.as_posix()}"\n}};\n'
+        out = make_check_code(True).invoke({"code": code, "language": "c"})
+        assert SECRET not in out, out
+        assert out.startswith("check_code refused:"), out
+
+
+@needs_gcc
+def test_admin_may_still_include_its_own_header(tmp_path):
+    (tmp_path / "util.h").write_text("int helper(void);\n", encoding="utf-8")
+    src = tmp_path / "main.c"
+    src.write_text('#include "util.h"\nint main(void){return helper();}\n', encoding="utf-8")
+    out = make_check_code(True).invoke({"path": str(src)})
+    assert "compiled cleanly" in out, out
+
+
+# ==========================================================================
+# final review I4: a UTF-8 BOM is not a syntax error
+# ==========================================================================
+
+def test_admin_check_code_accepts_a_utf8_bom_python_file(tmp_path):
+    p = tmp_path / "bom.py"
+    p.write_text("print(1)\n", encoding="utf-8-sig")
+    assert "python syntax OK" in make_check_code(True).invoke({"path": str(p)})
+
+
+def test_run_code_shows_a_bom_file_without_the_bom(tmp_path):
+    p = tmp_path / "bom.py"
+    p.write_text("print(1)\n", encoding="utf-8-sig")
+    seen = []
+    make_run_code(lambda r: seen.append(r) or False).invoke({"path": str(p)})
+    assert seen[0].source == "print(1)\n"
+
+
+# ==========================================================================
+# final review M1 (re-graded Important): a fenced block inside prose
+# ==========================================================================
+
+def test_check_code_finds_one_fenced_block_inside_prose():
+    msg = "Here is my code:\n```python\nprint(1)\n```\nis it right?"
+    assert "python syntax OK" in make_check_code(False).invoke({"code": msg, "language": "python"})

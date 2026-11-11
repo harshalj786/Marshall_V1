@@ -21,13 +21,15 @@ import sys
 import tempfile
 import time
 from dataclasses import dataclass
+from functools import lru_cache
 from pathlib import Path
 from typing import Callable, Optional
 
 from langchain_core.tools import tool, BaseTool
 
-from tools.code_guards import (CodeGuardError, find_forbidden_includes, normalize_language,
-                               resolve_source_path, strip_code_fences)
+from tools.code_guards import (CodeGuardError, find_forbidden_includes, find_secret_references,
+                               is_secret_name, normalize_language, resolve_source_path,
+                               strip_code_fences)
 from tools.tools import _cap_output
 
 
@@ -43,6 +45,16 @@ SYNTAX_ONLY_NOTE = ("syntax only: errors that happen while running, such as a di
 
 _COMPILERS = {"c": "gcc", "cpp": "g++"}
 _PASTED_SUFFIX = {"python": ".py", "c": ".c", "cpp": ".cpp"}
+_GCC_LANGUAGE = {"c": "c", "cpp": "c++"}
+
+#: no caret line under diagnostics. The caret line is gcc RE-READING a source line from
+#: disk, from whatever file a `#line` directive named — that is how `#line 1 "secret"`
+#: printed the secret. With it off, a diagnostic carries a file name, never file contents.
+_CARET_OFF = "-fno-diagnostics-show-caret"
+
+#: BOM-tolerant: Windows editors save "UTF-8 with signature", and a stray U+FEFF would be
+#: reported as a syntax error on line 1 of correct code
+_SOURCE_ENCODING = "utf-8-sig"
 
 
 @dataclass(frozen=True)
@@ -81,7 +93,7 @@ def check_c_family(source_path: Path, language: str, display_name: str) -> Check
     with tempfile.TemporaryDirectory(prefix="marshall-check-") as scratch:
         try:
             completed = subprocess.run(
-                [compiler, "-fsyntax-only", "-Wall", str(source_path)],
+                [compiler, "-fsyntax-only", "-Wall", _CARET_OFF, str(source_path)],
                 capture_output=True, text=True, errors="replace",
                 timeout=COMPILE_TIMEOUT_SECONDS, cwd=scratch, stdin=subprocess.DEVNULL)
         except subprocess.TimeoutExpired:
@@ -95,13 +107,95 @@ def check_c_family(source_path: Path, language: str, display_name: str) -> Check
     return CheckResult(True, report + (f"\nwarnings:\n{stderr}" if stderr else ""))
 
 
-def _check(source: str, language: str, display_name: str) -> CheckResult:
+@lru_cache(maxsize=None)
+def _system_include_dirs(compiler: str, language: str) -> tuple:
+    """The compiler's own `#include <...>` search list, as `gcc -E -v` reports it."""
+    completed = subprocess.run(
+        [compiler, "-x", _GCC_LANGUAGE[language], "-E", "-v", "-"],
+        input="", capture_output=True, text=True, errors="replace",
+        timeout=COMPILE_TIMEOUT_SECONDS)
+    dirs, inside = [], False
+    for line in (completed.stderr or "").splitlines():
+        if line.startswith("#include <...> search starts here"):
+            inside = True
+        elif line.startswith("End of search list"):
+            break
+        elif inside and line.strip():
+            dirs.append(os.path.normcase(os.path.realpath(line.strip())))
+    return tuple(dirs)
+
+
+def _dependencies(compiler: str, source_path: Path) -> list:
+    """Every file the preprocessor opens for `source_path`, via `gcc -M`. Output only parsed.
+
+    Its stdout is a make rule and its stderr is discarded — this pass exists to LOOK at what
+    would be read, never to show anything. A failed pass (a missing header is fatal) still
+    yields the files read up to that point, and the real check stops at the same place.
+    `#embed` files are NOT listed by `-M`; `find_forbidden_includes` and
+    `find_secret_references` are what stop those.
+    """
+    #: a timeout propagates rather than returning [] — "nothing was listed" must never be
+    #: read as "nothing was read"; the tool bodies turn it into the compiler-timeout report
+    with tempfile.TemporaryDirectory(prefix="marshall-deps-") as scratch:
+        completed = subprocess.run(
+            [compiler, "-M", str(source_path)], capture_output=True, text=True,
+            errors="replace", timeout=COMPILE_TIMEOUT_SECONDS, cwd=scratch,
+            stdin=subprocess.DEVNULL)
+    rule = (completed.stdout or "").replace("\\\r\n", " ").replace("\\\n", " ")
+    _, _, deps = rule.partition(": ")
+    #: a make rule escapes spaces in file names as "\ "
+    tokens = deps.replace("\\ ", "\0").split()
+    return [token.replace("\0", " ") for token in tokens if token != "\\"]
+
+
+def include_guard(source: str, language: str, guest: bool,
+                  source_path: Optional[Path] = None) -> Optional[str]:
+    """Why this C/C++ source may not be compiled, or None. Reads, never reports contents.
+
+    Three layers, because compiler diagnostics quote what they read: a normalised text scan
+    (comments, splices and digraphs cannot hide a directive), a `gcc -M` pass listing the
+    files the preprocessor would really open, and `_CARET_OFF` on every compile. A guest may
+    pull in system headers only; in every session `.env*` and the password hash are refused.
+    """
+    if guest:
+        hits = find_forbidden_includes(source)
+        if hits:
+            return f"guest code may only #include <system headers>; found: {hits[0].strip()}"
+    secret = find_secret_references(source)
+    if secret:
+        return f"{secret[0].strip()} names a secrets file, which is never read"
+    compiler = compiler_for(language)
+    if compiler is None:
+        return None          # nothing can be compiled; the check reports the missing compiler
+    with tempfile.TemporaryDirectory(prefix="marshall-guard-") as workdir:
+        if source_path is None:
+            source_path = Path(workdir) / f"pasted{_PASTED_SUFFIX[language]}"
+            source_path.write_text(source, encoding="utf-8")
+        own = os.path.normcase(os.path.realpath(source_path))
+        system = _system_include_dirs(compiler, language)
+        for dep in _dependencies(compiler, source_path):
+            real = os.path.normcase(os.path.realpath(dep))
+            if real == own:
+                continue
+            name = os.path.basename(real)
+            if is_secret_name(name):
+                return f"the code pulls in {name}, a secrets file, which is never read"
+            if guest and not any(real.startswith(d + os.sep) for d in system):
+                return ("guest code may only #include <system headers>; "
+                        f"found a dependency outside them: {name}")
+    return None
+
+
+def _check(source: str, language: str, display_name: str, guest: bool) -> str:
     if language == "python":
-        return check_python(source, display_name)
+        return check_python(source, display_name).report
+    refusal = include_guard(source, language, guest)
+    if refusal:
+        return f"check_code refused: {refusal}"
     with tempfile.TemporaryDirectory(prefix="marshall-src-") as workdir:
         src = Path(workdir) / f"pasted{_PASTED_SUFFIX[language]}"
         src.write_text(source, encoding="utf-8")
-        return check_c_family(src, language, display_name)
+        return check_c_family(src, language, display_name).report
 
 
 def make_check_code(allow_paths: bool) -> BaseTool:
@@ -131,22 +225,23 @@ def _check_code_body(code: str, language: str, path: str, allow_paths: bool) -> 
                 return ("check_code refused: file paths are not available in a guest session; "
                         "paste the code instead")
             resolved, lang = resolve_source_path(path, language)
-            source = resolved.read_text(encoding="utf-8", errors="replace")
+            source = resolved.read_text(encoding=_SOURCE_ENCODING, errors="replace")
             if lang == "python":
                 return check_python(source, path.strip()).report
+            refusal = include_guard(source, lang, guest=False, source_path=resolved)
+            if refusal:
+                return f"check_code refused: {refusal}"
             return check_c_family(resolved, lang, path.strip()).report
         source = strip_code_fences(code)
         if not (language or "").strip():
             return "check_code error: say which language the code is: python, c or cpp"
         lang = normalize_language(language)
-        if lang != "python" and not allow_paths:
-            hits = find_forbidden_includes(source)
-            if hits:
-                return ("check_code refused: guest code may only #include <system headers>; "
-                        f"found: {hits[0].strip()}")
-        return _check(source, lang, "code").report
+        return _check(source, lang, "code", guest=not allow_paths)
     except CodeGuardError as err:
         return f"check_code refused: {err}"
+    except subprocess.TimeoutExpired:
+        # from the guard's own gcc passes: fail closed, nothing was compiled
+        return f"check_code error: compiler timed out after {COMPILE_TIMEOUT_SECONDS:g}s"
 
 
 # ==========================================================================
@@ -237,7 +332,7 @@ def compile_c_family(source_path: Path, language: str, workdir: Path,
     exe = Path(workdir) / ("program.exe" if sys.platform == "win32" else "program")
     try:
         completed = subprocess.run(
-            [compiler, "-Wall", "-o", str(exe), str(source_path)],
+            [compiler, "-Wall", _CARET_OFF, "-o", str(exe), str(source_path)],
             capture_output=True, text=True, errors="replace",
             timeout=COMPILE_TIMEOUT_SECONDS, cwd=str(workdir), stdin=subprocess.DEVNULL)
     except subprocess.TimeoutExpired:
@@ -285,7 +380,7 @@ def _run_code_body(code: str, language: str, path: str,
         resolved: Optional[Path] = None
         if (path or "").strip():
             resolved, lang = resolve_source_path(path, language)
-            source = resolved.read_text(encoding="utf-8", errors="replace")
+            source = resolved.read_text(encoding=_SOURCE_ENCODING, errors="replace")
             origin = path.strip()
         else:
             source = strip_code_fences(code)
@@ -295,6 +390,14 @@ def _run_code_body(code: str, language: str, path: str,
             origin = "pasted"
     except CodeGuardError as err:
         return f"run_code refused: {err}"
+    if lang != "python":
+        #: before the confirmation, so a refusal costs the user nothing to answer
+        try:
+            refusal = include_guard(source, lang, guest=False, source_path=resolved)
+        except subprocess.TimeoutExpired:
+            return f"run_code error: compiler timed out after {COMPILE_TIMEOUT_SECONDS:g}s"
+        if refusal:
+            return f"run_code refused: {refusal}"
 
     #: the gate. Everything above only reads; nothing below happens without a yes.
     if not confirm(RunRequest(language=lang, source=source, origin=origin)):
