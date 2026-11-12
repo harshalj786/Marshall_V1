@@ -2,6 +2,7 @@
 
     python scripts/check_routing.py              # all six routes
     python scripts/check_routing.py --route math # one route, for a fast retry
+    python scripts/check_routing.py --json out/routing.json  # also write the eval record
     pytest tests/test_routing_matrix.py -v       # the same matrix, as a gate
 
 **The gap this closes.** `voice_main.py --check` loads every model, probes the mic and
@@ -127,10 +128,11 @@ ROUTES = (
           "what do you think makes a good explanation?", None, must_pass=False),
 )
 
-PASS = "PASS"
-FAIL = "FAIL"
-BOUNDARY = "KNOWN-BOUNDARY"
-ERROR = "ERROR"
+#: the verdicts live in the shared contract; re-exported here because
+#: tests/test_routing_matrix.py and scripts/check_code_tool_routing.py import them from
+#: this module, and that import must keep working unchanged
+from scripts.eval_contract import (BOUNDARY, ERROR, FAIL, PASS,  # noqa: E402,F401
+                                   CaseResult, CheckRecord, write_record)
 
 
 @dataclass
@@ -451,23 +453,42 @@ def parse_args(argv=None):
                         help="run a single route instead of all six")
     parser.add_argument("--fresh", action="store_true",
                         help=f"delete {CHECK_USER_HISTORY_PATH} and re-seed it first")
+    parser.add_argument("--json", default=None, metavar="PATH",
+                        help="also write the eval record (scripts/eval_contract.py) to PATH")
     return parser.parse_args(argv)
+
+
+def to_case(result: RouteResult) -> CaseResult:
+    return CaseResult(id=result.route.name, verdict=result.verdict,
+                      wall_seconds=result.seconds, error=result.error)
 
 
 def main(argv=None) -> int:
     args = parse_args(argv)
+    record = CheckRecord(check="routing", model=voice_main.VOICE_MODEL)
+    code = _run(args, record)
+    #: written on every exit path, including 2 (record.error says why). Additive: without
+    #: --json nothing here runs, and a failed write never changes the exit code.
+    if args.json:
+        write_record(record, args.json)
+    return code
 
+
+def _cannot_run(record: CheckRecord, message: str) -> int:
+    print(message, file=sys.stderr)
+    record.error = message
+    return 2
+
+
+def _run(args, record: CheckRecord) -> int:
     if not ollama_up():
-        print("Ollama is not reachable on :11434 - start it and try again.", file=sys.stderr)
-        return 2
+        return _cannot_run(record, "Ollama is not reachable on :11434 - start it and try again.")
     if not model_available(voice_main.VOICE_MODEL):
-        print(f"{voice_main.VOICE_MODEL} is not pulled: ollama pull {voice_main.VOICE_MODEL}",
-              file=sys.stderr)
-        return 2
+        return _cannot_run(record, f"{voice_main.VOICE_MODEL} is not pulled: "
+                                   f"ollama pull {voice_main.VOICE_MODEL}")
     document = args.file or voice_main.DEFAULT_DOCUMENT
     if not Path(document).exists():
-        print(f"no such document: {document}", file=sys.stderr)
-        return 2
+        return _cannot_run(record, f"no such document: {document}")
 
     print("=" * 72)
     print("ROUTING CHECK")
@@ -483,8 +504,7 @@ def main(argv=None) -> int:
         agent = build_check_agent(document, fresh=args.fresh)
         seed_memory(agent)
     except Exception as exc:
-        print(f"could not build the agent: {type(exc).__name__}: {exc}", file=sys.stderr)
-        return 2
+        return _cannot_run(record, f"could not build the agent: {type(exc).__name__}: {exc}")
     bound = [tool.name for tool in agent.tools]
     print(f"  tools      {len(bound)} bound: {', '.join(bound)}")
     #: R4's trap, stated where someone about to "simplify" this would read it
@@ -501,6 +521,7 @@ def main(argv=None) -> int:
         print("-" * 72)
         result = run_route(agent, route)
         results.append(result)
+        record.cases.append(to_case(result))
         print_result(result)
 
     return 0 if print_summary(results, time.perf_counter() - started) else 1
