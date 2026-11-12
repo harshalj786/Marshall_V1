@@ -60,6 +60,8 @@ logs/
 # per-turn voice latency rows: runtime measurements from one machine, not source.
 # The format is pinned by tests/test_voice_units.py; the data is not shared.
 voice_logs/
+# eval run history (scripts/run_evals.py): same reasoning — one machine's measurements.
+eval_logs/
 
 # Temporary files
 *.tmp
