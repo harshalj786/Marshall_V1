@@ -108,8 +108,9 @@ From the audit, these exist and are tested:
 - NOT yet wired to the agent, Chroma, or voice — that is Feature 5. Hand-typed for now.
 
 ## Known debts (decided, not blocking)
-- Structure_pipeline in pipeline.py: DELETING (broken placeholder + old
-  prompt-injection pattern). pipeline.py is orphaned (only tests import it).
+- Structure_pipeline in pipeline.py: deleted in commit "pipeline: delete the broken
+  Structure_pipeline placeholder"; R9 (rest of pipeline.py) still open. (Broken
+  placeholder + old prompt-injection pattern.) pipeline.py is orphaned (only tests import it).
 - Durable checkpointer (R8): conversation message state dies on restart. Folded
   into Feature 5.
 - .github/workflows/tests.yml header comment says 21/220; real split is 31/409.

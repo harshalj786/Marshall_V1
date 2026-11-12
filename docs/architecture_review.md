@@ -33,9 +33,10 @@
 | **H6** — memory written from the constructor, so reads wrote too | `[FIXED]` — `memory/long_term_memory.py`, `pipeline_lg.py` |
 | **§10 startup cost** — ingestion and MiniLM load ahead of the first word | `[FIXED]` — R1 for ingestion; `warmup.py` + `voice_main.boot` for the model loads |
 | **R8** — checkpointer still `MemorySaver` (H2's remaining half) | open — `AgentGraph(checkpointer=...)` seam landed (`d879bab`); default still `MemorySaver`, `SqliteSaver` lifecycle unsolved |
-| **R9** — decide the fate of `pipeline.py` | open — undecided; `pipeline.py` untouched since `5b2c04f` |
+| **R9** — decide the fate of `pipeline.py` | open — `Structure_pipeline` deleted (H5); the rest of `pipeline.py` undecided |
+| **H5** — `Structure_pipeline` broken and duplicated | `[FIXED]` — deleted from `pipeline.py` |
 | **M1, M2** — seven-way ingestion block; no `BuildKnowledge` singleton | `[PARTIALLY FIXED — see R1]` — six of seven sites and the singleton; `Structure_pipeline` and the two embeddings import paths remain |
-| **H3, H5, M3–M9, L1–L14** | open |
+| **H3, M3–M9, L1–L14** | open |
 
 All three criticals plus H1, H2 and H4 are closed. **H2's second half is not, and it is the half that loses data.** The agent's context no longer grows without bound — `summarize_and_trim` sees to that — but `MemorySaver` is still in-RAM and still per-object, so every checkpoint of every thread dies with the process. The only thing that survives a restart today is `{summary_persist_path}/conversation_summary.json`, reloaded by `invoke` when a thread has no in-RAM history; the message list itself, the turn count and the compressed profile do not. `SqliteSaver` (R8, `docs/archive/roadmap_v2_dead.md` Phase 1, already specified by `docs/archive/tech_stack_v2_dead.md` §2) is what remains of H2. ~~**H6** (`UserMemory` writes from its constructor) is now the highest-severity fully-open finding.~~ `[FIXED]` H6 is closed — construction opens, `.index()` writes, and the recall tool holds a read-only handle. It was closed *because* it stopped being theoretical: the routing gate caught the read path retrieving the query it had just written. **R8 is now the highest-severity open finding**, and the two remaining HIGHs (H3, H5) are both in `pipeline.py`. *(As of `d879bab` `AgentGraph` takes a `checkpointer` argument, so a durable saver can be injected without touching a call site — but the default is unchanged and the lifecycle problem R8's trade-off predicted is now written into the class docstring as `UNSOLVED`. The two chat graphs still construct their own `MemorySaver`. R8 stays open; see its entry in §9.)*
 
@@ -730,7 +731,7 @@ No trim node in `_build_graph` (546-563), by design (`README.md:267-269`); `Memo
 >
 > **Verified against the pre-fix code.** `tests/test_memory_gate_resilience.py` covers compression failure, construction failure, the `{}`-not-blank distinction, the happy path, parity between the two graphs, and two end-to-end runs proving a gate-tripping turn still returns an answer and a good profile survives a later failure. Run against the unguarded version, 6 of the 9 fail; the 3 that pass are the two signature assertions and the happy path, which the fix should not affect. The end-to-end tests skip automatically when Ollama is unreachable.
 
-**H5. `Structure_pipeline` is broken and is a 133-line copy.**
+**H5. `Structure_pipeline` is broken and is a 133-line copy.** `[FIXED]` — the class is deleted.
 `pipeline.py:245-378`; variable mismatch between the template at 302/309 and the invocation at 361.
 *Risk:* turns 1-4 raise. It is also ~95% duplicated from `ChatRagPipelineWithMemory`, so any fix to the memory logic must be applied twice. (Known placeholder — flagged, not touched.)
 
@@ -927,6 +928,8 @@ All preserve current behavior. **Not implemented — recommendations only.** Ord
 *Trade-off:* `pipeline.py` is the legacy generation and `Structure_pipeline` is explicitly a placeholder. Investment here may be wasted if the LangChain generation is retired outright — which is the more likely trajectory given `pipeline_lg.py` already covers every non-`Structure_pipeline` case. **Recommend deciding the fate of `pipeline.py` before spending effort on it.**
 
 > *Status at `49c4231`: still undecided.* `pipeline.py` has not changed since `5b2c04f`, H5's variable mismatch is still there (`MessagesPlaceholder("Chat_history")` and `{transcript}` in the template, `chat_history_placeholder` at the invoke), and its three `UserMemory(...)` sites still lack the `.index()` call H6 made necessary, so legacy sessions still write no memory.
+>
+> *Status, 2026-11-12:* `Structure_pipeline` is deleted (H5 `[FIXED]`). The rest of `pipeline.py` — `NRagPipeline`, `ChatRagPipeline`, `ChatRagPipelineWithMemory` — is still undecided.
 
 ### R10. Standardize on `langchain_ollama` and one embeddings import
 

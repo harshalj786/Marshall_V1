@@ -274,8 +274,9 @@ def test_pipelines_ingest_on_a_cold_index(tmp_path):
 
 
 def test_structure_pipeline_still_builds_from_docs(workspace):
-    """Structure_pipeline is a placeholder and was left on the old build-in-constructor
-    path deliberately — so Retrival(docs=...) must keep working exactly as before."""
+    """Retrival(docs=...) builds and queries in one step. Its last production caller,
+    Structure_pipeline, is deleted, but Retrival still offers the path — so it must keep
+    working exactly as before."""
     from ingestion.chunking import Chunking
     from ingestion.doc_loader import LoadDocs
 
