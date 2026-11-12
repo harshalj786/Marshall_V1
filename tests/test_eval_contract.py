@@ -14,7 +14,8 @@ REPO = Path(__file__).resolve().parent.parent
 sys.path.insert(0, str(REPO))
 
 from scripts.eval_contract import (BOUNDARY, ERROR, FAIL, PASS, SCHEMA_VERSION,
-                                   CaseResult, CheckRecord, record_passed, write_record)
+                                   CaseResult, CheckRecord, is_cold_load, record_passed,
+                                   write_record)
 
 
 def _record(*verdicts, error=None):
@@ -76,6 +77,33 @@ def test_round_trip_is_unchanged():
     restored = CheckRecord.from_dict(json.loads(json.dumps(original.to_dict())))
     assert restored == original
     assert restored.to_dict() == original.to_dict()
+
+
+def test_a_v1_record_still_reads_with_the_v2_fields_null():
+    v1 = {"schema_version": 1, "check": "routing", "model": "llama3.1", "error": None,
+          "cases": [{"id": "math", "verdict": "PASS", "wall_seconds": 4.0, "error": None}]}
+    record = CheckRecord.from_dict(v1)
+    case = record.cases[0]
+    assert (case.id, case.verdict, case.wall_seconds) == ("math", PASS, 4.0)
+    assert case.model_seconds is None and case.vram_models is None and case.vram_gpu_mib is None
+    assert record_passed(record) is True
+
+
+def test_v2_fields_round_trip():
+    original = _record(PASS)
+    case = original.cases[0]
+    case.model_seconds, case.load_seconds = 2.5, 0.09
+    case.prompt_tokens, case.output_tokens = 430, 32
+    case.vram_models = {"llama3.1:latest": 5211, "mistral:latest": 4906}
+    case.vram_gpu_mib = 11269
+    assert CheckRecord.from_dict(json.loads(json.dumps(original.to_dict()))) == original
+
+
+@pytest.mark.parametrize("load, expected", [(None, None), (0.09, False), (1.0, True), (6.2, True)])
+def test_is_cold_load_uses_the_threshold_not_nonzero(load, expected):
+    """A warm llama3.1 reports ~0.09 s of load_duration, so 'non-zero' is not 'cold'."""
+    case = CaseResult(id="x", verdict=PASS, wall_seconds=1.0, load_seconds=load)
+    assert is_cold_load(case) is expected
 
 
 def test_write_record_round_trips_through_disk(tmp_path):

@@ -116,6 +116,12 @@ From the audit, these exist and are tested:
 - .github/workflows/tests.yml header comment says 21/220; real split is 31/409.
   Fix in its own commit, not inside a feature commit.
 - mistral hardcoded in several files; no config/settings.py yet (Feature 3).
+- Eval `model_seconds` (scripts/eval_metrics.py) counts only the agent's own replies in
+  the thread; it misses the memory gate, the summariser and retrieval's hardcoded mistral,
+  so `wall_seconds - model_seconds` is NOT pure tool time. Read it that way in Feature 3.
+- Feature 2 Step 3 (runner) must record which models are loaded at each check's START,
+  not only after each case: VRAM depends on what ran before (mistral was resident only
+  because the ingestion tests ran first — 11,755 of 12,282 MiB with both loaded).
 - Same-day supersede leaves a zero-length row (valid_from == valid_until) that
   as_of() won't return. Acceptable at day precision.
 - Unknown relations logged to stderr only, not persisted.

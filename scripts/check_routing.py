@@ -133,6 +133,7 @@ ROUTES = (
 #: this module, and that import must keep working unchanged
 from scripts.eval_contract import (BOUNDARY, ERROR, FAIL, PASS,  # noqa: E402,F401
                                    CaseResult, CheckRecord, write_record)
+from scripts.eval_metrics import case_metrics  # noqa: E402
 
 
 @dataclass
@@ -149,6 +150,9 @@ class RouteResult:
     answer: str = ""
     seconds: float = 0.0
     error: Optional[str] = None
+    #: the v2 CaseResult fields (model time, tokens, VRAM) from scripts/eval_metrics.py,
+    #: read after the timer stopped. Never consulted for the verdict.
+    metrics: dict = field(default_factory=dict)
 
     @property
     def tools_called(self) -> list:
@@ -308,16 +312,25 @@ def seed_memory(agent) -> None:
 def run_route(agent, route: Route) -> RouteResult:
     """Invoke one route on its own thread and read back what it did. Never raises."""
     tool_names = [tool.name for tool in agent.tools]
+    #: where this turn starts in the thread, so only ITS replies are timed. Routing threads
+    #: are fresh (0), but a check that runs several turns on one thread needs the slice.
+    try:
+        turn_start = len(agent.get_history(route.thread_id))
+    except Exception:
+        turn_start = 0
     started = time.perf_counter()
     try:
         answer = agent.invoke(
             route.query, config={"configurable": {"thread_id": route.thread_id}})
     except Exception as exc:
-        return RouteResult(route=route, verdict=ERROR,
-                           seconds=time.perf_counter() - started,
-                           error=f"{type(exc).__name__}: {exc}")
+        seconds = time.perf_counter() - started
+        return RouteResult(route=route, verdict=ERROR, seconds=seconds,
+                           error=f"{type(exc).__name__}: {exc}",
+                           metrics=case_metrics([]))
     seconds = time.perf_counter() - started
     history = agent.get_history(route.thread_id)
+    #: after the timer, so the readings never land inside wall_seconds
+    metrics = case_metrics(history[turn_start:])
     result = RouteResult(
         route=route,
         verdict=FAIL,
@@ -326,6 +339,7 @@ def run_route(agent, route: Route) -> RouteResult:
         narrated=_final_narration(history, tool_names),
         answer=" ".join(str(answer or "").split()),
         seconds=seconds,
+        metrics=metrics,
     )
 
     #: a narrated call only condemns the turn when NOTHING real was emitted. With a real
@@ -460,7 +474,7 @@ def parse_args(argv=None):
 
 def to_case(result: RouteResult) -> CaseResult:
     return CaseResult(id=result.route.name, verdict=result.verdict,
-                      wall_seconds=result.seconds, error=result.error)
+                      wall_seconds=result.seconds, error=result.error, **result.metrics)
 
 
 def main(argv=None) -> int:
