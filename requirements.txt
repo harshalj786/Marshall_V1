@@ -88,7 +88,7 @@ num2words==0.5.14                      # transitive; misaki number expansion
 #    GPU install. torch arrives transitively via sentence-transformers, so leaving
 #    it unpinned is the only option that is safe in both directions.
 #
-#    To reproduce the GPU environment (RTX 4080 per docs/tech_stack.md):
+#    To reproduce the GPU environment (RTX 4080 per docs/archive/tech_stack_v2_dead.md):
 #        pip install torch==2.6.0 --index-url https://download.pytorch.org/whl/cu124
 #
 # 2. pdfplumber was missing when this file was first written, which made

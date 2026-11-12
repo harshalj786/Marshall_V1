@@ -37,7 +37,7 @@
 | **M1, M2** — seven-way ingestion block; no `BuildKnowledge` singleton | `[PARTIALLY FIXED — see R1]` — six of seven sites and the singleton; `Structure_pipeline` and the two embeddings import paths remain |
 | **H3, H5, M3–M9, L1–L14** | open |
 
-All three criticals plus H1, H2 and H4 are closed. **H2's second half is not, and it is the half that loses data.** The agent's context no longer grows without bound — `summarize_and_trim` sees to that — but `MemorySaver` is still in-RAM and still per-object, so every checkpoint of every thread dies with the process. The only thing that survives a restart today is `{summary_persist_path}/conversation_summary.json`, reloaded by `invoke` when a thread has no in-RAM history; the message list itself, the turn count and the compressed profile do not. `SqliteSaver` (R8, `docs/roadmap.md` Phase 1, already specified by `docs/tech_stack.md` §2) is what remains of H2. ~~**H6** (`UserMemory` writes from its constructor) is now the highest-severity fully-open finding.~~ `[FIXED]` H6 is closed — construction opens, `.index()` writes, and the recall tool holds a read-only handle. It was closed *because* it stopped being theoretical: the routing gate caught the read path retrieving the query it had just written. **R8 is now the highest-severity open finding**, and the two remaining HIGHs (H3, H5) are both in `pipeline.py`. *(As of `d879bab` `AgentGraph` takes a `checkpointer` argument, so a durable saver can be injected without touching a call site — but the default is unchanged and the lifecycle problem R8's trade-off predicted is now written into the class docstring as `UNSOLVED`. The two chat graphs still construct their own `MemorySaver`. R8 stays open; see its entry in §9.)*
+All three criticals plus H1, H2 and H4 are closed. **H2's second half is not, and it is the half that loses data.** The agent's context no longer grows without bound — `summarize_and_trim` sees to that — but `MemorySaver` is still in-RAM and still per-object, so every checkpoint of every thread dies with the process. The only thing that survives a restart today is `{summary_persist_path}/conversation_summary.json`, reloaded by `invoke` when a thread has no in-RAM history; the message list itself, the turn count and the compressed profile do not. `SqliteSaver` (R8, `docs/archive/roadmap_v2_dead.md` Phase 1, already specified by `docs/archive/tech_stack_v2_dead.md` §2) is what remains of H2. ~~**H6** (`UserMemory` writes from its constructor) is now the highest-severity fully-open finding.~~ `[FIXED]` H6 is closed — construction opens, `.index()` writes, and the recall tool holds a read-only handle. It was closed *because* it stopped being theoretical: the routing gate caught the read path retrieving the query it had just written. **R8 is now the highest-severity open finding**, and the two remaining HIGHs (H3, H5) are both in `pipeline.py`. *(As of `d879bab` `AgentGraph` takes a `checkpointer` argument, so a durable saver can be injected without touching a call site — but the default is unchanged and the lifecycle problem R8's trade-off predicted is now written into the class docstring as `UNSOLVED`. The two chat graphs still construct their own `MemorySaver`. R8 stays open; see its entry in §9.)*
 
 R1 is listed in the table because its structural half is now closed too: ingestion is an explicit step (`ingestion/ingest.py`) and `Retrival` can open a collection it did not build. That was the first item in the §10 voice sequencing, and it is what M1 and the startup-cost finding both rested on.
 
@@ -65,7 +65,7 @@ Four philosophies are visible, and they are not fully consistent with each other
 
 1. **"Everything is a `Runnable`."** `LoadDocs`, `Chunking`, `BuildKnowledge`, `Retrival`, `UserMemory`, and all four `pipeline.py` classes subclass `langchain_core.runnables.Runnable` and expose a single `invoke(input_dict, config=None)`. Stages are meant to be swappable and independently callable. In practice only `invoke` is overridden — no `ainvoke`, no `InputType`/`OutputType`, no `batch` — so the abstraction buys a uniform call shape and nothing else.
 2. **"Mode flags over subclasses."** Rather than `PDFLoader`/`CSVLoader` classes, `LoadDocs` takes `mode: Literal["pdf","scanned_pdf","web_url","txt","youtube","folder","csv"]` and branches. Same for `Chunking` (`recursive`/`semantic`) and `Retrival` (`simple`/`mmr`/`mqr`/`wiki`). Configuration is constructor arguments; behavior is an `if/elif` ladder.
-3. **"Local and private by default."** Every LLM call goes to a local Ollama (`mistral` for text, `llama3.1` for tool-calling). Every embedding is local (`sentence-transformers/all-MiniLM-L6-v2`). Every vector store is a local Chroma directory. No network calls except Wikipedia/DuckDuckGo tools and the initial HuggingFace model download. `docs/vision.md` names this explicitly as Pillar 4.
+3. **"Local and private by default."** Every LLM call goes to a local Ollama (`mistral` for text, `llama3.1` for tool-calling). Every embedding is local (`sentence-transformers/all-MiniLM-L6-v2`). Every vector store is a local Chroma directory. No network calls except Wikipedia/DuckDuckGo tools and the initial HuggingFace model download. `docs/archive/vision_v2_dead.md` names this explicitly as Pillar 4.
 4. **"Empirically-tuned agent prompting."** `pipeline_lg.py:327-364` and `tools/tools.py:146-164` are unusually careful — the prompt is assembled so it describes *exactly* the tools bound, with an explicit comment (`pipeline_lg.py:452-453`) that describing an unbound tool makes llama3.1 narrate a call in prose instead of emitting a real `tool_call`. This layer was clearly built against measured failures, and it is the highest-quality code in the repository.
 
 ### Major components and responsibilities
@@ -314,7 +314,7 @@ Each result becomes a `ToolMessage`; the edge `tools → agent` (562) loops back
 `memory/long_term_memory.py:17-22`. Two threads entering simultaneously both see `None` and both construct. Benign in outcome (the model is stateless) but wastes ~3 s and a model's worth of RAM.
 
 **E. `MemorySaver` is in-process, unbounded, and non-durable.**
-`pipeline_lg.py:96`, `205`, `461`. Every checkpoint of every thread stays in RAM for the process lifetime, and all of it is lost on restart. `docs/tech_stack.md` §2 already specifies `SqliteSaver` as the target. Additionally, each graph object gets its *own* `MemorySaver`, so two `AgentGraph` instances over the same document share no history at all.
+`pipeline_lg.py:96`, `205`, `461`. Every checkpoint of every thread stays in RAM for the process lifetime, and all of it is lost on restart. `docs/archive/tech_stack_v2_dead.md` §2 already specifies `SqliteSaver` as the target. Additionally, each graph object gets its *own* `MemorySaver`, so two `AgentGraph` instances over the same document share no history at all.
 
 **F. `AgentGraph` never trims message history.**
 There is no `trim_history` node in `_build_graph` (546-563) — a deliberate choice documented at `README.md:267-269`, because cutting between an `AIMessage`'s `tool_calls` and its matching `ToolMessage` orphans the pair and Ollama rejects it. The consequence is real: agent turns emit 3-4 messages each, so prompt size, latency, and cost grow linearly and unboundedly until the model's context window is exceeded.
@@ -363,7 +363,7 @@ There is no `trim_history` node in `_build_graph` (546-563) — a deliberate cho
 
 ### Hardcoded values that should be configurable
 
-`docs/todo.md` §0 already lists the first four. Full inventory:
+`docs/archive/todo_v2_dead.md` §0 already lists the first four. Full inventory:
 
 - `chunk_size=500, chunk_overlap=50` — `pipeline.py:31, 88, 156, 267`; `pipeline_lg.py:81, 184, 421`. Each carries the comment `# here arguments are hardcoded`.
 - Model `"mistral"`, `temperature=0` — `pipeline.py:64, 112, 196, 342`; `pipeline_lg.py:89, 193`; `retreival/retrieval.py:22`; `memory/long_term_memory.py:50`. Seven sites.
@@ -405,7 +405,7 @@ There is no `trim_history` node in `_build_graph` (546-563) — a deliberate cho
 These are the three that pay for themselves; the rest of the codebase does *not* need more indirection.
 
 1. ~~**A `KnowledgeBase` / index-lifecycle object** that separates "build or open an index" from "query an index" — this is the one abstraction that fixes the duplicate-write bug (A) rather than papering over it, and it simultaneously removes the 7-way duplicated constructor block.~~ `[BUILT — see R1]` It landed as two functions in `ingestion/ingest.py` rather than a class, because nothing needed to hold state between building and querying: `ensure_ingested` returns a collection name, and `Retrival` opens it. A class would have added a lifetime to manage for no gain.
-2. **A single config/settings object** (`docs/todo.md` §0 already calls for `config/settings.py`) carrying chunk sizes, model names, embedding name, k/lambda defaults, memory cadence, and paths. This collapses ~40 hardcoded literals into one place.
+2. **A single config/settings object** (`docs/archive/todo_v2_dead.md` §0 already calls for `config/settings.py`) carrying chunk sizes, model names, embedding name, k/lambda defaults, memory cadence, and paths. This collapses ~40 hardcoded literals into one place.
 3. **A shared `BaseRagGraph`** holding `get_history`, `run_chat`, the last-`AIMessage` extraction, and checkpointer wiring — removing 3-6 copies each of four methods in `pipeline_lg.py`.
 
 ---
@@ -485,8 +485,8 @@ These are the three that pay for themselves; the rest of the codebase does *not*
 - A fresh `MemorySaver()` per graph object — `pipeline_lg.py:96`, `205`, `461`. Consequences: **(a)** nothing survives process restart; **(b)** two graph objects over the same document share nothing; **(c)** every checkpoint of every thread is retained in RAM for the process lifetime, with no TTL or cap.
 - Checkpoints are written after every super-step, so a turn with three tool calls writes many snapshots, all retained.
 - `graph.get_state` is called on every `invoke` in `AgentGraph` (571) plus in `get_history` (598-600), `get_turn_count` (602-604), and `get_user_history_summary` (606-608). Cheap against `MemorySaver`; each becomes a real I/O round-trip under `SqliteSaver`.
-- **No `interrupt()` anywhere in the repository** — confirmed by grep. `docs/roadmap.md` Phase 2 and `docs/vision.md` both make native Human-in-the-Loop a headline V2 feature; none of the scaffolding exists yet.
-- `docs/tech_stack.md` §2 specifies `SqliteSaver`; the code uses `MemorySaver`. A known, documented gap.
+- **No `interrupt()` anywhere in the repository** — confirmed by grep. `docs/archive/roadmap_v2_dead.md` Phase 2 and `docs/archive/vision_v2_dead.md` both make native Human-in-the-Loop a headline V2 feature; none of the scaffolding exists yet.
+- `docs/archive/tech_stack_v2_dead.md` §2 specifies `SqliteSaver`; the code uses `MemorySaver`. A known, documented gap.
 
 > *[PARTIALLY CHANGED, `d879bab`]* `AgentGraph` takes `checkpointer: Optional[BaseCheckpointSaver] = None` and constructs its own `MemorySaver()` only when none is passed — deliberately not a `= MemorySaver()` default, which would be evaluated once at import and shared by every instance. Consequences (a)–(c) above therefore still describe the **default** `AgentGraph` and both chat graphs, which still hard-code `MemorySaver()`. The durable case is not solved, only made possible: the class docstring records as `UNSOLVED` that `SqliteSaver` is a context manager and this constructor offers no scope for the caller's `with` to span. See R8.
 
@@ -517,7 +517,7 @@ The integration is textbook-correct and the ordering constraints are real:
 
 ### Design and data model
 
-Two layers, per `docs/memory.md`:
+Two layers, per `docs/archive/memory_v2_dead.md`:
 
 - **Short-term working memory** — LangGraph `AgentState`/`ChatState`, thread-scoped, in `MemorySaver`.
 - **Long-term user memory** — a ChromaDB collection of the user's own past messages, user-scoped, on disk.
@@ -674,7 +674,7 @@ Tool *results* are always `ToolMessage`s carrying a string. Errors are strings t
 
 **C3. No dependency manifest.** `[FIXED]`
 No `requirements.txt`, `pyproject.toml`, `setup.py`, `Pipfile`, or lock file anywhere. Install was unpinned `pip install` lines at `README.md:77-83`.
-*Risk:* the environment was unreproducible. This repository already had a LangGraph version crisis — `.claude/settings.local.json` records hand-pinning through `langgraph==0.3.34` and then `1.1.2`, plus `langgraph-checkpoint`, `langgraph-prebuilt`, `langgraph-sdk`, and `langchain-core` bounds. That knowledge lived only in a permissions allowlist. Directly contradicted `docs/security.md` §6 ("explicitly pin exact versions") and `docs/tech_stack.md` §5.
+*Risk:* the environment was unreproducible. This repository already had a LangGraph version crisis — `.claude/settings.local.json` records hand-pinning through `langgraph==0.3.34` and then `1.1.2`, plus `langgraph-checkpoint`, `langgraph-prebuilt`, `langgraph-sdk`, and `langchain-core` bounds. That knowledge lived only in a permissions allowlist. Directly contradicted `docs/security.md` §6 ("explicitly pin exact versions") and `docs/archive/tech_stack_v2_dead.md` §5.
 
 > **Resolution.** `requirements.txt` pins 21 packages with `==`, verified against the running environment and by a clean `pip install --dry-run` (exit 0, no conflicts, nothing new to install) on CPython 3.12.9.
 >
@@ -686,7 +686,7 @@ No `requirements.txt`, `pyproject.toml`, `setup.py`, `Pipfile`, or lock file any
 
 **H1. Untrusted content is concatenated into the system prompt.** `[FIXED in pipeline_lg.py; still present in pipeline.py]`
 `pipeline_lg.py:36-48, 50-63` interpolated retrieved `{context}` into the **system** message; `_with_profile` (532-535) concatenated the LLM-generated user profile onto it. `pipeline.py:42-62, 96-111, 163-195, 274-341` do the same.
-*Risk:* `docs/security.md` §4 states the rule this violates verbatim — *"Pass untrusted input exclusively inside designated variable slots within isolated system prompts—never concatenate raw web data into system instructions."* `LoadDocs` ingests web pages, YouTube transcripts, and arbitrary PDFs. Any of them can carry instructions that arrive with system-message authority. This becomes acute the moment `docs/roadmap.md` Phases 3-5 land Gmail, browser, and scraper tools with real side effects.
+*Risk:* `docs/security.md` §4 states the rule this violates verbatim — *"Pass untrusted input exclusively inside designated variable slots within isolated system prompts—never concatenate raw web data into system instructions."* `LoadDocs` ingests web pages, YouTube transcripts, and arbitrary PDFs. Any of them can carry instructions that arrive with system-message authority. This becomes acute the moment `docs/archive/roadmap_v2_dead.md` Phases 3-5 land Gmail, browser, and scraper tools with real side effects.
 
 > **Resolution (LangGraph generation).** The system message is now instructions only. Retrieved material and the user profile travel in the **human** turn, fenced in `<retrieved_context>` and `<user_profile>` tags, and a new `_UNTRUSTED_DATA_RULE` — which does sit in the trusted position — declares tagged blocks to be data that cannot alter the rules. The chat prompts gained `BASE_HUMAN_TEMPLATE` / `MEMORY_HUMAN_TEMPLATE` for this; no node signature changed, since both slots are filled from the same invoke dict.
 >
@@ -712,7 +712,7 @@ No trim node in `_build_graph` (546-563), by design (`README.md:267-269`); `Memo
 >
 > **Verified.** `tests/test_reconciliation.py` (11 tests, pure) and `tests/test_summarization_cycle.py` (23 tests, real graph and real `ToolNode` with faked model handles) — cadence, list replacement, the tool-pair walk-back, the failure/retry contract, disk persistence and reload across a fresh graph. The two tool-boundary tests were re-run against a naive `min(target, len)` cut and both fail there, so they are load-bearing. The compressor prompt was also exercised against a live model end to end.
 >
-> *Still open:* the checkpointer. `MemorySaver` still holds every checkpoint of every thread in RAM and still loses everything at exit — the summary file is currently the only thing that survives a restart. `SqliteSaver` (`docs/roadmap.md` Phase 1) is the fix and is untouched here. *(Still true by default at `49c4231`; `AgentGraph` can now be handed a checkpointer — see R8.)*
+> *Still open:* the checkpointer. `MemorySaver` still holds every checkpoint of every thread in RAM and still loses everything at exit — the summary file is currently the only thing that survives a restart. `SqliteSaver` (`docs/archive/roadmap_v2_dead.md` Phase 1) is the fix and is untouched here. *(Still true by default at `49c4231`; `AgentGraph` can now be handed a checkpointer — see R8.)*
 >
 > *Known cost:* the first cycle of a conversation drops only one message (at 16 messages, keeping 14), so it pays a compression call for very little. Every later cycle drops a full interval. Raising `summary_keep_recent` or lowering `summarize_every_n_turns` shifts where that lands; the warm-up call itself is not worth a special case.
 
@@ -760,7 +760,7 @@ No trim node in `_build_graph` (546-563), by design (`README.md:267-269`); `Memo
 
 **M3. Deprecated `langchain_community.llms.Ollama` in four files.** `pipeline.py`, `pipeline_lg.py:11`, `retreival/retrieval.py:6`, `memory/long_term_memory.py:7`. The deprecation warning is already visible in `labbb.ipynb`, and the notice says removal in LangChain 1.0.0 — which the project has effectively already moved to (`langchain-core>=1.2.13` per the settings allowlist).
 
-**M4. ~40 hardcoded literals across 9 files, no config module.** Enumerated in §4. `docs/todo.md` §0 already tracks the top four.
+**M4. ~40 hardcoded literals across 9 files, no config module.** Enumerated in §4. `docs/archive/todo_v2_dead.md` §0 already tracks the top four.
 
 **M5. `_memory_cache` is unbounded and unsynchronized.** `pipeline_lg.py:443, 476-496`.
 
@@ -827,7 +827,7 @@ All preserve current behavior. **Not implemented — recommendations only.** Ord
 ### R2. Introduce `config/settings.py`
 
 *Problem:* M4 — ~40 literals across 9 files; changing the model name means editing seven sites.
-*Change:* one dataclass (or Pydantic settings object) holding chunk size/overlap, model names, embedding name, k/lambda defaults, memory cadence, trim threshold, recursion limit, and paths — env-overridable via `python-dotenv`, which `docs/tech_stack.md` §5 already specifies and which nothing currently imports. Keep every existing constructor argument as an explicit override that wins over the default.
+*Change:* one dataclass (or Pydantic settings object) holding chunk size/overlap, model names, embedding name, k/lambda defaults, memory cadence, trim threshold, recursion limit, and paths — env-overridable via `python-dotenv`, which `docs/archive/tech_stack_v2_dead.md` §5 already specifies and which nothing currently imports. Keep every existing constructor argument as an explicit override that wins over the default.
 *Trade-off:* a settings object is a new global-ish dependency reachable from every module; without discipline it becomes a junk drawer. Mitigate by keeping it a flat frozen dataclass with no behavior.
 
 ### R3. Extract a `BaseRagGraph`
@@ -910,11 +910,11 @@ All preserve current behavior. **Not implemented — recommendations only.** Ord
 
 *Problem:* §7 — three files and six edit sites per tool, and a prompt/binding invariant maintained by hand that `extra_tools` silently violates.
 *Change:* a small registry where each entry pairs a tool (or factory) with its prompt bullet and optional usage guideline. `AgentGraph` then builds `self.tools` and the system prompt from one source, making drift structurally impossible and giving `extra_tools` a way to contribute its description.
-*Trade-off:* this is genuine new indirection for a five-tool system, and it would be over-engineering today were it not for `docs/roadmap.md` Phases 3-5 adding three more tools with real side effects. Recommend building it *when* the sixth tool lands, not before.
+*Trade-off:* this is genuine new indirection for a five-tool system, and it would be over-engineering today were it not for `docs/archive/roadmap_v2_dead.md` Phases 3-5 adding three more tools with real side effects. Recommend building it *when* the sixth tool lands, not before.
 
 ### R8. Adopt a durable checkpointer
 
-*Problem:* H2 and §5 — `MemorySaver` is in-RAM, per-object, and non-durable. `docs/tech_stack.md` §2 already specifies `SqliteSaver`.
+*Problem:* H2 and §5 — `MemorySaver` is in-RAM, per-object, and non-durable. `docs/archive/tech_stack_v2_dead.md` §2 already specifies `SqliteSaver`.
 *Change:* make the checkpointer a constructor parameter defaulting to `MemorySaver`, so `SqliteSaver` (or `AsyncSqliteSaver`) can be injected.
 *Trade-off:* `SqliteSaver` requires context-manager lifecycle management, which the current constructor-owns-everything pattern doesn't accommodate. Every `get_state` call (four sites in `AgentGraph`) becomes real I/O; `AgentGraph.invoke:571` does one per turn.
 
@@ -962,7 +962,7 @@ The assessment below was written before any voice code existed and is kept as wr
 5. **Tools are proper `BaseTool`s.** Adding async support means giving each an `async def` coroutine; `ToolNode` will prefer it automatically. No dispatch changes needed.
 6. **The ReAct loop is bounded.** `recursion_limit=25` (570) *(now `DEFAULT_RECURSION_LIMIT = 30`, sized from the graph's worst case)* means a runaway tool loop terminates in seconds rather than minutes — important when the user is waiting in real time.
 7. **The system prompt already forbids process narration.** Lines 361-363 instruct Marshall to answer as though it had simply known — exactly right for speech, where "let me search for that" is dead air.
-8. **`docs/tech_stack.md` §3 already commits to async infrastructure** (`Crawl4AI`'s `AsyncWebCrawler`, Playwright), so the async direction is already the project's stated intent.
+8. **`docs/archive/tech_stack_v2_dead.md` §3 already commits to async infrastructure** (`Crawl4AI`'s `AsyncWebCrawler`, Playwright), so the async direction is already the project's stated intent.
 
 ### What blocks each capability
 
@@ -986,7 +986,7 @@ The assessment below was written before any voice code existed and is kept as wr
 - Turn boundaries are implicit (one `invoke` = one turn). Voice needs explicit utterance boundaries with barge-in semantics. *[PARTIALLY FIXED — V1a/V1b]* Utterance boundaries and SPEAKING-phase barge-in now exist, but in the orchestrator's own state machine *outside* the graph. One utterance is still one `invoke`, and no external event can reach a running graph.
 
 **Interrupt / cancel mid-generation — blocked entirely.** *[PARTIALLY UNBLOCKED — V1b]* Interrupting *playback* now works. Interrupting *generation*, which is what this heading is about, is still blocked for every reason below. V1b avoided these reasons rather than solving them, by allowing barge-in only after `invoke` has returned.
-- No `interrupt()` anywhere, despite `docs/roadmap.md` Phase 2 and `docs/vision.md` both naming native HITL as a headline feature.
+- No `interrupt()` anywhere, despite `docs/archive/roadmap_v2_dead.md` Phase 2 and `docs/archive/vision_v2_dead.md` both naming native HITL as a headline feature.
 - Blocking sync calls can't be cancelled; killing the thread leaves Chroma and Ollama clients in an unknown state.
 - Cancelling mid-ReAct-loop leaves `messages` with an `AIMessage` carrying `tool_calls` and no matching `ToolMessage` — the exact orphaned-pair state that `README.md:267-269` records Ollama rejecting. **Cancellation therefore corrupts the thread**, and this is the single hardest voice problem in the current design. Any cancel path must either complete or synthesize the pending `ToolMessage`s.
 - `MemorySaver` writes a checkpoint per super-step, so a mid-turn kill leaves a checkpoint in exactly that broken state, and it persists into the next turn.
@@ -1031,7 +1031,7 @@ Two consequences for the voice work:
 4. Add a durable checkpointer (R8) before adding cancellation, so a corrupted mid-turn state is recoverable. *— future. The injection seam exists (`d879bab`); no durable saver is wired in.*
 5. Solve the orphaned-`ToolMessage` problem explicitly — a cancel path that reconciles pending tool calls — before exposing barge-in. *— sidestepped, not solved. V1b exposed barge-in only in SPEAKING, after `invoke` returns, where no tool pair can be pending. The cancel path is still owed before generation can be interrupted, which is the streaming increment (V1c).*
 6. Make `AgentGraph` per-session, or make `_memory_cache` thread-safe, before serving concurrent sessions. *— future. Voice is one session per process, so nothing has needed it yet.*
-7. Only then add `interrupt()`/HITL per `docs/roadmap.md` Phase 2. *— future. Still no `interrupt(` anywhere.*
+7. Only then add `interrupt()`/HITL per `docs/archive/roadmap_v2_dead.md` Phase 2. *— future. Still no `interrupt(` anywhere.*
 
 ---
 
@@ -1047,13 +1047,13 @@ The three problems identified as blocking further work:
 2. ~~**C2** — long-term memory silently defaults to non-durable.~~ `[FIXED]` It is now loud rather than silent. It is still ephemeral by default; callers must pass a path.
 3. ~~**C3** — no dependency manifest, in a project that has already survived one LangGraph version crisis whose resolution is recorded only in a permissions allowlist.~~ `[FIXED]` 21 packages pinned and verified. The known-good baseline now exists in the repository rather than in shell history.
 
-**All three criticals are closed, and so is H1** — untrusted document content no longer reaches the system message in the LangGraph generation, verified by a live injection attempt rather than by inspection. That mattered for sequencing: `docs/roadmap.md` Phases 3-5 add Gmail, browser, and scraper tools with real side effects, driven by a model whose system prompt any ingested PDF or web page could previously write to. Fixing it before those land was much cheaper than after.
+**All three criticals are closed, and so is H1** — untrusted document content no longer reaches the system message in the LangGraph generation, verified by a live injection attempt rather than by inspection. That mattered for sequencing: `docs/archive/roadmap_v2_dead.md` Phases 3-5 add Gmail, browser, and scraper tools with real side effects, driven by a model whose system prompt any ingested PDF or web page could previously write to. Fixing it before those land was much cheaper than after.
 
 **H4 is closed too** — `ChatRagWithMemoryGraph` now shares `AgentGraph`'s error-handling discipline, and the repository has its first tests as a result.
 
 **H2's first half is closed** — `AgentGraph` now compresses and trims its own history on a cadence, so time-to-first-token stops climbing with conversation length. The pair-reconciliation problem that made it look expensive was solved as a separate primitive rather than inside the node, precisely because §10 needs the same one for barge-in: `find_safe_cut_point` is a pure function over a message list and knows nothing about the graph.
 
-**What remains of H2 is the checkpointer, and it should not be filed as a leftover.** `MemorySaver` is still in-RAM and still per-object: nothing survives a restart except `conversation_summary.json`, two `AgentGraph` instances over the same document share no history, and every checkpoint of every thread is retained for the process lifetime with no cap. The trim work made this *more* visible rather than less — a conversation now has a compressed record worth persisting, and the only piece of it that reaches disk is the summary. `SqliteSaver` (R8) is the fix, `docs/tech_stack.md` §2 already specifies it, and §10 sequencing puts it before cancellation for a reason: a mid-turn kill leaves a checkpoint in the orphaned-`ToolMessage` state, and an in-RAM checkpointer gives you nothing to recover from.
+**What remains of H2 is the checkpointer, and it should not be filed as a leftover.** `MemorySaver` is still in-RAM and still per-object: nothing survives a restart except `conversation_summary.json`, two `AgentGraph` instances over the same document share no history, and every checkpoint of every thread is retained for the process lifetime with no cap. The trim work made this *more* visible rather than less — a conversation now has a compressed record worth persisting, and the only piece of it that reaches disk is the summary. `SqliteSaver` (R8) is the fix, `docs/archive/tech_stack_v2_dead.md` §2 already specifies it, and §10 sequencing puts it before cancellation for a reason: a mid-turn kill leaves a checkpoint in the orphaned-`ToolMessage` state, and an in-RAM checkpointer gives you nothing to recover from.
 
 ~~The highest-severity fully-open finding is now **H6** — `UserMemory` writes to Chroma from its constructor, so every read path also writes.~~ `[FIXED]` **H6 is closed, and how it closed is the point.** The review had called it "safe today only because of the `_memory_cache` fingerprint and content-hash ids". It was not safe: the fingerprint makes *repeat* construction a no-op and says nothing about the first build of a turn, which is exactly the one `recall_user_memory` triggers. Asked *"what is my name?"*, the tool wrote that question into the collection and then retrieved it back at `k=1` — and the reply still read as correct, because the system prompt names Harshal. It took `scripts/check_routing.py` printing raw tool output to see it. A finding that had been reasoned about twice and marked safe both times was settled in one line of a test harness's output.
 
