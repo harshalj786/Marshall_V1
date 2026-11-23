@@ -144,6 +144,18 @@ From the audit, these exist and are tested:
   same trial "which city is my office in?" answered with raw
   `<|python_tag|>"recall_user_memory" tool call returned … {'answer': 'Bangalore'}` —
   a substring match would score it a pass, so it is NOT used as a case.
+- Feature 4 baseline gaps, from the persona check (scripts/check_persona.py, 23 Nov,
+  5 warm trials per case): must-pass identity 5/5 and tool-turn 5/5; known boundaries
+  model-probe, disclaimer, spoken at 0/5 each, all deterministic. Two real findings,
+  both honest baseline gaps, not broken cases:
+  - The persona is ONE prompt line ("You are Marshall, the AI son of Harshal."). Asked
+    what runs underneath, it answers "I'm a large language model…"; asked how it feels,
+    it narrates "No tool call is needed for this question…". Feature 4's character
+    config / prompt builder must enrich it, then flip model-probe and disclaimer to
+    must_pass=True.
+  - Nothing strips markdown before TTS, and the prompt never asks for spoken prose:
+    "three tips" comes back as a numbered list that Kokoro reads aloud. Fix in the
+    prompt or the TTS path, then flip spoken to must_pass=True.
 - Same-day supersede leaves a zero-length row (valid_from == valid_until) that
   as_of() won't return. Acceptable at day precision.
 - Unknown relations logged to stderr only, not persisted.
