@@ -20,7 +20,8 @@ into a green one.
 `passed` is deliberately not a stored field. It is derived here, once, so a record can
 never claim a verdict its own cases contradict.
 
-Schema version 2 (v1 = the first four CaseResult fields only; still readable):
+Schema version 3 (v1 = the first four CaseResult fields only, v2 = through vram_gpu_mib;
+both still readable, their missing fields read as None):
 
     CheckRecord
       schema_version : int             bumped when a field changes meaning or is added
@@ -42,6 +43,18 @@ Schema version 2 (v1 = the first four CaseResult fields only; still readable):
       vram_models    : dict | None     {loaded model: size_vram MiB} from /api/ps;
                                        {} = read fine, nothing loaded
       vram_gpu_mib   : int | None      nvidia-smi memory.used, whole GPU
+      -- v3, k-of-n (scripts/check_memory.py); None = the check does not count attempts --
+      attempts       : int | None      how many times the case actually ran (early stop
+                                       means fewer than n)
+      passes         : int | None      how many of those attempts passed
+      required       : int | None      k: passes needed for PASS (1 for a solid case)
+      detail         : str | None      why each missed attempt missed, e.g.
+                                       "a2: recall_user_memory not called; a4: answer
+                                       lacks 'peanut'"; None when no attempt missed
+
+With k-of-n, the timing fields summarise the attempts rather than one run: medians for
+wall/model/tokens, max for load_seconds and vram_gpu_mib (a cold load must stay
+visible), the last reading for vram_models. Routing leaves all four v3 fields None.
 
 `wall_seconds - model_seconds` is the remainder (tools, embeddings, graph, HTTP, and any
 LLM call whose reply is not in the thread). It is computed by readers, never stored —
@@ -53,9 +66,10 @@ from dataclasses import asdict, dataclass, field
 from pathlib import Path
 from typing import Optional
 
-SCHEMA_VERSION = 2
-#: versions from_dict accepts. A v1 record simply lacks the v2 fields, which default None.
-READABLE_VERSIONS = (1, 2)
+SCHEMA_VERSION = 3
+#: versions from_dict accepts. An older record simply lacks the newer fields, which
+#: default None.
+READABLE_VERSIONS = (1, 2, 3)
 
 #: Ollama reports ~0.09 s of load_duration on a model that is ALREADY loaded (measured
 #: 2026-11-12, llama3.1 warm), so "non-zero" cannot mean cold. A real 8B load from disk
@@ -86,6 +100,10 @@ class CaseResult:
     output_tokens: Optional[int] = None
     vram_models: Optional[dict] = None
     vram_gpu_mib: Optional[int] = None
+    attempts: Optional[int] = None
+    passes: Optional[int] = None
+    required: Optional[int] = None
+    detail: Optional[str] = None
 
     def __post_init__(self):
         if self.verdict not in VERDICTS:
@@ -115,8 +133,8 @@ class CheckRecord:
         if data.get("schema_version") not in READABLE_VERSIONS:
             raise ValueError(f"unsupported schema_version {data.get('schema_version')!r}; "
                              f"this reader understands {READABLE_VERSIONS}")
-        #: read into the current shape: a v1 record's missing fields become None, and the
-        #: object is a v2 record from here on (to_dict writes it back as v2)
+        #: read into the current shape: an older record's missing fields become None, and
+        #: the object is a current-version record from here on (to_dict writes it back so)
         return cls(
             check=data["check"],
             model=data["model"],

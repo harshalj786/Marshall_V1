@@ -99,7 +99,30 @@ def test_v2_fields_round_trip():
     assert CheckRecord.from_dict(json.loads(json.dumps(original.to_dict()))) == original
 
 
-@pytest.mark.parametrize("load, expected", [(None, None), (0.09, False), (1.0, True), (6.2, True)])
+def test_a_v2_record_still_reads_with_the_v3_fields_null():
+    """Every routing record written before k-of-n existed must keep reading."""
+    v2 = {"schema_version": 2, "check": "routing", "model": "llama3.1", "error": None,
+          "cases": [{"id": "math", "verdict": "PASS", "wall_seconds": 4.0, "error": None,
+                     "model_seconds": 2.0, "load_seconds": 0.1, "prompt_tokens": 400,
+                     "output_tokens": 20, "vram_models": {}, "vram_gpu_mib": 7000}]}
+    record = CheckRecord.from_dict(v2)
+    case = record.cases[0]
+    assert case.model_seconds == 2.0
+    assert (case.attempts, case.passes, case.required, case.detail) == (None,) * 4
+    assert record.schema_version == SCHEMA_VERSION == 3
+
+
+def test_v3_fields_round_trip():
+    original = _record(PASS)
+    case = original.cases[0]
+    case.attempts, case.passes, case.required = 4, 3, 3
+    case.detail = "a2: answer lacks 'peanut'"
+    restored = CheckRecord.from_dict(json.loads(json.dumps(original.to_dict())))
+    assert restored == original
+    assert restored.cases[0].detail == "a2: answer lacks 'peanut'"
+
+
+@pytest.mark.parametrize("load, expected",[(None, None), (0.09, False), (1.0, True), (6.2, True)])
 def test_is_cold_load_uses_the_threshold_not_nonzero(load, expected):
     """A warm llama3.1 reports ~0.09 s of load_duration, so 'non-zero' is not 'cold'."""
     case = CaseResult(id="x", verdict=PASS, wall_seconds=1.0, load_seconds=load)

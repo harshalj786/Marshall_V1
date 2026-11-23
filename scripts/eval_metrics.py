@@ -24,12 +24,27 @@ whatever the hidden calls cost.
 
 `load_seconds` is raw. A warm model still reports ~0.09 s of load_duration, so judge
 "cold" with eval_contract.is_cold_load, never with `> 0`.
+
+TWO WAYS TO TIME A TURN — and they measure different things
+-----------------------------------------------------------
+  * `turn_timing(messages)` / `case_metrics(messages)`: reads the replies left in the
+    thread. Routing uses it. Narrow (agent replies only) and it needs a slice of the
+    history, which a summariser rewrite can invalidate on a long thread.
+  * `TurnTimer` (a LangChain callback) / `timer_metrics(timer)`: collects every LLM
+    response AS IT IS PRODUCED during the turn. The memory check uses it. Wider: it also
+    catches the memory gate, the summariser and any nested model call (see its docstring).
+
+Same field names, different scope. Do not compare one check's model_seconds with
+another's unless both were timed the same way.
 """
 import json
 import subprocess
+import threading
 import urllib.request
 from dataclasses import dataclass
 from typing import Optional
+
+from langchain_core.callbacks import BaseCallbackHandler
 
 OLLAMA_PS_URL = "http://127.0.0.1:11434/api/ps"
 NVIDIA_SMI = ["nvidia-smi", "--query-gpu=memory.used", "--format=csv,noheader,nounits"]
@@ -55,12 +70,24 @@ def turn_timing(messages) -> TurnTiming:
     """
     try:
         replies = [m for m in messages or [] if getattr(m, "type", None) == "ai"]
-        if not replies:
+        return _sum_metadata([getattr(reply, "response_metadata", None) for reply in replies])
+    except Exception:
+        return TurnTiming()
+
+
+def _sum_metadata(metas) -> TurnTiming:
+    """Sum Ollama timing dicts. The ONE place the all-or-null rule lives.
+
+    Empty -> all None (nothing was measured). Any entry missing, not a dict, or lacking
+    total_duration -> all None (a partial sum would undercount and read as a fast model).
+    """
+    try:
+        metas = list(metas or [])
+        if not metas:
             return TurnTiming()
         total = load = prompt = output = 0
-        for reply in replies:
-            meta = getattr(reply, "response_metadata", None) or {}
-            if meta.get("total_duration") is None:
+        for meta in metas:
+            if not isinstance(meta, dict) or meta.get("total_duration") is None:
                 return TurnTiming()
             total += int(meta["total_duration"])
             load += int(meta.get("load_duration") or 0)
@@ -70,6 +97,80 @@ def turn_timing(messages) -> TurnTiming:
                           prompt_tokens=prompt, output_tokens=output)
     except Exception:
         return TurnTiming()
+
+
+class TurnTimer(BaseCallbackHandler):
+    """Collect each LLM response's Ollama timing as it is produced. Never raises.
+
+        timer = TurnTimer()
+        timer.reset()                                   # before each timed turn
+        agent.invoke(q, config={"configurable": {...}, "callbacks": [timer]})
+        timer.timing()                                  # -> TurnTiming for that turn
+
+    Why a callback and not a history slice: on a multi-turn thread the summariser replaces
+    the message list (RemoveMessage(REMOVE_ALL) + summary + tail), so "len(history) before
+    the turn" can point past the end or at the wrong messages afterwards. The callback
+    never looks at the list, so a rewrite cannot corrupt it.
+
+    SCOPE — WIDER THAN ROUTING'S model_seconds. Callbacks passed in the invoke config
+    propagate to nested runnables even when the nested `.invoke()` passes no config
+    (langchain_core's child-config context; pinned by tests/test_eval_metrics.py). So this
+    counts EVERY model call made during the turn: the agent's replies, plus the memory gate
+    (UserMemory compression on turns 5, 10, ...), the conversation summariser, and the
+    retriever's mistral if search_current_doc runs. Routing's model_seconds
+    (`turn_timing`) counts only the agent's replies. **A memory-check model_seconds and a
+    routing model_seconds are not the same measurement: do not compare them naively in
+    Feature 3.** For a single-turn thread where neither the gate nor the summariser fires,
+    and no document search runs, the two coincide.
+
+    All-or-null, like `turn_timing`: one response without timing (or an errored call)
+    nulls the whole turn. Thread-safe: ToolNode may run tools, and so nested model calls,
+    on worker threads.
+    """
+
+    def __init__(self):
+        super().__init__()
+        self._lock = threading.Lock()
+        self._metas: list = []
+
+    def reset(self) -> None:
+        with self._lock:
+            self._metas = []
+
+    @property
+    def call_count(self) -> int:
+        """How many model responses were seen since the last reset."""
+        with self._lock:
+            return len(self._metas)
+
+    def on_llm_end(self, response, **kwargs) -> None:
+        try:
+            found = []
+            for generations in getattr(response, "generations", None) or []:
+                for generation in generations:
+                    message = getattr(generation, "message", None)
+                    meta = getattr(message, "response_metadata", None)
+                    if not meta:
+                        #: completion-style models put it here instead
+                        meta = getattr(generation, "generation_info", None)
+                    found.append(dict(meta) if isinstance(meta, dict) else None)
+            if not found:
+                found = [None]   # a response with no generation is an unmeasured call
+        except Exception:
+            found = [None]
+        with self._lock:
+            self._metas.extend(found)
+
+    def on_llm_error(self, error, **kwargs) -> None:
+        #: a call that failed has no timing; recording None nulls the turn rather than
+        #: letting the remaining calls read as the whole cost
+        with self._lock:
+            self._metas.append(None)
+
+    def timing(self) -> TurnTiming:
+        with self._lock:
+            metas = list(self._metas)
+        return _sum_metadata(metas)
 
 
 def ollama_vram(url: Optional[str] = None, timeout: float = 2.0) -> Optional[dict]:
@@ -107,7 +208,22 @@ def case_metrics(turn_messages) -> dict:
     Call after the case's timer has stopped: the readings (~0.2 s for nvidia-smi) must
     not land inside wall_seconds.
     """
-    timing = turn_timing(turn_messages)
+    return _with_vram(turn_timing(turn_messages))
+
+
+def timer_metrics(timer: Optional[TurnTimer]) -> dict:
+    """The same six fields, timed by a TurnTimer instead of the history. Never raises.
+
+    See TurnTimer's docstring: this model_seconds is WIDER than case_metrics'.
+    """
+    try:
+        timing = timer.timing() if timer is not None else TurnTiming()
+    except Exception:
+        timing = TurnTiming()
+    return _with_vram(timing)
+
+
+def _with_vram(timing: TurnTiming) -> dict:
     return {
         "model_seconds": timing.model_seconds,
         "load_seconds": timing.load_seconds,

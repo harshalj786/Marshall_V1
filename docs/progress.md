@@ -122,6 +122,28 @@ From the audit, these exist and are tested:
 - Feature 2 Step 3 (runner) must record which models are loaded at each check's START,
   not only after each case: VRAM depends on what ran before (mistral was resident only
   because the ingestion tests ran first — 11,755 of 12,282 MiB with both loaded).
+- Feature 5 must flip pet, two-facts, paraphrase, carry-over back to must_pass=True and
+  make them pass — this is the human-like-recall target. Baseline 2/6 pass, 4 known
+  boundaries (23 Nov), plus `unknown` (Feature 5's "I don't know" target, no gap note:
+  it passes some runs). A boundary may pass on a lucky run (pet did on 23 Nov) — that
+  is not a fix. A 7th case, `born`, was added as a RETRIEVAL-ONLY must-pass (recall
+  chosen + "1998" returned; answer not graded, and its record says so). Two must-pass
+  cases on two layers:
+  ranking = retrieve -> answer, born = retrieve only. (scripts/check_memory.py; each
+  case's `known_gap` says why it misses today.)
+- **Feature 5's #1 target: make Marshall actually USE retrieved facts in its replies.**
+  "Recall returns the fact, the answer doesn't use it" is NEARLY UNIVERSAL on llama3.1:
+  pet, carry-over, and in a 23 Nov trial born ("what year was I born?") and car ("what
+  car do I drive?") at 0/5 each — the tool returned the exact sentence every time and the
+  answer said "I don't have any information about…". Only ranking's answer-forcing
+  format dodges it. pet + carry-over are the same defect, not two. Untested lead: the
+  snippets come back as the user's raw first-person words ("I was born in 1998.") with
+  no attribution, so the model may read "I" as itself — try framing them ("The user
+  said: …").
+- Separate defect for Feature 5 to check: tool-call syntax leaking into the reply. In the
+  same trial "which city is my office in?" answered with raw
+  `<|python_tag|>"recall_user_memory" tool call returned … {'answer': 'Bangalore'}` —
+  a substring match would score it a pass, so it is NOT used as a case.
 - Same-day supersede leaves a zero-length row (valid_from == valid_until) that
   as_of() won't return. Acceptable at day precision.
 - Unknown relations logged to stderr only, not persisted.

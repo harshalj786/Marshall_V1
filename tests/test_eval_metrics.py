@@ -120,3 +120,87 @@ def test_gpu_used_mib_parses_the_first_gpu(monkeypatch):
     done = subprocess.CompletedProcess(args=[], returncode=0, stdout="11269\n2048\n")
     monkeypatch.setattr(metrics.subprocess, "run", lambda *a, **k: done)
     assert gpu_used_mib() == 11269
+
+
+# --------------------------------------------------------------------------
+# TurnTimer: live timing by callback (Step 4). Fake chat models, no Ollama.
+# --------------------------------------------------------------------------
+
+from langchain_core.language_models.fake_chat_models import FakeMessagesListChatModel  # noqa: E402
+from langchain_core.runnables import RunnableLambda  # noqa: E402
+
+from scripts.eval_metrics import TurnTimer, timer_metrics  # noqa: E402
+
+NS = 1_000_000_000
+
+
+def _fake_model(*replies):
+    return FakeMessagesListChatModel(responses=list(replies))
+
+
+def test_timer_sums_every_response_in_the_turn():
+    timer = TurnTimer()
+    model = _fake_model(_reply(total_ns=2 * NS, load_ns=NS // 10, prompt=300, output=20),
+                        _reply(total_ns=3 * NS, load_ns=NS // 10, prompt=400, output=30))
+    model.invoke("first", config={"callbacks": [timer]})
+    model.invoke("second", config={"callbacks": [timer]})
+    timing = timer.timing()
+    assert timer.call_count == 2
+    assert timing.model_seconds == pytest.approx(5.0)
+    assert timing.load_seconds == pytest.approx(0.2)
+    assert (timing.prompt_tokens, timing.output_tokens) == (700, 50)
+
+
+def test_timer_catches_a_nested_call_that_passed_no_config():
+    """The property the memory check relies on: the memory gate and the summariser call
+    their model WITHOUT forwarding the config, and the callback still sees them."""
+    timer = TurnTimer()
+    inner = _fake_model(_reply(total_ns=4 * NS))
+    outer = RunnableLambda(lambda _: inner.invoke("nested, no config"))
+    outer.invoke(None, config={"callbacks": [timer]})
+    assert timer.call_count == 1
+    assert timer.timing().model_seconds == pytest.approx(4.0)
+
+
+def test_timer_is_all_or_null_when_one_response_lacks_timing():
+    timer = TurnTimer()
+    model = _fake_model(_reply(total_ns=2 * NS), _reply(total_ns=None))
+    model.invoke("a", config={"callbacks": [timer]})
+    model.invoke("b", config={"callbacks": [timer]})
+    assert timer.call_count == 2
+    assert timer.timing() == metrics.TurnTiming()
+
+
+def test_timer_reset_starts_a_new_turn():
+    timer = TurnTimer()
+    model = _fake_model(_reply(total_ns=9 * NS), _reply(total_ns=1 * NS))
+    model.invoke("turn 1", config={"callbacks": [timer]})
+    timer.reset()
+    model.invoke("turn 2", config={"callbacks": [timer]})
+    assert timer.timing().model_seconds == pytest.approx(1.0)
+
+
+def test_timer_with_nothing_seen_is_null():
+    assert TurnTimer().timing() == metrics.TurnTiming()
+
+
+def test_an_errored_call_nulls_the_turn():
+    timer = TurnTimer()
+    _fake_model(_reply(total_ns=2 * NS)).invoke("ok", config={"callbacks": [timer]})
+    timer.on_llm_error(RuntimeError("model fell over"))
+    assert timer.timing() == metrics.TurnTiming()
+
+
+def test_garbage_response_never_raises_and_nulls():
+    timer = TurnTimer()
+    timer.on_llm_end(object())          # no .generations at all
+    assert timer.call_count == 1
+    assert timer.timing() == metrics.TurnTiming()
+
+
+def test_timer_metrics_with_every_reader_gone(monkeypatch):
+    monkeypatch.setattr(metrics, "OLLAMA_PS_URL", "http://127.0.0.1:9/api/ps")
+    monkeypatch.setattr(metrics, "NVIDIA_SMI", ["definitely-not-a-real-binary-xyz"])
+    assert timer_metrics(None) == {
+        "model_seconds": None, "load_seconds": None, "prompt_tokens": None,
+        "output_tokens": None, "vram_models": None, "vram_gpu_mib": None}

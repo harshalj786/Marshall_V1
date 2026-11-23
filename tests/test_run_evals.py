@@ -19,7 +19,8 @@ REPO = Path(__file__).resolve().parent.parent
 sys.path.insert(0, str(REPO))
 
 import scripts.run_evals as runner
-from scripts.eval_contract import BOUNDARY, ERROR, FAIL, PASS, CaseResult, CheckRecord
+from scripts.eval_contract import (BOUNDARY, ERROR, FAIL, PASS, SCHEMA_VERSION, CaseResult,
+                                   CheckRecord)
 from scripts.run_evals import (DISAGREE, ST_COULD_NOT_RUN, ST_NOT_BUILT, ST_PASS,
                                ST_REGRESSION, CheckOutcome, build_log_line, classify,
                                format_table, overall_exit, run_check, summarize)
@@ -188,7 +189,7 @@ def test_log_line_shape_embeds_the_full_record():
 # ==========================================================================
 
 def _record_json(*verdicts, error=None):
-    return json.dumps({"schema_version": 2, "check": "fake", "model": "fake-model",
+    return json.dumps({"schema_version": SCHEMA_VERSION,"check": "fake", "model": "fake-model",
                        "error": error,
                        "cases": [{"id": f"c{i}", "verdict": v, "wall_seconds": 0.1}
                                  for i, v in enumerate(verdicts)]})
