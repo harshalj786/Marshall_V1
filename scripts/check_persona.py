@@ -226,13 +226,15 @@ def grade(case: PersonaCase, calls: list, answer: str) -> Optional[str]:
 # running against the agent
 # ==========================================================================
 
-def build_agent():
-    """The voice path's agent (via check_routing), on THIS check's own empty stores."""
+def build_agent(model: Optional[str] = None):
+    """The voice path's agent (via check_routing), on THIS check's own empty stores.
+
+    `model` is the `--model` override; None keeps voice_main.VOICE_MODEL."""
     from scripts.check_routing import build_check_agent
 
     shutil.rmtree(CHECK_USER_HISTORY_PATH, ignore_errors=True)
     return build_check_agent(user_history_path=CHECK_USER_HISTORY_PATH,
-                             summary_path=CHECK_SUMMARY_PATH)
+                             summary_path=CHECK_SUMMARY_PATH, model=model)
 
 
 def ask(agent, case: PersonaCase, thread_id: str) -> Attempt:
@@ -280,7 +282,7 @@ def print_attempt(number: int, attempt: Attempt) -> None:
         print(f"           why      {attempt.reason}")
 
 
-def print_summary(results: list, elapsed: float) -> bool:
+def print_summary(results: list, elapsed: float, model: str = voice_main.VOICE_MODEL) -> bool:
     print("=" * 72)
     print("SUMMARY")
     print("=" * 72)
@@ -295,7 +297,7 @@ def print_summary(results: list, elapsed: float) -> bool:
     if regressions:
         print("PERSONA REGRESSION - " + ", ".join(r.id for r in regressions))
     else:
-        print(f"PERSONA OK - {voice_main.VOICE_MODEL} stays Marshall on every must-pass case.")
+        print(f"PERSONA OK - {model} stays Marshall on every must-pass case.")
     print("=" * 72)
     return not regressions
 
@@ -312,12 +314,14 @@ def parse_args(argv=None):
                         help="run a single case instead of all of them")
     parser.add_argument("--json", default=None, metavar="PATH",
                         help="also write the eval record (scripts/eval_contract.py) to PATH")
+    from scripts.check_routing import add_model_arg
+    add_model_arg(parser)
     return parser.parse_args(argv)
 
 
 def main(argv=None) -> int:
     args = parse_args(argv)
-    record = CheckRecord(check="persona", model=voice_main.VOICE_MODEL)
+    record = CheckRecord(check="persona", model=args.model)
     code = _run(args, record)
     if args.json:
         write_record(record, args.json)
@@ -335,9 +339,9 @@ def _run(args, record: CheckRecord) -> int:
 
     if not ollama_up():
         return _cannot_run(record, "Ollama is not reachable on :11434 - start it and try again.")
-    if not model_available(voice_main.VOICE_MODEL):
-        return _cannot_run(record, f"{voice_main.VOICE_MODEL} is not pulled: "
-                                   f"ollama pull {voice_main.VOICE_MODEL}")
+    model = args.model
+    if not model_available(model):
+        return _cannot_run(record, f"{model} is not pulled: ollama pull {model}")
     if not Path(voice_main.DEFAULT_DOCUMENT).exists():
         return _cannot_run(record, f"no such document: {voice_main.DEFAULT_DOCUMENT}")
 
@@ -345,13 +349,13 @@ def _run(args, record: CheckRecord) -> int:
     print("=" * 72)
     print("PERSONA CHECK")
     print("=" * 72)
-    print(f"  model      {voice_main.VOICE_MODEL}")
+    print(f"  model      {model}")
     print(f"  memory     {CHECK_USER_HISTORY_PATH}  (wiped, empty: persona needs no facts)")
     print()
 
     started = time.perf_counter()
     try:
-        agent = build_agent()
+        agent = build_agent(model)
     except Exception as exc:
         return _cannot_run(record, f"could not build the agent: {type(exc).__name__}: {exc}")
 
@@ -375,7 +379,7 @@ def _run(args, record: CheckRecord) -> int:
               f"need {result.required})")
         print()
 
-    return 0 if print_summary(results, time.perf_counter() - started) else 1
+    return 0 if print_summary(results, time.perf_counter() - started, model) else 1
 
 
 if __name__ == "__main__":

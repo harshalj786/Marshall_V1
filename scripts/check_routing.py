@@ -255,7 +255,8 @@ def build_check_agent(file_path: Optional[str] = None,
                       fresh: bool = False,
                       vector_db_path: Optional[str] = None,
                       user_history_path: Optional[str] = None,
-                      summary_path: Optional[str] = None):
+                      summary_path: Optional[str] = None,
+                      model: Optional[str] = None):
     """The voice path's agent, with long-term memory pointed at a dedicated store.
 
     Every other argument is `voice_main`'s own constant, imported rather than copied: same
@@ -268,9 +269,14 @@ def build_check_agent(file_path: Optional[str] = None,
     hand-run of this script reads. `db/voice_vdb` in particular is the live document index —
     with it as the default, a suite running while a voice session is live put two processes
     on one Chroma directory. The gate passes its own tmp paths; nothing else changes.
+
+    `model` is the Feature 3 bake-off override (`--model` on every check). It replaces
+    BOTH the generation model and the memory model, because one model doing both jobs is
+    exactly what is being measured. None keeps `voice_main.VOICE_MODEL`.
     """
     from pipeline_lg import AgentGraph
 
+    model = model or voice_main.VOICE_MODEL
     user_history = user_history_path or CHECK_USER_HISTORY_PATH
     if fresh:
         shutil.rmtree(user_history, ignore_errors=True)
@@ -279,8 +285,8 @@ def build_check_agent(file_path: Optional[str] = None,
         file_path=document,
         mode_docs="pdf" if str(document).lower().endswith(".pdf") else "txt",
         persist_directory_path=vector_db_path or voice_main.VECTOR_DB_PATH,
-        model=voice_main.VOICE_MODEL,
-        memory_model=voice_main.VOICE_MODEL,
+        model=model,
+        memory_model=model,
         keep_alive=voice_main.KEEP_ALIVE,
         user_history_directory_path=user_history,
         summary_persist_path=summary_path or CHECK_SUMMARY_PATH,
@@ -305,7 +311,9 @@ def seed_memory(agent) -> None:
         chat_history=[HumanMessage(content=text) for text in SEED_MESSAGES],
         collection_name=agent.user_memory_collection,
         persist_directory_path=agent.user_history_directory_path,
-        model=voice_main.VOICE_MODEL,
+        #: the agent's own memory model, so an overridden run never names llama3.1 here.
+        #: (`.index()` only embeds; it calls no LLM, but a stray name is a trap to read.)
+        model=agent.memory_model,
     ).index()
 
 
@@ -376,15 +384,27 @@ def ollama_up() -> bool:
 
 
 def model_available(model: str) -> bool:
-    """Is `model` pulled? Tag-insensitive: llama3.1 is served as `llama3.1:latest`."""
+    """Is `model` pulled? Asks Ollama's /api/tags; the matching rule is `model_matches`."""
     try:
         with urllib.request.urlopen(OLLAMA_TAGS_URL, timeout=3) as response:
             tags = json.load(response)
     except Exception:
         return False
-    wanted = model.split(":")[0]
-    return any(str(entry.get("name", "")).split(":")[0] == wanted
-               for entry in tags.get("models", []))
+    return model_matches(model, [str(entry.get("name", "")) for entry in tags.get("models", [])])
+
+
+def model_matches(model: str, pulled: list) -> bool:
+    """Does `model` name one of the `pulled` tags? Pure.
+
+    A BARE name matches any tag: `llama3.1` is served as `llama3.1:latest`, and every
+    existing caller passes the bare name. A TAGGED name must match exactly. This used to
+    compare only the part before the colon, so `granite4:tiny-h` read as pulled when only
+    `granite4:latest` (the 3B micro model) was — and a bake-off would then report numbers
+    for a model it never ran, or fail every case later with a less obvious error.
+    """
+    if ":" not in model:
+        return any(name.split(":")[0] == model for name in pulled)
+    return model in pulled
 
 
 # ==========================================================================
@@ -418,7 +438,8 @@ def print_result(result: RouteResult) -> None:
     print()
 
 
-def print_summary(results: list, elapsed: float) -> bool:
+def print_summary(results: list, elapsed: float,
+                  model: str = voice_main.VOICE_MODEL) -> bool:
     """Print the closing block. Returns True when routing is intact."""
     must_pass = [r for r in results if r.route.must_pass]
     correct = [r for r in must_pass if r.verdict == PASS]
@@ -440,7 +461,7 @@ def print_summary(results: list, elapsed: float) -> bool:
 
     ok = not regressions
     if ok:
-        print(f"ROUTING OK - {voice_main.VOICE_MODEL} answers and selects the right tool "
+        print(f"ROUTING OK - {model} answers and selects the right tool "
               f"on all {len(must_pass)}.")
     else:
         print("ROUTING REGRESSION - " + ", ".join(
@@ -469,7 +490,19 @@ def parse_args(argv=None):
                         help=f"delete {CHECK_USER_HISTORY_PATH} and re-seed it first")
     parser.add_argument("--json", default=None, metavar="PATH",
                         help="also write the eval record (scripts/eval_contract.py) to PATH")
+    add_model_arg(parser)
     return parser.parse_args(argv)
+
+
+def add_model_arg(parser) -> None:
+    """`--model`, shared by all three checks so the flag cannot drift between them.
+
+    A flag and never an environment variable: in a bake-off the model belongs in the
+    command that produced the numbers, not in shell state left over from a previous run.
+    """
+    parser.add_argument("--model", default=voice_main.VOICE_MODEL,
+                        help="Ollama model for generation AND the memory gate, e.g. "
+                             f"qwen3.5:9b (default {voice_main.VOICE_MODEL}, the voice model)")
 
 
 def to_case(result: RouteResult) -> CaseResult:
@@ -479,7 +512,7 @@ def to_case(result: RouteResult) -> CaseResult:
 
 def main(argv=None) -> int:
     args = parse_args(argv)
-    record = CheckRecord(check="routing", model=voice_main.VOICE_MODEL)
+    record = CheckRecord(check="routing", model=args.model)
     code = _run(args, record)
     #: written on every exit path, including 2 (record.error says why). Additive: without
     #: --json nothing here runs, and a failed write never changes the exit code.
@@ -497,9 +530,9 @@ def _cannot_run(record: CheckRecord, message: str) -> int:
 def _run(args, record: CheckRecord) -> int:
     if not ollama_up():
         return _cannot_run(record, "Ollama is not reachable on :11434 - start it and try again.")
-    if not model_available(voice_main.VOICE_MODEL):
-        return _cannot_run(record, f"{voice_main.VOICE_MODEL} is not pulled: "
-                                   f"ollama pull {voice_main.VOICE_MODEL}")
+    model = args.model
+    if not model_available(model):
+        return _cannot_run(record, f"{model} is not pulled: ollama pull {model}")
     document = args.file or voice_main.DEFAULT_DOCUMENT
     if not Path(document).exists():
         return _cannot_run(record, f"no such document: {document}")
@@ -507,7 +540,7 @@ def _run(args, record: CheckRecord) -> int:
     print("=" * 72)
     print("ROUTING CHECK")
     print("=" * 72)
-    print(f"  model      {voice_main.VOICE_MODEL} (generation and memory gate)")
+    print(f"  model      {model} (generation and memory gate)")
     print(f"  document   {document}")
     print(f"  doc index  {voice_main.VECTOR_DB_PATH}")
     print(f"  memory     {CHECK_USER_HISTORY_PATH}  (seeded here, not the live voice store)")
@@ -515,7 +548,7 @@ def _run(args, record: CheckRecord) -> int:
 
     started = time.perf_counter()
     try:
-        agent = build_check_agent(document, fresh=args.fresh)
+        agent = build_check_agent(document, fresh=args.fresh, model=model)
         seed_memory(agent)
     except Exception as exc:
         return _cannot_run(record, f"could not build the agent: {type(exc).__name__}: {exc}")
@@ -538,7 +571,7 @@ def _run(args, record: CheckRecord) -> int:
         record.cases.append(to_case(result))
         print_result(result)
 
-    return 0 if print_summary(results, time.perf_counter() - started) else 1
+    return 0 if print_summary(results, time.perf_counter() - started, model) else 1
 
 
 if __name__ == "__main__":

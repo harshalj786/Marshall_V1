@@ -326,3 +326,74 @@ def test_main_unknown_name_is_a_usage_error(tmp_path, snapshot, capsys):
                        registry=_registry(tmp_path)) == 2
     assert "unknown check(s): rotuing" in capsys.readouterr().err
     assert not (tmp_path / "l.jsonl").exists()   # nothing ran, nothing logged
+
+
+# ==========================================================================
+# --model (Feature 3 prep step 1) — reaches every check, and the table names it
+# ==========================================================================
+
+#: a fake check that writes back whatever `--model` it was launched with ("default"
+#: when none), so the test witnesses the real argv rather than a mocked call. One line:
+#: `_fake_check` dedents its template, so a multi-line body would break the indentation.
+_ECHO_MODEL = (
+    "import json; "
+    "model = sys.argv[sys.argv.index('--model') + 1] if '--model' in sys.argv else 'default'; "
+    "out.write_text(json.dumps({'schema_version': " + str(SCHEMA_VERSION) + ", 'check': 'fake',"
+    " 'model': model, 'error': None,"
+    " 'cases': [{'id': 'c0', 'verdict': 'PASS', 'wall_seconds': 0.1}]})); "
+    "sys.exit(0)")
+
+
+def test_check_command_adds_model_only_when_asked():
+    plain = runner.check_command("s.py", "r.json")
+    assert plain == [sys.executable, "s.py", "--json", "r.json"]   # byte-for-byte as before
+    assert runner.check_command("s.py", "r.json", "qwen3.5:9b") == plain + ["--model", "qwen3.5:9b"]
+
+
+def test_model_flag_reaches_every_check_subprocess(tmp_path, snapshot, capsys):
+    registry = {name: str(_fake_check(tmp_path, name, _ECHO_MODEL))
+                for name in ("routing", "memory", "persona")}
+    log = tmp_path / "runs.jsonl"
+    assert runner.main(["--model", "qwen3.5:9b", "--log", str(log)], registry=registry) == 0
+    line = json.loads(log.read_text(encoding="utf-8").strip())
+    assert [c["record"]["model"] for c in line["checks"]] == ["qwen3.5:9b"] * 3
+    assert "model qwen3.5:9b" in capsys.readouterr().out
+
+
+def test_no_model_flag_passes_nothing(tmp_path, snapshot):
+    registry = {"routing": str(_fake_check(tmp_path, "routing", _ECHO_MODEL))}
+    log = tmp_path / "runs.jsonl"
+    assert runner.main(["--log", str(log)], registry=registry) == 0
+    assert json.loads(log.read_text(encoding="utf-8"))["checks"][0]["record"]["model"] == "default"
+
+
+def _with_model(check, model):
+    record = _record(PASS)
+    record.model = model
+    return CheckOutcome(check=check, status=ST_PASS, exit_code=0, record=record)
+
+
+def test_header_names_the_model_the_records_report():
+    table = format_table([_with_model("routing", "qwen3.5:9b"), _with_model("memory", "qwen3.5:9b")],
+                         "abc1234", False, "T", 0, model="qwen3.5:9b")
+    header = table.splitlines()[1]
+    assert "model qwen3.5:9b" in header and "!! model" not in table
+
+
+def test_header_without_records_falls_back_to_the_requested_model():
+    missing = CheckOutcome(check="routing", status=ST_NOT_BUILT, reason="x")
+    assert "model qwen3:8b" in format_table([missing], None, None, "T", 2, model="qwen3:8b")
+    assert "model unknown" in format_table([missing], None, None, "T", 2)
+
+
+def test_a_check_that_ignored_the_override_is_flagged():
+    table = format_table([_with_model("routing", "llama3.1")], None, None, "T", 0,
+                         model="qwen3.5:9b")
+    assert "!! model: asked for --model qwen3.5:9b but the checks ran llama3.1" in table
+
+
+def test_checks_that_disagree_are_flagged():
+    table = format_table([_with_model("routing", "llama3.1"), _with_model("memory", "qwen3:8b")],
+                         None, None, "T", 0)
+    assert "model llama3.1, qwen3:8b" in table.splitlines()[1]
+    assert "!! model: checks ran different models: llama3.1, qwen3:8b" in table

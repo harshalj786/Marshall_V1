@@ -364,12 +364,14 @@ def aggregate(case: MemoryCase, attempts: list) -> CaseResult:
 # running against the agent
 # ==========================================================================
 
-def build_agent(user_history_path: str):
-    """The voice path's agent (via check_routing), on THIS check's own stores."""
+def build_agent(user_history_path: str, model: Optional[str] = None):
+    """The voice path's agent (via check_routing), on THIS check's own stores.
+
+    `model` is the `--model` override; None keeps voice_main.VOICE_MODEL."""
     from scripts.check_routing import build_check_agent
 
     return build_check_agent(user_history_path=user_history_path,
-                             summary_path=CHECK_SUMMARY_PATH)
+                             summary_path=CHECK_SUMMARY_PATH, model=model)
 
 
 def seed_store(agent, statements) -> None:
@@ -383,7 +385,8 @@ def seed_store(agent, statements) -> None:
         chat_history=[HumanMessage(content=text) for text in statements],
         collection_name=agent.user_memory_collection,
         persist_directory_path=agent.user_history_directory_path,
-        model=voice_main.VOICE_MODEL,
+        #: the agent's own memory model (`.index()` only embeds; no LLM call)
+        model=agent.memory_model,
     ).index()
 
 
@@ -427,12 +430,12 @@ def run_seeded_attempt(agent, case: MemoryCase, number: int) -> Attempt:
     return ask(agent, case, f"mem-{case.id}-{number}", TurnTimer())
 
 
-def run_carry_attempt(case: MemoryCase, number: int) -> Attempt:
+def run_carry_attempt(case: MemoryCase, number: int, model: Optional[str] = None) -> Attempt:
     """Fresh store + fresh agent, tell the facts in thread A, ask in fresh thread B."""
     store = f"{CHECK_CARRY_PATH}/a{number}"
     shutil.rmtree(store, ignore_errors=True)
     try:
-        agent = build_agent(store)
+        agent = build_agent(store, model)
     except Exception as exc:
         return Attempt(passed=False, error=f"could not build the agent: {exc}")
     setup = TurnTimer()
@@ -471,7 +474,7 @@ def print_attempt(number: int, attempt: Attempt) -> None:
         print(f"           why      {attempt.reason}")
 
 
-def print_summary(results: list, elapsed: float) -> bool:
+def print_summary(results: list, elapsed: float, model: str = voice_main.VOICE_MODEL) -> bool:
     print("=" * 72)
     print("SUMMARY")
     print("=" * 72)
@@ -488,7 +491,7 @@ def print_summary(results: list, elapsed: float) -> bool:
     if regressions:
         print("MEMORY REGRESSION - " + ", ".join(r.id for r in regressions))
     else:
-        print(f"MEMORY OK - {voice_main.VOICE_MODEL} recalls every must-pass fact.")
+        print(f"MEMORY OK - {model} recalls every must-pass fact.")
     print("=" * 72)
     return not regressions
 
@@ -505,12 +508,14 @@ def parse_args(argv=None):
                         help="run a single case instead of all of them")
     parser.add_argument("--json", default=None, metavar="PATH",
                         help="also write the eval record (scripts/eval_contract.py) to PATH")
+    from scripts.check_routing import add_model_arg
+    add_model_arg(parser)
     return parser.parse_args(argv)
 
 
 def main(argv=None) -> int:
     args = parse_args(argv)
-    record = CheckRecord(check="memory", model=voice_main.VOICE_MODEL)
+    record = CheckRecord(check="memory", model=args.model)
     code = _run(args, record)
     if args.json:
         write_record(record, args.json)
@@ -528,9 +533,9 @@ def _run(args, record: CheckRecord) -> int:
 
     if not ollama_up():
         return _cannot_run(record, "Ollama is not reachable on :11434 - start it and try again.")
-    if not model_available(voice_main.VOICE_MODEL):
-        return _cannot_run(record, f"{voice_main.VOICE_MODEL} is not pulled: "
-                                   f"ollama pull {voice_main.VOICE_MODEL}")
+    model = args.model
+    if not model_available(model):
+        return _cannot_run(record, f"{model} is not pulled: ollama pull {model}")
     if not Path(voice_main.DEFAULT_DOCUMENT).exists():
         return _cannot_run(record, f"no such document: {voice_main.DEFAULT_DOCUMENT}")
 
@@ -539,7 +544,7 @@ def _run(args, record: CheckRecord) -> int:
     print("=" * 72)
     print("MEMORY CHECK")
     print("=" * 72)
-    print(f"  model      {voice_main.VOICE_MODEL} (generation and memory gate)")
+    print(f"  model      {model} (generation and memory gate)")
     print(f"  memory     {CHECK_USER_HISTORY_PATH}  (wiped + seeded here, not the live store)")
     print(f"  seeded     {len(seeds)} statements, so the top 4 has to rank")
     print()
@@ -549,7 +554,7 @@ def _run(args, record: CheckRecord) -> int:
     if any(not c.told_in_thread for c in cases):
         shutil.rmtree(CHECK_USER_HISTORY_PATH, ignore_errors=True)
         try:
-            agent = build_agent(CHECK_USER_HISTORY_PATH)
+            agent = build_agent(CHECK_USER_HISTORY_PATH, model)
             seed_store(agent, seeds)
         except Exception as exc:
             return _cannot_run(record, f"could not build the agent: {type(exc).__name__}: {exc}")
@@ -564,7 +569,7 @@ def _run(args, record: CheckRecord) -> int:
         print("-" * 72)
 
         def one(number, case=case):
-            attempt = (run_carry_attempt(case, number) if case.told_in_thread
+            attempt = (run_carry_attempt(case, number, model) if case.told_in_thread
                        else run_seeded_attempt(agent, case, number))
             print_attempt(number, attempt)
             return attempt
@@ -576,7 +581,7 @@ def _run(args, record: CheckRecord) -> int:
               f"need {result.required})")
         print()
 
-    return 0 if print_summary(results, time.perf_counter() - started) else 1
+    return 0 if print_summary(results, time.perf_counter() - started, model) else 1
 
 
 if __name__ == "__main__":
