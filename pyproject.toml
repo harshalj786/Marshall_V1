@@ -27,5 +27,5 @@ addopts = "-ra --strict-markers --strict-config"
 # tests — see the long comment there. Nothing in tests/ was edited to add them.
 markers = [
     "needs_ollama: needs a reachable Ollama on :11434 (test_ingestion_retrieval_split, test_memory_gate_resilience, and every needs_llama31 test)",
-    "needs_llama31: needs Ollama on :11434 with llama3.1 pulled — the tool-routing gate in test_routing_matrix. Implies needs_ollama.",
+    "needs_llama31: needs Ollama on :11434 with llama3.1 pulled — the live eval gates (test_routing_matrix, test_code_tool_routing, test_memory_gate_live, test_persona_gate_live). Implies needs_ollama.",
 ]

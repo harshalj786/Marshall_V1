@@ -23,7 +23,7 @@ the audit; the 17-feature plan is unchanged, but several foundation pieces exist
 | # | Feature | Status | Notes / evidence |
 |---|---------|--------|------------------|
 | 1 | Dated-fact memory prototype | DONE | memory/facts.py + tests/test_facts.py (8 tests, in CI). Standalone. See below. |
-| 2 | Eval harness | NEXT | golden set per feature; records latency + VRAM. Grows from the routing regression gate. |
+| 2 | Eval harness | DONE | `python scripts/run_evals.py --only routing,memory,persona` — one command, one table, latency + VRAM per case. Logic in CI, live behaviour in the local gate. See "Feature 2 — what exists now" for the reference baseline. |
 | 3 | Model, embedder, context manager | PARTIAL already | LangGraph agent runs llama3.1; mistral still hardcoded in several files; no config/ module; embedder not yet chosen. |
 | 4 | Identity and personality | NOT STARTED | char config, prompt builder, drift probe. |
 | 5 | Full durable memory | PARTIAL already | wire facts.py into chat; facts pulled from conversation. FOLDS IN the durable checkpointer (R8): conversation message state currently dies on restart; fix it here. |
@@ -107,21 +107,59 @@ From the audit, these exist and are tested:
   (valid_until IS NULL OR valid_until >= valid_from).
 - NOT yet wired to the agent, Chroma, or voice — that is Feature 5. Hand-typed for now.
 
+## Feature 2 — what exists now (the measuring stick every later feature uses)
+One command: `python scripts/run_evals.py --only routing,memory,persona` (exit 0 nothing
+regressed, 1 a case regressed, 2 a check could not run or is not built). Shape:
+- `scripts/eval_contract.py` — the record every check writes (`--json`): schema v3,
+  per-case verdict PASS / FAIL / KNOWN-BOUNDARY / ERROR plus attempts, passes, required,
+  detail.
+- `scripts/eval_metrics.py` — per-case model seconds, load seconds, tokens, VRAM per
+  loaded model (Ollama /api/ps) and GPU MiB (nvidia-smi); readers degrade to null.
+  TurnTimer (callback) for memory/persona is WIDER than routing's history slice.
+- `scripts/run_evals.py` — runs each check as a subprocess, one summary table, appends
+  a JSONL run log (`eval_logs/runs.jsonl`).
+- Checks: `check_routing.py`, `check_memory.py`, `check_persona.py`.
+
+**Reference baseline (23–24 Nov, llama3.1). Later features compare against this:**
+| check | result | must-pass (gate) | known boundaries |
+|---|---|---|---|
+| routing | 5/6 | the five tool routes | no-tool "good explanation" (R4) |
+| memory | 4/7 (3–4 across runs) | ranking (retrieve -> answer), born (RETRIEVAL-ONLY) | pet, two-facts, paraphrase, carry-over; unknown (no gap) |
+| persona | 2/5 | identity, tool-turn | model-probe, disclaimer, spoken |
+memory's 4/7 includes pet and unknown passing on lucky runs (the 24 Nov Done-when run
+scored 3/7); the guaranteed floor is the 2 must-pass. A lucky boundary pass is not a fix.
+
+**The two gates — stated plainly:**
+- CI (every push, `pytest -m "not needs_ollama"`): 606 tests. Feature 2's model-free
+  logic is all here — test_eval_contract 20, test_eval_metrics 21, test_run_evals 36,
+  test_memory_check 69, test_persona_check 51 (197), plus routing's model-free tests.
+- Local gate (`pytest -m needs_ollama`, needs llama3.1): 46 tests — routing 17,
+  code-tool routing 10, memory 9 (`tests/test_memory_gate_live.py`), persona 6
+  (`tests/test_persona_gate_live.py`), ingestion/memory-gate 4. The LIVE memory, persona
+  and routing behaviour checks NEVER run in CI (no model there). In the live gates only a
+  must-pass miss fails; a boundary miss xfails with its known gap; a lucky boundary pass
+  is allowed.
+
 ## Known debts (decided, not blocking)
 - Structure_pipeline in pipeline.py: deleted in commit "pipeline: delete the broken
   Structure_pipeline placeholder"; R9 (rest of pipeline.py) still open. (Broken
   placeholder + old prompt-injection pattern.) pipeline.py is orphaned (only tests import it).
 - Durable checkpointer (R8): conversation message state dies on restart. Folded
   into Feature 5.
-- .github/workflows/tests.yml header comment says 21/220; real split is 31/409.
-  Fix in its own commit, not inside a feature commit.
 - mistral hardcoded in several files; no config/settings.py yet (Feature 3).
 - Eval `model_seconds` (scripts/eval_metrics.py) counts only the agent's own replies in
   the thread; it misses the memory gate, the summariser and retrieval's hardcoded mistral,
   so `wall_seconds - model_seconds` is NOT pure tool time. Read it that way in Feature 3.
-- Feature 2 Step 3 (runner) must record which models are loaded at each check's START,
-  not only after each case: VRAM depends on what ran before (mistral was resident only
-  because the ingestion tests ran first — 11,755 of 12,282 MiB with both loaded).
+- **FOOTGUN — hand-run memory/persona checks open the LIVE document index.** Run by hand
+  (`python scripts/check_memory.py`, `check_persona.py`, or via run_evals.py), both build
+  their agent through `check_routing.build_check_agent()` with no vector path, so they
+  open `db/voice_vdb` — the real voice index — and can race a live voice session for one
+  Chroma directory (or cold-ingest into it). The pytest gates monkeypatch every path into
+  tmp; the hand-run DEFAULT is the hazard (check_routing.py run by hand shares the same
+  default). Don't run them while voice is live. Fix = give
+  the checks their own vector path; that edits check logic, so it was left out of Feature 2.
+- (Done in Feature 2 Step 3: the runner records which models are loaded at each check's
+  START — the "loaded at start" column.)
 - Feature 5 must flip pet, two-facts, paraphrase, carry-over back to must_pass=True and
   make them pass — this is the human-like-recall target. Baseline 2/6 pass, 4 known
   boundaries (23 Nov), plus `unknown` (Feature 5's "I don't know" target, no gap note:

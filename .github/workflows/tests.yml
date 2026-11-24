@@ -1,9 +1,13 @@
 # Runs everything that does not need a local model server.
 #
-# Ollama is deliberately NOT provisioned here. The 21 model-gated tests — 17 of
-# which are the tool-routing gate — are deselected by `-m "not needs_ollama"` and
-# must still be run locally against a real llama3.1 before trusting a routing
-# change. This workflow protects the other 220; it does not replace that run.
+# Ollama is deliberately NOT provisioned here. The 46 model-gated tests are
+# deselected by `-m "not needs_ollama"`: the live eval gates (routing 17, code-tool
+# routing 10, memory 9, persona 6) and 4 ingestion / memory-gate tests. They must
+# still be run locally against a real llama3.1 — `pytest -m needs_ollama`, or
+# `python scripts/run_evals.py --only routing,memory,persona` — before trusting a
+# change to routing, memory or the persona. This workflow protects the other 606
+# (including the eval harness's model-free logic: contract, metrics, runner,
+# graders); it does not replace that run.
 #
 # Marker selection is derived from the skipif conditions already in the tests
 # (see conftest.py). If that derivation ever breaks, these tests are deselected
