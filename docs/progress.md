@@ -24,7 +24,7 @@ the audit; the 17-feature plan is unchanged, but several foundation pieces exist
 |---|---------|--------|------------------|
 | 1 | Dated-fact memory prototype | DONE | memory/facts.py + tests/test_facts.py (8 tests, in CI). Standalone. See below. |
 | 2 | Eval harness | DONE | `python scripts/run_evals.py --only routing,memory,persona` — one command, one table, latency + VRAM per case. Logic in CI, live behaviour in the local gate. See "Feature 2 — what exists now" for the reference baseline. |
-| 3 | Model, embedder, context manager | PARTIAL already | LangGraph agent runs llama3.1; mistral still hardcoded in several files; no config/ module; embedder not yet chosen. |
+| 3 | Model, embedder, context manager | IN PROGRESS | Step 0 recon done (24 Nov), see docs/feature3_model_bakeoff.md. Every live path already runs llama3.1 ALONE, so this is an optimisation bake-off, not a de-split; mistral removal is a tidy-up. gpt-oss-20b (14 GB) does not fit. Defect: num_ctx never set (4096 default). Next: six harness-prep steps, then the bake-off. Embedder not yet chosen; no config/ module. |
 | 4 | Identity and personality | NOT STARTED | char config, prompt builder, drift probe. |
 | 5 | Full durable memory | PARTIAL already | wire facts.py into chat; facts pulled from conversation. FOLDS IN the durable checkpointer (R8): conversation message state currently dies on restart; fix it here. |
 | 6 | Conversational judgement | NOT STARTED | |
@@ -50,7 +50,7 @@ Line numbers are as of commit a027b25 and will drift — search by symbol.
 |---|------------|-------------------------------|-----------------------------------|
 | 1 | ALREADY DONE | `memory/facts.py:100` add_fact, `:144` current, `:153` as_of, `:164` forget_fact, `:36` relation list. The four Done-when tests: `tests/test_facts.py:50`, `:60`, `:67`, `:78`. | Nothing for Feature 1. Not wired into anything (`memory/facts.py:7`) — that is Feature 5. |
 | 2 | PARTIAL | Routing golden set with a pass/fail exit code and per-route seconds: `scripts/check_routing.py:113` (ROUTES), `:306` (run_route), `:457` (main); pytest gate `tests/test_routing_matrix.py`. Code-tool A/B: `scripts/check_code_tool_routing.py:141` (measure), `:166` (passed). Per-turn voice latency rows: `voice/telemetry.py:57`. | No memory probes, no persona probes, no VRAM recording anywhere, no single command covering all three. |
-| 3 | PARTIAL | Agent model is a constructor argument: `pipeline_lg.py:743`, `:857`; entry points pin llama3.1 at `chat_main.py:26`, `voice_main.py:45`. Context management: summarise-and-trim `pipeline_lg.py:1027` (cadence `:494-495`), tool-output cap `tools/tools.py:54`. | No bake-off. mistral hardcoded at `pipeline_lg.py:134`, `:244`, `retreival/retrieval.py:29`, `memory/long_term_memory.py:30`. Embedder (all-MiniLM-L6-v2) fixed at three sites: `ingestion/vector_db.py:32`, `ingestion/chunking.py:15`, `memory/long_term_memory.py:21`. No token budget, no config module. Prompt order not designed: the user profile is appended inside the system message (`pipeline_lg.py:1096`), ahead of the conversation. |
+| 3 | PARTIAL | Agent model is a constructor argument: `pipeline_lg.py:743`, `:857`; entry points pin llama3.1 at `chat_main.py:26`, `voice_main.py:45`. Context management: summarise-and-trim `pipeline_lg.py:1027` (cadence `:494-495`), tool-output cap `tools/tools.py:54`. | No bake-off. mistral hardcoded at `pipeline_lg.py:134`, `:244`, `retreival/retrieval.py:29`, `memory/long_term_memory.py:30` (and `pipeline.py:63`, `:110`, `:193`). CORRECTED 24 Nov: none of these run on a live path; voice, chat and the eval checks all run llama3.1 for both generation and memory (docs/feature3_model_bakeoff.md). `num_ctx` is never set, so the context is Ollama's 4096 default. Embedder (all-MiniLM-L6-v2) fixed at three sites: `ingestion/vector_db.py:32`, `ingestion/chunking.py:15`, `memory/long_term_memory.py:21`. No token budget, no config module. Prompt order not designed: the user profile is appended inside the system message (`pipeline_lg.py:1096`), ahead of the conversation. |
 | 4 | NOT STARTED | Reusable: the static prompt template `pipeline_lg.py:433`, assembled once at construction `:845`. | Character config, per-call prompt builder, example conversations, drift probe. |
 | 5 | PARTIAL | Chroma fuzzy recall: `memory/long_term_memory.py:65` (index), `:102` (retreival); recall tool `tools/tools.py:257`; memory gate `pipeline_lg.py:1075`, `:1083`; conversation summary persisted `:986` and reloaded `:1197`. Checkpointer injection seam `:754`, `:866`. | Fact table not wired (nothing outside tests imports `memory/facts.py`); no facts pulled from chat; no "remember this" / "that changed" / "forget that"; no durable checkpointer (`pipeline_lg.py:715`, UNSOLVED), so the message list dies on restart — R8, fixed here. |
 | 6 | NOT STARTED | Reusable: the tool / no-tool prompt rule `pipeline_lg.py:446-452`. | The per-turn answer / ask / discuss / challenge / act choice. |
@@ -146,7 +146,18 @@ scored 3/7); the guaranteed floor is the 2 must-pass. A lucky boundary pass is n
   placeholder + old prompt-injection pattern.) pipeline.py is orphaned (only tests import it).
 - Durable checkpointer (R8): conversation message state dies on restart. Folded
   into Feature 5.
-- mistral hardcoded in several files; no config/settings.py yet (Feature 3).
+- mistral hardcoded in several files; no config/settings.py yet (Feature 3). CORRECTED
+  24 Nov: the mistral sites are dead code on every live path (everything runs llama3.1
+  alone), so removing them is a tidy-up with no behaviour change, not the point of
+  Feature 3. See docs/feature3_model_bakeoff.md.
+- **ACTIVE DEFECT, fix in Feature 3: the context window is never set.** Nothing passes
+  `num_ctx`, so every model runs at Ollama's 4096-token default (llama3.1's 5,211 MiB in
+  the run log is exactly weights + a 4096-token KV cache). One persona turn already uses
+  3,436 prompt tokens (84%); long voice sessions, with history, summary and tool output on
+  top, are being silently truncated today.
+- gpt-oss-20b does not fit: 14 GB on Ollama, more than the whole 12 GB card before voice.
+  The only MoE that fits natively is granite4:tiny-h (7B total, 1B active), and its tool
+  calling is unproven. Big-MoE CPU offload stays parked.
 - Eval `model_seconds` (scripts/eval_metrics.py) counts only the agent's own replies in
   the thread; it misses the memory gate, the summariser and retrieval's hardcoded mistral,
   so `wall_seconds - model_seconds` is NOT pure tool time. Read it that way in Feature 3.

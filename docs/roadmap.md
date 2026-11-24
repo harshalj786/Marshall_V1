@@ -29,9 +29,14 @@ on an RTX 4080 laptop (12 GB VRAM), inference and memory local.
 2. **Eval harness** — one command reruns a small golden set per feature, grown from
    the routing regression gate; records response time and VRAM.
    Done when: one command prints pass/fail for routing, memory and persona probes.
-3. **Model, embedder and context manager** — bake-off of the agent model vs Qwen3.5 9B
-   vs Gemma 4 12B on the full voice workload; pick the embedder; set the context
-   budget and prompt order; centralise model choice (remove hardcoded mistral).
+3. **Model, embedder and context manager** — an OPTIMISATION: is there a better single
+   model than llama3.1 for 12 GB with voice loaded? (Recon, 24 Nov: every live path
+   already runs llama3.1 alone; the mistral sites are dead code, so removing them is a
+   tidy-up.) Bake-off of llama3.1 vs Qwen3.5 9B (Qwen3 8B fallback) vs Granite 4 tiny-h,
+   the only MoE that fits (gpt-oss-20b is 14 GB and does not), with Gemma 4 12B as a fit
+   check only, on the full voice workload; pick the embedder; set the context budget
+   (num_ctx is never set today, so everything runs at 4096) and prompt order; centralise
+   model choice. Design: docs/feature3_model_bakeoff.md.
    Done when: the choice is backed by eval scores and measured VRAM with speech,
    synthesis and retrieval all loaded.
 4. **Identity and personality** — character config, system-prompt builder rebuilt
