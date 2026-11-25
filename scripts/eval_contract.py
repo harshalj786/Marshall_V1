@@ -20,8 +20,9 @@ into a green one.
 `passed` is deliberately not a stored field. It is derived here, once, so a record can
 never claim a verdict its own cases contradict.
 
-Schema version 4 (v1 = the first four CaseResult fields only, v2 = through vram_gpu_mib,
-v3 = no num_ctx; all still readable, their missing fields read as None):
+Schema version 5 (v1 = the first four CaseResult fields only, v2 = through vram_gpu_mib,
+v3 = no num_ctx, v4 = no model_size_mib/model_ctx; all still readable, their missing
+fields read as None):
 
     CheckRecord
       schema_version : int             bumped when a field changes meaning or is added
@@ -54,6 +55,11 @@ v3 = no num_ctx; all still readable, their missing fields read as None):
       detail         : str | None      why each missed attempt missed, e.g.
                                        "a2: recall_user_memory not called; a4: answer
                                        lacks 'peanut'"; None when no attempt missed
+      -- v5, the rest of /api/ps (Feature 3 prep step 3); same read as vram_models --
+      model_size_mib : dict | None     {loaded model: WHOLE size MiB}. size > the model's
+                                       vram_models entry means Ollama put part of it on
+                                       the CPU — see eval_metrics.offload_mib
+      model_ctx      : dict | None     {loaded model: context_length Ollama loaded it at}
 
 With k-of-n, the timing fields summarise the attempts rather than one run: medians for
 wall/model/tokens, max for load_seconds and vram_gpu_mib (a cold load must stay
@@ -69,10 +75,10 @@ from dataclasses import asdict, dataclass, field
 from pathlib import Path
 from typing import Optional
 
-SCHEMA_VERSION = 4
+SCHEMA_VERSION = 5
 #: versions from_dict accepts. An older record simply lacks the newer fields, which
 #: default None.
-READABLE_VERSIONS = (1, 2, 3, 4)
+READABLE_VERSIONS = (1, 2, 3, 4, 5)
 
 #: Ollama reports ~0.09 s of load_duration on a model that is ALREADY loaded (measured
 #: 2026-11-12, llama3.1 warm), so "non-zero" cannot mean cold. A real 8B load from disk
@@ -107,6 +113,8 @@ class CaseResult:
     passes: Optional[int] = None
     required: Optional[int] = None
     detail: Optional[str] = None
+    model_size_mib: Optional[dict] = None
+    model_ctx: Optional[dict] = None
 
     def __post_init__(self):
         if self.verdict not in VERDICTS:

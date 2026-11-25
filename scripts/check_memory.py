@@ -334,7 +334,11 @@ def aggregate(case: MemoryCase, attempts: list) -> CaseResult:
             misses.append(f"a{number}: {attempt.reason or 'missed'}")
 
     metric = lambda key: [a.metrics.get(key) for a in attempts]  # noqa: E731
-    vram_models = next((m for m in reversed(metric("vram_models")) if m is not None), None)
+    #: the LAST attempt that could read /api/ps supplies all three model fields, so the
+    #: whole size, the GPU part and the context describe one instant, never a mix
+    last_ps = next((a.metrics for a in reversed(attempts)
+                    if a.metrics.get("vram_models") is not None), {})
+    vram_models = last_ps.get("vram_models")
     median_int = lambda key: (None if _median(metric(key)) is None  # noqa: E731
                               else int(round(_median(metric(key)))))
     if verdict == BOUNDARY and case.known_gap:
@@ -357,6 +361,8 @@ def aggregate(case: MemoryCase, attempts: list) -> CaseResult:
         passes=passes,
         required=k,
         detail="; ".join(misses) or None,
+        model_size_mib=last_ps.get("model_size_mib"),
+        model_ctx=last_ps.get("model_ctx"),
     )
 
 

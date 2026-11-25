@@ -110,7 +110,7 @@ def test_a_v2_record_still_reads_with_the_v3_fields_null():
     assert case.model_seconds == 2.0
     assert (case.attempts, case.passes, case.required, case.detail) == (None,) * 4
     #: read into the current shape, so it is a current-version record from here on
-    assert record.schema_version == SCHEMA_VERSION == 4
+    assert record.schema_version == SCHEMA_VERSION == 5
 
 
 def test_v3_fields_round_trip():
@@ -167,5 +167,5 @@ def test_num_ctx_round_trips_and_sits_after_model():
     original.num_ctx = 8192
     data = original.to_dict()
     assert list(data)[:4] == ["schema_version", "check", "model", "num_ctx"]
-    assert data["schema_version"] == 4
+    assert data["schema_version"] == SCHEMA_VERSION
     assert CheckRecord.from_dict(json.loads(json.dumps(data))) == original

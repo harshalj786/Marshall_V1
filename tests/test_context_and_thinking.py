@@ -218,7 +218,8 @@ def test_record_carries_num_ctx(check, monkeypatch, tmp_path):
     out = tmp_path / "record.json"
     assert check.main(["--num-ctx", "8192", "--json", str(out)]) == 2
     record = json.loads(out.read_text(encoding="utf-8"))
-    assert record["num_ctx"] == 8192 and record["schema_version"] == 4
+    from scripts.eval_contract import SCHEMA_VERSION
+    assert record["num_ctx"] == 8192 and record["schema_version"] == SCHEMA_VERSION
 
 
 @pytest.fixture

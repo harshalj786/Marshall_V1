@@ -93,7 +93,8 @@ def test_case_metrics_never_raises_with_every_reader_gone(monkeypatch):
     monkeypatch.setattr(metrics, "NVIDIA_SMI", ["no-such-nvidia-smi-binary"])
     result = case_metrics([_reply(total_ns=None)])
     assert result == {"model_seconds": None, "load_seconds": None, "prompt_tokens": None,
-                      "output_tokens": None, "vram_models": None, "vram_gpu_mib": None}
+                      "output_tokens": None, "vram_models": None, "vram_gpu_mib": None,
+                      "model_size_mib": None, "model_ctx": None}
 
 
 # --------------------------------------------------------------------------
@@ -203,4 +204,5 @@ def test_timer_metrics_with_every_reader_gone(monkeypatch):
     monkeypatch.setattr(metrics, "NVIDIA_SMI", ["definitely-not-a-real-binary-xyz"])
     assert timer_metrics(None) == {
         "model_seconds": None, "load_seconds": None, "prompt_tokens": None,
-        "output_tokens": None, "vram_models": None, "vram_gpu_mib": None}
+        "output_tokens": None, "vram_models": None, "vram_gpu_mib": None,
+        "model_size_mib": None, "model_ctx": None}

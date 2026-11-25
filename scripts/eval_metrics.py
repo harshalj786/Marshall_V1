@@ -48,6 +48,7 @@ from langchain_core.callbacks import BaseCallbackHandler
 
 OLLAMA_PS_URL = "http://127.0.0.1:11434/api/ps"
 NVIDIA_SMI = ["nvidia-smi", "--query-gpu=memory.used", "--format=csv,noheader,nounits"]
+NVIDIA_SMI_TOTAL = ["nvidia-smi", "--query-gpu=memory.total", "--format=csv,noheader,nounits"]
 
 _NS = 1_000_000_000
 _MIB = 1024 * 1024
@@ -173,17 +174,53 @@ class TurnTimer(BaseCallbackHandler):
         return _sum_metadata(metas)
 
 
-def ollama_vram(url: Optional[str] = None, timeout: float = 2.0) -> Optional[dict]:
-    """{loaded model: size_vram in MiB}. None = could not read; {} = nothing loaded."""
+def ollama_models(url: Optional[str] = None, timeout: float = 2.0) -> Optional[dict]:
+    """Every loaded model as {name: {"size": MiB, "vram": MiB, "ctx": int | None}}.
+
+    None = could not read; {} = read fine, nothing loaded.
+
+    `size` is the model's whole footprint and `vram` the part on the GPU. When VRAM runs
+    short Ollama does NOT fail: it quietly puts layers on the CPU, and the only trace is
+    `size > vram` (see `offload_mib`). Reading `vram` alone — all Feature 2 did — makes a
+    half-offloaded model look like a small one that fits. `ctx` is the context Ollama
+    actually loaded, which catches a reload at a context nobody asked for.
+    """
     try:
         #: resolved at call time, not as a default argument, so OLLAMA_PS_URL is the one
         #: place to repoint it (a default would freeze the value at import)
         with urllib.request.urlopen(url or OLLAMA_PS_URL, timeout=timeout) as response:
             data = json.load(response)
-        return {str(entry["name"]): round(int(entry["size_vram"]) / _MIB)
+        #: `size` per model, not per reply: an entry without it (an older server) keeps
+        #: its vram reading and simply has no offload verdict, rather than losing all three
+        return {str(entry["name"]): {
+                    "size": None if entry.get("size") is None
+                    else round(int(entry["size"]) / _MIB),
+                    "vram": round(int(entry["size_vram"]) / _MIB),
+                    "ctx": entry.get("context_length")}
                 for entry in data.get("models", [])}
     except Exception:
         return None
+
+
+def ollama_vram(url: Optional[str] = None, timeout: float = 2.0) -> Optional[dict]:
+    """{loaded model: size_vram in MiB}. None = could not read; {} = nothing loaded."""
+    models = ollama_models(url, timeout)
+    return None if models is None else {name: m["vram"] for name, m in models.items()}
+
+
+def offload_mib(size_mib: Optional[dict], vram_mib: Optional[dict]) -> dict:
+    """{model: MiB on the CPU} for every model whose whole size is NOT on the GPU. Pure.
+
+    Derived by readers, never stored (like the wall - model remainder). A model missing
+    from either map is skipped rather than guessed at. Empty = nothing spilled, which is
+    the only reading the bake-off's fit gate accepts.
+    """
+    out = {}
+    for name, size in (size_mib or {}).items():
+        vram = (vram_mib or {}).get(name)
+        if size is not None and vram is not None and size > vram:
+            out[name] = size - vram
+    return out
 
 
 def gpu_used_mib(timeout: float = 5.0) -> Optional[int]:
@@ -202,8 +239,20 @@ def gpu_used_mib(timeout: float = 5.0) -> Optional[int]:
         return None
 
 
+def gpu_total_mib(timeout: float = 5.0) -> Optional[int]:
+    """The first GPU's total memory from nvidia-smi (12,282 MiB here). None if unavailable."""
+    try:
+        done = subprocess.run(NVIDIA_SMI_TOTAL, capture_output=True, text=True,
+                              timeout=timeout, check=False)
+        if done.returncode != 0:
+            return None
+        return int(done.stdout.strip().splitlines()[0].strip())
+    except Exception:
+        return None
+
+
 def case_metrics(turn_messages) -> dict:
-    """The v2 CaseResult fields for one case, as keyword arguments. Never raises.
+    """The v2 + v5 CaseResult fields for one case, as keyword arguments. Never raises.
 
     Call after the case's timer has stopped: the readings (~0.2 s for nvidia-smi) must
     not land inside wall_seconds.
@@ -212,7 +261,7 @@ def case_metrics(turn_messages) -> dict:
 
 
 def timer_metrics(timer: Optional[TurnTimer]) -> dict:
-    """The same six fields, timed by a TurnTimer instead of the history. Never raises.
+    """The same eight fields, timed by a TurnTimer instead of the history. Never raises.
 
     See TurnTimer's docstring: this model_seconds is WIDER than case_metrics'.
     """
@@ -224,11 +273,16 @@ def timer_metrics(timer: Optional[TurnTimer]) -> dict:
 
 
 def _with_vram(timing: TurnTiming) -> dict:
+    #: ONE /api/ps read for all three model fields, so size, vram and ctx describe the
+    #: same instant (two reads could straddle a reload and disagree)
+    models = ollama_models()
     return {
         "model_seconds": timing.model_seconds,
         "load_seconds": timing.load_seconds,
         "prompt_tokens": timing.prompt_tokens,
         "output_tokens": timing.output_tokens,
-        "vram_models": ollama_vram(),
+        "vram_models": None if models is None else {n: m["vram"] for n, m in models.items()},
         "vram_gpu_mib": gpu_used_mib(),
+        "model_size_mib": None if models is None else {n: m["size"] for n, m in models.items()},
+        "model_ctx": None if models is None else {n: m["ctx"] for n, m in models.items()},
     }
