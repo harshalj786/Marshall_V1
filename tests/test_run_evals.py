@@ -174,7 +174,10 @@ def test_log_line_shape_embeds_the_full_record():
                            start_vram_models={}, start_gpu_mib=900)
     line = build_log_line([outcome, _o(ST_NOT_BUILT, "memory")], "abc", False, "T",
                           ["routing", "memory"], 0)
-    assert set(line) == {"timestamp", "commit", "dirty", "only", "exit_code", "checks"}
+    assert set(line) == {"timestamp", "commit", "dirty", "only", "exit_code", "checks",
+                         "settings", "vram", "clean", "voice", "fit", "error"}
+    #: a plain run: the Feature 3 blocks are present but empty, so every line has one shape
+    assert line["clean"] is None and line["voice"] is None and line["fit"] is None
     first, second = line["checks"]
     assert set(first) == {"check", "status", "exit_code", "reason", "note",
                           "start_vram_models", "start_gpu_mib", "record"}

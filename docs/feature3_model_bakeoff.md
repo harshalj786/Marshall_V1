@@ -58,20 +58,50 @@ voice session adds history, the conversation summary and tool output on top, so 
 sessions are being silently truncated today. Fix in Feature 3, and pin the same value
 for every bake-off candidate.
 
-## VRAM budget with voice loaded
+## THE NUMBER THE BAKE-OFF TURNS ON: about 6.4 GB for the model
+
+**Measured 25 Nov** with `run_evals --with-voice` (Split B): voice + the check process +
+the desktop take **about 4.8 GB at peak** (10,783 MiB peak − 5,987 MiB of llama3.1). Under
+the FIT gate's 1 GB headroom rule, that leaves **about 6.4 GB for the model plus its 8K
+cache** (12,282 − 1,024 − 4,796 ≈ 6,462 MiB).
+
+- **llama3.1 at 8192 uses 5,987 MiB: it fits, but barely** (FIT PASS, peak 10,783 of 12,282).
+- **qwen3.5:9b's q4_K_M file alone is 6.6 GB**, before any cache, so it looks likely to
+  **fail the fit gate with voice at 8192**. To be confirmed by measurement, not assumed.
+- That makes qwen3:8b (5.2 GB) and granite4:tiny-h (4.2 GB) the likelier real contenders,
+  and some candidates may need testing at 4096 too. The candidate list gets revisited with
+  fit numbers in hand.
+
+The desktop's share moves (2,212 and 2,278 MiB idle in the two 25 Nov runs; 1.6–2.8 GB
+across 24–25 Nov), which is exactly what the 1 GB headroom is for.
+
+## VRAM budget with voice loaded (measured 25 Nov)
 
 | Component | Device | VRAM | Source |
 |---|---|---|---|
-| Desktop with nothing of ours loaded (wallpaper engine, browsers, VS Code, overlays) | GPU | 2,776 MiB on 24 Nov; varies | measured, `nvidia-smi` |
-| llama3.1 Q4_K_M at 4096 context | GPU | 5,211 MiB | measured, run log |
-| MiniLM embedder plus torch's CUDA setup, in the agent's process | GPU (torch is cu124, so sentence-transformers picks CUDA) | about 0.4–0.5 GB | inferred from the 8,456 MiB peak in the run log |
-| faster-whisper large-v3-turbo, `int8_float16` | GPU, with its own CUDA setup | about 1–1.5 GB | **estimate, unmeasured** |
-| Kokoro-82M | GPU (KPipeline uses CUDA when available) | about 0.3–0.5 GB | **estimate, unmeasured** |
-| Silero VAD | CPU (`load_silero_vad()` default) | 0 | read in code |
+| Desktop with nothing of ours loaded (wallpaper engine, browsers, VS Code, overlays) | GPU | 2,212–2,278 MiB idle on 25 Nov; 1.6–2.8 GB seen | measured, `run_evals --clean` idle reading |
+| faster-whisper large-v3-turbo, `int8_float16` | GPU, its own CUDA context | **+1,056 MiB** (recon estimate was 1–1.5 GB) | measured, ballast stage |
+| Kokoro-82M | GPU (KPipeline uses CUDA when available) | **+283 MiB** (estimate was 0.3–0.5 GB) | measured, ballast stage |
+| First-use pool growth (Whisper + Kokoro, the warm-up round trip) | GPU | **+370 MiB** — real session memory | measured, ballast stage |
+| Silero VAD | CPU (`load_silero_vad()` default) | 0 | measured, ballast stage |
+| The ballast's own torch CUDA context | GPU | +160 / +296 MiB in two runs (nvidia-smi is noisy at this scale) | measured; the one over-count (see below) |
+| **Desktop + voice, ready** | | **4,139 MiB** | measured |
+| MiniLM embedder plus torch's CUDA context, in the check process | GPU | about 0.4–0.6 GB | peak − voice − LLM |
+| llama3.1 Q4_K_M at 4096 / 8192 context | GPU | 5,211 / 5,987 MiB | measured, `/api/ps` |
+| **Peak, everything loaded, llama3.1 @ 8192** | | **10,783 of 12,282 MiB** | measured |
 
-Budget: 12,282 − about 2.8 desktop − about 0.5 embedder − about 1.5–2 voice ≈
-**7–7.5 GB for the model, KV cache included**. The voice figures are estimates; the
-ballast step exists to measure them.
+Voice round trip (Kokoro synthesis + Whisper transcription of `CHECK_PHRASE`): 557 ms with
+voice loaded, 603 ms after the checks with the LLM resident (1.08x). The FIRST round trip
+after load is not steady state (2,402 ms on 25 Nov, Kokoro's first synthesis 1.8 s), which
+is why the ballast warms up before it reports ready.
+
+**The one over-count:** in a real voice session Kokoro and the embedder share one process
+and so one torch CUDA context; under `--with-voice` the ballast and the check each have
+one. The verdict is therefore conservative by about that much (160–300 MiB).
+
+Recon estimate, for the record: it had 7–7.5 GB for the model, from an unmeasured
+1.5–2 GB for voice. Measured voice is about 1.7 GB loaded plus 0.4 GB of first-use
+growth, and the check process adds its own share, so the real figure is about 6.4 GB.
 
 Two blind spots in the harness as of Feature 2:
 
@@ -175,13 +205,21 @@ vs `size_vram`; Whisper and Kokoro re-run afterwards.
 
 No model is benchmarked until all six are in.
 
-1. Model override (flag or env) passed from `run_evals` into the checks.
-2. `num_ctx` and `reasoning` passed through `AgentGraph` into `ChatOllama`.
-3. The harness reads `size` vs `size_vram` from `/api/ps` and takes the idle reading.
+1. DONE (Split A) — `--model` flag (never an env var) from `run_evals` into the checks.
+2. DONE (Split A) — `num_ctx` and `reasoning` through `AgentGraph` into `ChatOllama` and
+   `UserMemory`; live pinned at 4096; checks always send think:false; `--num-ctx`.
+3. DONE (Split B) — `size` vs `size_vram` and the loaded context from `/api/ps`
+   (schema v5); the idle reading.
 4. Widen the leak lists: Qwen/Alibaba, Gemma/Google, Granite/IBM, and gpt-oss's
-   `to=functions.x`.
-5. The ballast script: real Whisper, Kokoro and embedder, one pass each, then hold.
-6. Unload all models between candidates.
+   `to=functions.x`. (Split C, next.)
+5. DONE (Split B) — `scripts/voice_ballast.py`: real Whisper, Kokoro and Silero (NOT the
+   embedder: the check process already has it), a warm-up round trip, then hold;
+   `run_evals --with-voice` prints and logs the FIT verdict.
+6. DONE (Split B) — `run_evals --clean`: unload all, wait for an empty `/api/ps`, warm the
+   candidate at the checks' num_ctx.
+
+The bake-off command, once step 4 is in:
+`python scripts/run_evals.py --model <candidate> --num-ctx 8192 --with-voice`
 
 Centralising model choice (a config module) and deleting mistral are separate tidy-up
 steps, ordered before or after the decision.
