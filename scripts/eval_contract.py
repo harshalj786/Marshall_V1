@@ -20,13 +20,16 @@ into a green one.
 `passed` is deliberately not a stored field. It is derived here, once, so a record can
 never claim a verdict its own cases contradict.
 
-Schema version 3 (v1 = the first four CaseResult fields only, v2 = through vram_gpu_mib;
-both still readable, their missing fields read as None):
+Schema version 4 (v1 = the first four CaseResult fields only, v2 = through vram_gpu_mib,
+v3 = no num_ctx; all still readable, their missing fields read as None):
 
     CheckRecord
       schema_version : int             bumped when a field changes meaning or is added
       check          : str             "routing"
       model          : str             "llama3.1"
+      num_ctx        : int | None      v4: the context window every model call was sent
+                                       with. Two runs of one model at 8192 and 32768 are
+                                       otherwise indistinguishable. None = a v1-v3 record.
       error          : str | None      set only when the check could not run (exit 2)
       cases          : list[CaseResult]
 
@@ -66,10 +69,10 @@ from dataclasses import asdict, dataclass, field
 from pathlib import Path
 from typing import Optional
 
-SCHEMA_VERSION = 3
+SCHEMA_VERSION = 4
 #: versions from_dict accepts. An older record simply lacks the newer fields, which
 #: default None.
-READABLE_VERSIONS = (1, 2, 3)
+READABLE_VERSIONS = (1, 2, 3, 4)
 
 #: Ollama reports ~0.09 s of load_duration on a model that is ALREADY loaded (measured
 #: 2026-11-12, llama3.1 warm), so "non-zero" cannot mean cold. A real 8B load from disk
@@ -116,6 +119,7 @@ class CheckRecord:
     model: str
     cases: list = field(default_factory=list)
     error: Optional[str] = None
+    num_ctx: Optional[int] = None
     schema_version: int = SCHEMA_VERSION
 
     def to_dict(self) -> dict:
@@ -124,6 +128,7 @@ class CheckRecord:
             "schema_version": self.schema_version,
             "check": self.check,
             "model": self.model,
+            "num_ctx": self.num_ctx,
             "error": self.error,
             "cases": [asdict(case) for case in self.cases],
         }
@@ -138,6 +143,7 @@ class CheckRecord:
         return cls(
             check=data["check"],
             model=data["model"],
+            num_ctx=data.get("num_ctx"),
             error=data.get("error"),
             cases=[CaseResult(**case) for case in data.get("cases", [])],
         )

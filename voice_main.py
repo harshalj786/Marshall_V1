@@ -48,6 +48,20 @@ VOICE_MODEL = "llama3.1"
 #: quitting eventually gives the GPU back. "-1" (forever) would strand 4.9 GB after exit.
 KEEP_ALIVE = "30m"
 
+#: the context window, EXPLICIT. 4096 is exactly what Ollama gave every request before
+#: this constant existed (llama3.1 loaded at 5,211 MiB = weights + a 4096-token cache), so
+#: pinning it changes no VRAM and causes no reload; what it buys is that a future Ollama
+#: default or an OLLAMA_CONTEXT_LENGTH setting can no longer change it silently. Raising it
+#: costs VRAM (8192 measured +776 MiB on llama3.1, 24 Nov) and is a deliberate decision
+#: for after the Feature 3 bake-off. docs/feature3_model_bakeoff.md has the numbers.
+NUM_CTX = 4096
+
+#: thinking OFF. A thinking model narrates before it answers, which is dead air in a voice
+#: turn and text the TTS would read aloud. Sent as think:false; a model without a thinking
+#: mode (llama3.1) accepts that as a no-op — measured — whereas think:true is rejected with
+#: HTTP 400, so True must never become a default.
+REASONING = False
+
 #: durable by default, and separately from the text pipelines' scratch directories.
 #: The C2 failure — long-term memory silently in-memory, working perfectly all session
 #: and gone at exit — is the one `docs/architecture_review.md` calls "the most
@@ -121,6 +135,8 @@ def build_agent(file_path: str, session=None, run_confirm=None, quiet: bool = Fa
         #: same model as generation — see VOICE_MODEL
         memory_model=VOICE_MODEL,
         keep_alive=KEEP_ALIVE,
+        num_ctx=NUM_CTX,
+        reasoning=REASONING,
         user_history_directory_path=USER_HISTORY_PATH,
         #: H2's summary reload gives cross-session continuity for free: `invoke` reloads
         #: this thread's stored summary whenever the in-RAM history is empty, and the

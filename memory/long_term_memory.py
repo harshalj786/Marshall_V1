@@ -5,7 +5,7 @@ from langchain_community.vectorstores import Chroma
 from langchain_core.documents import Document
 from typing import Optional
 from langchain_community.embeddings import HuggingFaceEmbeddings
-from langchain_community.llms import Ollama
+from langchain_ollama import OllamaLLM
 from langchain_core.messages import HumanMessage,AIMessage
 from langchain_core.prompts import PromptTemplate
 from langchain_core.output_parsers import StrOutputParser
@@ -31,11 +31,18 @@ DEFAULT_MEMORY_MODEL = "mistral"
 
 
 class UserMemory(Runnable):
-    def __init__(self,chat_history : list[str] = None,collection_name = "user_history",persist_directory_path : Optional[str] = None,model : str = DEFAULT_MEMORY_MODEL):
+    def __init__(self,chat_history : list[str] = None,collection_name = "user_history",persist_directory_path : Optional[str] = None,model : str = DEFAULT_MEMORY_MODEL,num_ctx : Optional[int] = None,reasoning : Optional[bool] = None):
         self.chat_history = chat_history or []
         self.collection_name = collection_name
         self.persist_directory_path = persist_directory_path
         self.model = model
+        #: the compression call must run at the SAME context as the agent that holds the
+        #: model: Ollama reloads a model whenever a request's num_ctx differs from the
+        #: loaded one, so a mismatch here costs an unload + reload on every gate turn and
+        #: another when the agent speaks next. None leaves both out of the request.
+        #: reasoning=False stops a thinking model narrating its thoughts into the summary.
+        self.num_ctx = num_ctx
+        self.reasoning = reasoning
         self.human_messages = [msg for msg in self.chat_history if isinstance(msg,HumanMessage)]
         self.ai_messages = [msg for msg in self.chat_history if isinstance(msg,AIMessage)]
         self.embedding_model = _get_embedding_model()
@@ -89,7 +96,9 @@ class UserMemory(Runnable):
     def invoke(self,input,config=None):
         #here the invoke function compress the human from chat_history and then give it to the llm for personal context
         #no input for this function just call this function to get the compressed user_history
-        llm = Ollama(model = self.model,temperature = 0)
+        #: OllamaLLM, not langchain_community's Ollama: same /api/generate request, but the
+        #: old class has no `reasoning` field, so thinking could not be switched off
+        llm = OllamaLLM(model = self.model,temperature = 0,num_ctx = self.num_ctx,reasoning = self.reasoning)
         parser = StrOutputParser()
         template = PromptTemplate(
             template=""" You are an ai assistant that would be given an user's chat_history just compress it and keep the personal things and relations about the user \n 

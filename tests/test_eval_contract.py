@@ -109,7 +109,8 @@ def test_a_v2_record_still_reads_with_the_v3_fields_null():
     case = record.cases[0]
     assert case.model_seconds == 2.0
     assert (case.attempts, case.passes, case.required, case.detail) == (None,) * 4
-    assert record.schema_version == SCHEMA_VERSION == 3
+    #: read into the current shape, so it is a current-version record from here on
+    assert record.schema_version == SCHEMA_VERSION == 4
 
 
 def test_v3_fields_round_trip():
@@ -141,3 +142,30 @@ def test_write_record_never_raises(tmp_path):
     blocker = tmp_path / "a_file"
     blocker.write_text("x")
     assert write_record(_record(PASS), blocker / "routing.json") is False
+
+
+# ==========================================================================
+# v4 — num_ctx on the record (Feature 3 prep step 2)
+# ==========================================================================
+
+def test_a_v3_record_still_reads_with_num_ctx_null():
+    """Every record in eval_logs/runs.jsonl before Feature 3 is v3 and must keep loading."""
+    v3 = {"schema_version": 3, "check": "persona", "model": "llama3.1", "error": None,
+          "cases": [{"id": "identity", "verdict": "PASS", "wall_seconds": 7.3, "error": None,
+                     "model_seconds": 3.7, "load_seconds": 0.2, "prompt_tokens": 1944,
+                     "output_tokens": 56, "vram_models": {"llama3.1:latest": 5211},
+                     "vram_gpu_mib": 7809, "attempts": 1, "passes": 1, "required": 1,
+                     "detail": None}]}
+    record = CheckRecord.from_dict(v3)
+    assert record.num_ctx is None
+    assert record.cases[0].prompt_tokens == 1944
+    assert record_passed(record) is True
+
+
+def test_num_ctx_round_trips_and_sits_after_model():
+    original = _record(PASS)
+    original.num_ctx = 8192
+    data = original.to_dict()
+    assert list(data)[:4] == ["schema_version", "check", "model", "num_ctx"]
+    assert data["schema_version"] == 4
+    assert CheckRecord.from_dict(json.loads(json.dumps(data))) == original

@@ -226,15 +226,16 @@ def grade(case: PersonaCase, calls: list, answer: str) -> Optional[str]:
 # running against the agent
 # ==========================================================================
 
-def build_agent(model: Optional[str] = None):
+def build_agent(model: Optional[str] = None, num_ctx: Optional[int] = None):
     """The voice path's agent (via check_routing), on THIS check's own empty stores.
 
-    `model` is the `--model` override; None keeps voice_main.VOICE_MODEL."""
+    `model` / `num_ctx` are the `--model` / `--num-ctx` overrides; None keeps the live
+    voice_main values."""
     from scripts.check_routing import build_check_agent
 
     shutil.rmtree(CHECK_USER_HISTORY_PATH, ignore_errors=True)
     return build_check_agent(user_history_path=CHECK_USER_HISTORY_PATH,
-                             summary_path=CHECK_SUMMARY_PATH, model=model)
+                             summary_path=CHECK_SUMMARY_PATH, model=model, num_ctx=num_ctx)
 
 
 def ask(agent, case: PersonaCase, thread_id: str) -> Attempt:
@@ -314,14 +315,14 @@ def parse_args(argv=None):
                         help="run a single case instead of all of them")
     parser.add_argument("--json", default=None, metavar="PATH",
                         help="also write the eval record (scripts/eval_contract.py) to PATH")
-    from scripts.check_routing import add_model_arg
-    add_model_arg(parser)
+    from scripts.check_routing import add_runtime_args
+    add_runtime_args(parser)
     return parser.parse_args(argv)
 
 
 def main(argv=None) -> int:
     args = parse_args(argv)
-    record = CheckRecord(check="persona", model=args.model)
+    record = CheckRecord(check="persona", model=args.model, num_ctx=args.num_ctx)
     code = _run(args, record)
     if args.json:
         write_record(record, args.json)
@@ -350,12 +351,13 @@ def _run(args, record: CheckRecord) -> int:
     print("PERSONA CHECK")
     print("=" * 72)
     print(f"  model      {model}")
+    print(f"  context    num_ctx {args.num_ctx}, thinking off")
     print(f"  memory     {CHECK_USER_HISTORY_PATH}  (wiped, empty: persona needs no facts)")
     print()
 
     started = time.perf_counter()
     try:
-        agent = build_agent(model)
+        agent = build_agent(model, args.num_ctx)
     except Exception as exc:
         return _cannot_run(record, f"could not build the agent: {type(exc).__name__}: {exc}")
 

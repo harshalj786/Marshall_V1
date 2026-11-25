@@ -4,11 +4,14 @@
     python scripts/run_evals.py --only routing           # just these
     python scripts/run_evals.py --only routing,memory,persona   # Feature 2's Done-when
     python scripts/run_evals.py --model qwen3.5:9b       # Feature 3 bake-off: another model
+    python scripts/run_evals.py --model qwen3.5:9b --num-ctx 8192   # ...at a pinned context
 
 `--model` is passed to every check as its own `--model`, which replaces both the
 generation model and the memory model. Without it the checks run voice_main.VOICE_MODEL,
 exactly as before. The table header names the model the checks actually reported, so a
-pasted table cannot be mistaken for a different model's run.
+pasted table cannot be mistaken for a different model's run. `--num-ctx` works the same
+way (default: the live voice_main.NUM_CTX) and the header reads `model X @ ctx N`: one
+model at 8192 and at 32768 is otherwise two indistinguishable tables.
 
 Each check (scripts/check_<name>.py) runs as its own subprocess with `--json`, so a
 crash in one cannot take down the others and no state leaks between them. The runner
@@ -176,31 +179,46 @@ def _secs(value: Optional[float]) -> str:
 ROW = "{:<9}{:<15}{:<12}{:<15}{:<11}{:<11}{:<24}{}"
 
 
+def reported(outcomes: list, field: str) -> list:
+    """The distinct values of one record field (`model`, `num_ctx`) the checks' own
+    records report, in check order. None (a v1-v3 record has no num_ctx) is skipped."""
+    return list(dict.fromkeys(getattr(o.record, field) for o in outcomes
+                              if o.record is not None and getattr(o.record, field) is not None))
+
+
 def reported_models(outcomes: list) -> list:
-    """The distinct models the checks' own records say they ran, in check order."""
-    return list(dict.fromkeys(o.record.model for o in outcomes
-                              if o.record is not None and o.record.model))
+    return reported(outcomes, "model")
 
 
-def model_note(outcomes: list, model: Optional[str]) -> Optional[str]:
-    """Why the header's model line cannot be trusted, or None when it can.
-
-    Two ways a bake-off table lies about its model: the checks disagree with each other,
-    or a check ran something other than the `--model` it was given.
-    """
-    seen = reported_models(outcomes)
+def _field_note(outcomes: list, field: str, flag: str, asked, plural: str) -> Optional[str]:
+    """Two ways a bake-off table lies about a setting: the checks disagree with each
+    other, or a check ran something other than the flag it was given."""
+    seen = reported(outcomes, field)
     if len(seen) > 1:
-        return f"checks ran different models: {', '.join(seen)}"
-    if model and seen and seen[0] != model:
-        return f"asked for --model {model} but the checks ran {seen[0]}"
+        return f"checks ran different {plural}: {', '.join(map(str, seen))}"
+    if asked is not None and seen and seen[0] != asked:
+        return f"asked for {flag} {asked} but the checks ran {seen[0]}"
     return None
 
 
+def model_note(outcomes: list, model: Optional[str]) -> Optional[str]:
+    """Why the header's model can't be trusted, or None when it can."""
+    return _field_note(outcomes, "model", "--model", model, "models")
+
+
+def ctx_note(outcomes: list, num_ctx: Optional[int]) -> Optional[str]:
+    """Why the header's context can't be trusted, or None when it can."""
+    return _field_note(outcomes, "num_ctx", "--num-ctx", num_ctx, "num_ctx values")
+
+
 def format_table(outcomes: list, commit: Optional[str], dirty: Optional[bool],
-                 timestamp: str, exit_code: int, model: Optional[str] = None) -> str:
+                 timestamp: str, exit_code: int, model: Optional[str] = None,
+                 num_ctx: Optional[int] = None) -> str:
     head = f"commit {commit[:7] if commit else 'unknown'}" + (" (dirty)" if dirty else "")
     #: what the records say ran; the requested model only when no record came back
     head += f"   model {', '.join(reported_models(outcomes)) or model or 'unknown'}"
+    ctx = ", ".join(map(str, reported(outcomes, "num_ctx"))) or num_ctx or "unknown"
+    head += f" @ ctx {ctx}"
     lines = ["=" * 72, f"EVAL SUMMARY   {head}   {timestamp}", "=" * 72,
              ROW.format("check", "status", "cases", "wall med/max", "model med",
                         "peak GPU", "loaded at start", "loaded during")]
@@ -222,9 +240,10 @@ def format_table(outcomes: list, commit: Optional[str], dirty: Optional[bool],
     for o in outcomes:
         if o.note:
             lines.append(f"{'':<9}!! {o.check}: {o.note}")
-    mismatch = model_note(outcomes, model)
-    if mismatch:
-        lines.append(f"{'':<9}!! model: {mismatch}")
+    for label, note in (("model", model_note(outcomes, model)),
+                        ("ctx", ctx_note(outcomes, num_ctx))):
+        if note:
+            lines.append(f"{'':<9}!! {label}: {note}")
     regressions = sum(o.status == ST_REGRESSION for o in outcomes)
     cannot = sum(o.status == ST_COULD_NOT_RUN for o in outcomes)
     missing = sum(o.status == ST_NOT_BUILT for o in outcomes)
@@ -260,17 +279,21 @@ def build_log_line(outcomes: list, commit: Optional[str], dirty: Optional[bool],
 # I/O — launching checks, git, the log
 # ==========================================================================
 
-def check_command(script_path, record_path, model: Optional[str] = None) -> list:
-    """The argv for one check. `--model` is added only when asked for, so a plain run
-    launches exactly the command it always did."""
+def check_command(script_path, record_path, model: Optional[str] = None,
+                  num_ctx: Optional[int] = None) -> list:
+    """The argv for one check. `--model` / `--num-ctx` are added only when asked for, so
+    a plain run launches exactly the command it always did."""
     cmd = [sys.executable, str(script_path), "--json", str(record_path)]
     if model:
         cmd += ["--model", model]
+    if num_ctx is not None:
+        cmd += ["--num-ctx", str(num_ctx)]
     return cmd
 
 
 def run_check(name: str, script, timeout_s: float = DEFAULT_TIMEOUT_S,
-              workdir: Optional[str] = None, model: Optional[str] = None) -> CheckOutcome:
+              workdir: Optional[str] = None, model: Optional[str] = None,
+              num_ctx: Optional[int] = None) -> CheckOutcome:
     """Launch one check as its own process and turn what it left behind into an outcome."""
     script_path = Path(script) if Path(script).is_absolute() else REPO / script
     if not script_path.exists():
@@ -287,7 +310,7 @@ def run_check(name: str, script, timeout_s: float = DEFAULT_TIMEOUT_S,
         exit_code, failure, record = None, None, None
         try:
             #: output is NOT captured: the check's printout is the detail and streams live
-            done = subprocess.run(check_command(script_path, record_path, model),
+            done = subprocess.run(check_command(script_path, record_path, model, num_ctx),
                                   cwd=str(REPO), env=env, timeout=timeout_s, check=False)
             exit_code = done.returncode
         except subprocess.TimeoutExpired:
@@ -357,6 +380,9 @@ def main(argv=None, registry: Optional[dict] = None) -> int:
     parser.add_argument("--model", default=None,
                         help="Ollama model every check runs, for generation AND memory "
                              "(default: each check's own, voice_main.VOICE_MODEL)")
+    parser.add_argument("--num-ctx", type=int, default=None,
+                        help="context window every check sends (default: each check's own, "
+                             "voice_main.NUM_CTX). The bake-off pins this for every model.")
     args = parser.parse_args(argv)
 
     names, requested, unknown = parse_only(args.only, registry)
@@ -370,13 +396,15 @@ def main(argv=None, registry: Optional[dict] = None) -> int:
         print("#" * 72)
         print(f"# CHECK {name}")
         print("#" * 72, flush=True)
-        outcomes.append(run_check(name, registry[name], args.timeout, model=args.model))
+        outcomes.append(run_check(name, registry[name], args.timeout, model=args.model,
+                                  num_ctx=args.num_ctx))
 
     code = overall_exit(outcomes, requested)
     commit, dirty = git_state()
     timestamp = datetime.now(timezone.utc).isoformat(timespec="seconds")
     print()
-    print(format_table(outcomes, commit, dirty, timestamp, code, model=args.model))
+    print(format_table(outcomes, commit, dirty, timestamp, code, model=args.model,
+                       num_ctx=args.num_ctx))
     append_log(build_log_line(outcomes, commit, dirty, timestamp, names, code), args.log)
     return code
 

@@ -751,6 +751,8 @@ class AgentGraph:
                  summary_persist_path: Optional[str] = None,
                  memory_model: str = DEFAULT_MEMORY_MODEL,
                  keep_alive: Optional[str | int] = None,
+                 num_ctx: Optional[int] = None,
+                 reasoning: Optional[bool] = None,
                  checkpointer: Optional[BaseCheckpointSaver] = None,
                  agent_hook: Optional[tuple] = None,
                  session: Optional[Session] = None,
@@ -794,6 +796,14 @@ class AgentGraph:
         # stall with a model swap stacked on top. Default is unchanged ("mistral"); the voice
         # path passes its own generation model so the gate runs against a resident one.
         self.memory_model = memory_model
+        # num_ctx / reasoning reach EVERY model call this graph makes: the agent, the
+        # summariser (same handle) and UserMemory's compression. None leaves the field out
+        # of the request, so a caller that passes neither sends exactly what it did before.
+        # They must agree across calls: Ollama RELOADS a model whenever a request's num_ctx
+        # differs from the loaded one, so a memory gate at a different context would unload
+        # and reload the model twice on every gate turn (5, 10, 15...).
+        self.num_ctx = num_ctx
+        self.reasoning = reasoning
         self.memory_every_n_turns = memory_every_n_turns
         self.summarize_every_n_turns = summarize_every_n_turns
         self.summary_keep_recent = summary_keep_recent
@@ -854,7 +864,8 @@ class AgentGraph:
         # keep_alive=None is ChatOllama's own default, so passing it through changes nothing
         # until a caller asks for something else. The voice path pins the model resident
         # ("-1"/"30m") so no turn pays a cold load mid-conversation.
-        base_llm = ChatOllama(model=model, temperature=0, keep_alive=keep_alive)
+        base_llm = ChatOllama(model=model, temperature=0, keep_alive=keep_alive,
+                              num_ctx=num_ctx, reasoning=reasoning)
         self.llm = base_llm.bind_tools(self.tools)
         # the summariser must be the UNBOUND handle: asked to compress a transcript full of
         # tool calls while holding tools itself, llama3.1 answers with a tool_call instead
@@ -903,6 +914,8 @@ class AgentGraph:
                 collection_name=self.user_memory_collection,
                 persist_directory_path=self.user_history_directory_path,
                 model=self.memory_model,
+                num_ctx=self.num_ctx,
+                reasoning=self.reasoning,
             )
             # nothing to write either way, so this entry is "written" for any caller
             self._memory_cache[thread_id] = (fingerprint, memory, True)
@@ -912,6 +925,8 @@ class AgentGraph:
             collection_name=self.user_memory_collection,
             persist_directory_path=self.user_history_directory_path,
             model=self.memory_model,
+            num_ctx=self.num_ctx,
+            reasoning=self.reasoning,
         )
         if index:
             memory.index(humans)

@@ -25,6 +25,11 @@ DEFAULT_DOCUMENT = "test_pdf's/Pipes_2025.pdf"
 #: the only locally-pulled model that reliably emits tool_calls — see voice_main.VOICE_MODEL
 CHAT_MODEL = "llama3.1"
 
+#: explicit context window and thinking off — the same values and reasons as
+#: voice_main.NUM_CTX / REASONING (4096 is what Ollama already used: no VRAM change)
+NUM_CTX = 4096
+REASONING = False
+
 VECTOR_DB_PATH = "db/chat_vdb"
 USER_HISTORY_PATH = "db/chat_user_history"
 SUMMARY_PATH = "db/chat_summaries"
@@ -40,6 +45,8 @@ def build_agent(file_path: str, session: Session, run_confirm=terminal_confirm):
         persist_directory_path=VECTOR_DB_PATH,
         model=CHAT_MODEL,
         memory_model=CHAT_MODEL,
+        num_ctx=NUM_CTX,
+        reasoning=REASONING,
         user_history_directory_path=USER_HISTORY_PATH,
         summary_persist_path=SUMMARY_PATH,
         session=session,

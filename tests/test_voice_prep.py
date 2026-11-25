@@ -235,15 +235,19 @@ def test_fast_body_still_reaches_the_caller_through_the_real_tool(monkeypatch):
 # ==========================================================================
 
 class _RecordingOllama(Runnable):
-    """Stands in for langchain's Ollama, capturing which model was asked for.
+    """Stands in for langchain_ollama's OllamaLLM, capturing what it was built with.
 
     A real `Runnable` rather than a bare stub: `UserMemory.invoke` builds
     `template | llm | parser`, and langchain refuses to coerce anything else.
+    `seen` keeps the model names (what these tests were written against); `built` keeps
+    every constructor kwarg, for the num_ctx / reasoning tests.
     """
     seen: list = []
+    built: list = []
 
     def __init__(self, model=None, temperature=None, **kw):
         _RecordingOllama.seen.append(model)
+        _RecordingOllama.built.append({"model": model, "temperature": temperature, **kw})
         self.model = model
 
     def invoke(self, input, config=None, **kw):
@@ -262,14 +266,14 @@ def test_user_memory_model_defaults_to_mistral():
 
 
 def test_user_memory_uses_the_default_model_when_unspecified(memory_dir, monkeypatch):
-    monkeypatch.setattr(ltm, "Ollama", _RecordingOllama)
+    monkeypatch.setattr(ltm, "OllamaLLM", _RecordingOllama)
     _RecordingOllama.seen = []
     UserMemory(chat_history=[], persist_directory_path=memory_dir).invoke({})
     assert _RecordingOllama.seen == ["mistral"], "existing callers must be unaffected"
 
 
 def test_user_memory_honours_a_model_override(memory_dir, monkeypatch):
-    monkeypatch.setattr(ltm, "Ollama", _RecordingOllama)
+    monkeypatch.setattr(ltm, "OllamaLLM", _RecordingOllama)
     _RecordingOllama.seen = []
     UserMemory(chat_history=[], persist_directory_path=memory_dir, model="llama3.1").invoke({})
     assert _RecordingOllama.seen == ["llama3.1"]
@@ -298,6 +302,7 @@ def test_agent_graph_passes_memory_model_to_user_memory(monkeypatch):
 
     agent = AgentGraph.__new__(AgentGraph)          # no ingestion; only the funnel is exercised
     agent.memory_model = "llama3.1"
+    agent.num_ctx, agent.reasoning = 8192, False
     agent.user_memory_collection = "user_history"
     agent.user_history_directory_path = "/tmp/does-not-matter"
     agent._memory_cache = {}
@@ -305,10 +310,15 @@ def test_agent_graph_passes_memory_model_to_user_memory(monkeypatch):
     from langchain_core.messages import HumanMessage
     agent._build_user_memory([HumanMessage(content="my name is Harshal")], "t1")
     assert captured["model"] == "llama3.1"
+    #: THE RELOAD TRAP. Ollama reloads a model whenever a request's num_ctx differs from
+    #: the loaded one, so a UserMemory at any other context than the agent's costs an
+    #: unload + reload on every gate turn (5, 10, 15...) and another when the agent speaks.
+    assert (captured["num_ctx"], captured["reasoning"]) == (8192, False)
 
     captured.clear()
     agent._build_user_memory([], "t2")              # the read-only/no-humans branch
     assert captured["model"] == "llama3.1", "the empty-history branch must thread it too"
+    assert (captured["num_ctx"], captured["reasoning"]) == (8192, False),         "the empty-history branch must thread the context too"
 
 
 def test_chat_graph_passes_memory_model_to_user_memory(monkeypatch):

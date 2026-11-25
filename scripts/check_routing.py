@@ -74,6 +74,11 @@ import voice_main
 #: The recall route needs a KNOWN fact to find, which means seeding — and seeding into the
 #: live store would write check fixtures into the user's real profile. Separate store, seeded
 #: here, deterministic on a machine that has never run a voice session.
+#: every check sends think:false, never the model's own default and never think:true
+#: (rejected with HTTP 400 by a model that cannot think). Not voice_main.REASONING: if the
+#: live path ever turns thinking on, the checks must still compare models with it off.
+CHECK_REASONING = False
+
 CHECK_USER_HISTORY_PATH = "db/routing_check_user_history"
 #: same reasoning for the conversation summary. One turn per thread never trips the
 #: summariser, but pointing it at the voice path's summaries would be a write waiting to happen.
@@ -256,7 +261,8 @@ def build_check_agent(file_path: Optional[str] = None,
                       vector_db_path: Optional[str] = None,
                       user_history_path: Optional[str] = None,
                       summary_path: Optional[str] = None,
-                      model: Optional[str] = None):
+                      model: Optional[str] = None,
+                      num_ctx: Optional[int] = None):
     """The voice path's agent, with long-term memory pointed at a dedicated store.
 
     Every other argument is `voice_main`'s own constant, imported rather than copied: same
@@ -273,10 +279,16 @@ def build_check_agent(file_path: Optional[str] = None,
     `model` is the Feature 3 bake-off override (`--model` on every check). It replaces
     BOTH the generation model and the memory model, because one model doing both jobs is
     exactly what is being measured. None keeps `voice_main.VOICE_MODEL`.
+
+    `num_ctx` (`--num-ctx`) defaults to the live `voice_main.NUM_CTX`, so a plain check
+    still measures the agent voice talks to. Thinking is ALWAYS off here (`CHECK_REASONING`),
+    whatever the live path does: a thinking default that differs per model is a fairness
+    trap, and think:false is a measured no-op on models without a thinking mode.
     """
     from pipeline_lg import AgentGraph
 
     model = model or voice_main.VOICE_MODEL
+    num_ctx = num_ctx or voice_main.NUM_CTX
     user_history = user_history_path or CHECK_USER_HISTORY_PATH
     if fresh:
         shutil.rmtree(user_history, ignore_errors=True)
@@ -287,6 +299,8 @@ def build_check_agent(file_path: Optional[str] = None,
         persist_directory_path=vector_db_path or voice_main.VECTOR_DB_PATH,
         model=model,
         memory_model=model,
+        num_ctx=num_ctx,
+        reasoning=CHECK_REASONING,
         keep_alive=voice_main.KEEP_ALIVE,
         user_history_directory_path=user_history,
         summary_persist_path=summary_path or CHECK_SUMMARY_PATH,
@@ -490,19 +504,30 @@ def parse_args(argv=None):
                         help=f"delete {CHECK_USER_HISTORY_PATH} and re-seed it first")
     parser.add_argument("--json", default=None, metavar="PATH",
                         help="also write the eval record (scripts/eval_contract.py) to PATH")
-    add_model_arg(parser)
+    add_runtime_args(parser)
     return parser.parse_args(argv)
 
 
-def add_model_arg(parser) -> None:
-    """`--model`, shared by all three checks so the flag cannot drift between them.
+def add_runtime_args(parser) -> None:
+    """`--model` and `--num-ctx`, shared by all three checks so they cannot drift apart.
 
-    A flag and never an environment variable: in a bake-off the model belongs in the
-    command that produced the numbers, not in shell state left over from a previous run.
+    Flags and never environment variables: in a bake-off the model and its context belong
+    in the command that produced the numbers, not in shell state left over from a previous
+    run. There is deliberately no thinking flag — checks always send think:false.
     """
     parser.add_argument("--model", default=voice_main.VOICE_MODEL,
                         help="Ollama model for generation AND the memory gate, e.g. "
                              f"qwen3.5:9b (default {voice_main.VOICE_MODEL}, the voice model)")
+    parser.add_argument("--num-ctx", type=_positive_int, default=voice_main.NUM_CTX,
+                        help="context window sent with every model call "
+                             f"(default {voice_main.NUM_CTX}, the live value)")
+
+
+def _positive_int(text: str) -> int:
+    value = int(text)
+    if value <= 0:
+        raise argparse.ArgumentTypeError(f"must be a positive integer, got {text}")
+    return value
 
 
 def to_case(result: RouteResult) -> CaseResult:
@@ -512,7 +537,7 @@ def to_case(result: RouteResult) -> CaseResult:
 
 def main(argv=None) -> int:
     args = parse_args(argv)
-    record = CheckRecord(check="routing", model=args.model)
+    record = CheckRecord(check="routing", model=args.model, num_ctx=args.num_ctx)
     code = _run(args, record)
     #: written on every exit path, including 2 (record.error says why). Additive: without
     #: --json nothing here runs, and a failed write never changes the exit code.
@@ -541,6 +566,7 @@ def _run(args, record: CheckRecord) -> int:
     print("ROUTING CHECK")
     print("=" * 72)
     print(f"  model      {model} (generation and memory gate)")
+    print(f"  context    num_ctx {args.num_ctx}, thinking off")
     print(f"  document   {document}")
     print(f"  doc index  {voice_main.VECTOR_DB_PATH}")
     print(f"  memory     {CHECK_USER_HISTORY_PATH}  (seeded here, not the live voice store)")
@@ -548,7 +574,8 @@ def _run(args, record: CheckRecord) -> int:
 
     started = time.perf_counter()
     try:
-        agent = build_check_agent(document, fresh=args.fresh, model=model)
+        agent = build_check_agent(document, fresh=args.fresh, model=model,
+                                  num_ctx=args.num_ctx)
         seed_memory(agent)
     except Exception as exc:
         return _cannot_run(record, f"could not build the agent: {type(exc).__name__}: {exc}")

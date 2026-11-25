@@ -155,6 +155,19 @@ scored 3/7); the guaranteed floor is the 2 must-pass. A lucky boundary pass is n
   the run log is exactly weights + a 4096-token KV cache). One persona turn already uses
   3,436 prompt tokens (84%); long voice sessions, with history, summary and tool output on
   top, are being silently truncated today.
+  - Prep step 2 (25 Nov) PINS it: `voice_main.NUM_CTX = chat_main.NUM_CTX = 4096`, sent
+    explicitly with every call (agent, summariser, UserMemory compression). Still 4096, so
+    truncation remains; raising it (8192 = +776 MiB measured on llama3.1) is a deliberate
+    call after the bake-off.
+  - **Why the pin mattered — Ollama's default context depends on HOW OLLAMA WAS STARTED.**
+    Launched from the Ollama desktop app, the server gets `OLLAMA_CONTEXT_LENGTH=8192` from
+    the app's own settings (server.log: "server config ... OLLAMA_CONTEXT_LENGTH:8192",
+    overriding its VRAM-based default of 4096). Started any other way (`ollama serve`), the
+    default is 4096. Before step 2, live voice VRAM therefore swung by 776 MiB (5,211 vs
+    5,987 MiB for llama3.1) depending only on the launch method, silently. With the pin it
+    is always 4096; against an app-started server that costs one reload, which lands at boot
+    in `warm_llm`, never mid-conversation. If a number ever looks 776 MiB off, check
+    `ollama ps`'s CONTEXT column before suspecting the model.
 - gpt-oss-20b does not fit: 14 GB on Ollama, more than the whole 12 GB card before voice.
   The only MoE that fits natively is granite4:tiny-h (7B total, 1B active), and its tool
   calling is unproven. Big-MoE CPU offload stays parked.

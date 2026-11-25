@@ -364,14 +364,16 @@ def aggregate(case: MemoryCase, attempts: list) -> CaseResult:
 # running against the agent
 # ==========================================================================
 
-def build_agent(user_history_path: str, model: Optional[str] = None):
+def build_agent(user_history_path: str, model: Optional[str] = None,
+                num_ctx: Optional[int] = None):
     """The voice path's agent (via check_routing), on THIS check's own stores.
 
-    `model` is the `--model` override; None keeps voice_main.VOICE_MODEL."""
+    `model` / `num_ctx` are the `--model` / `--num-ctx` overrides; None keeps the live
+    voice_main values."""
     from scripts.check_routing import build_check_agent
 
     return build_check_agent(user_history_path=user_history_path,
-                             summary_path=CHECK_SUMMARY_PATH, model=model)
+                             summary_path=CHECK_SUMMARY_PATH, model=model, num_ctx=num_ctx)
 
 
 def seed_store(agent, statements) -> None:
@@ -430,12 +432,13 @@ def run_seeded_attempt(agent, case: MemoryCase, number: int) -> Attempt:
     return ask(agent, case, f"mem-{case.id}-{number}", TurnTimer())
 
 
-def run_carry_attempt(case: MemoryCase, number: int, model: Optional[str] = None) -> Attempt:
+def run_carry_attempt(case: MemoryCase, number: int, model: Optional[str] = None,
+                      num_ctx: Optional[int] = None) -> Attempt:
     """Fresh store + fresh agent, tell the facts in thread A, ask in fresh thread B."""
     store = f"{CHECK_CARRY_PATH}/a{number}"
     shutil.rmtree(store, ignore_errors=True)
     try:
-        agent = build_agent(store, model)
+        agent = build_agent(store, model, num_ctx)
     except Exception as exc:
         return Attempt(passed=False, error=f"could not build the agent: {exc}")
     setup = TurnTimer()
@@ -508,14 +511,14 @@ def parse_args(argv=None):
                         help="run a single case instead of all of them")
     parser.add_argument("--json", default=None, metavar="PATH",
                         help="also write the eval record (scripts/eval_contract.py) to PATH")
-    from scripts.check_routing import add_model_arg
-    add_model_arg(parser)
+    from scripts.check_routing import add_runtime_args
+    add_runtime_args(parser)
     return parser.parse_args(argv)
 
 
 def main(argv=None) -> int:
     args = parse_args(argv)
-    record = CheckRecord(check="memory", model=args.model)
+    record = CheckRecord(check="memory", model=args.model, num_ctx=args.num_ctx)
     code = _run(args, record)
     if args.json:
         write_record(record, args.json)
@@ -545,6 +548,7 @@ def _run(args, record: CheckRecord) -> int:
     print("MEMORY CHECK")
     print("=" * 72)
     print(f"  model      {model} (generation and memory gate)")
+    print(f"  context    num_ctx {args.num_ctx}, thinking off")
     print(f"  memory     {CHECK_USER_HISTORY_PATH}  (wiped + seeded here, not the live store)")
     print(f"  seeded     {len(seeds)} statements, so the top 4 has to rank")
     print()
@@ -554,7 +558,7 @@ def _run(args, record: CheckRecord) -> int:
     if any(not c.told_in_thread for c in cases):
         shutil.rmtree(CHECK_USER_HISTORY_PATH, ignore_errors=True)
         try:
-            agent = build_agent(CHECK_USER_HISTORY_PATH, model)
+            agent = build_agent(CHECK_USER_HISTORY_PATH, model, args.num_ctx)
             seed_store(agent, seeds)
         except Exception as exc:
             return _cannot_run(record, f"could not build the agent: {type(exc).__name__}: {exc}")
@@ -569,7 +573,7 @@ def _run(args, record: CheckRecord) -> int:
         print("-" * 72)
 
         def one(number, case=case):
-            attempt = (run_carry_attempt(case, number, model) if case.told_in_thread
+            attempt = (run_carry_attempt(case, number, model, args.num_ctx) if case.told_in_thread
                        else run_seeded_attempt(agent, case, number))
             print_attempt(number, attempt)
             return attempt
